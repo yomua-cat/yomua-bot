@@ -2705,6 +2705,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "png",
+ "rand 0.8.8",
  "reqwest",
  "rmp-serde",
  "serde",

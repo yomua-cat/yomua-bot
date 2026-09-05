@@ -29,6 +29,85 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
             .map_err(|e| StorageError::Migration(format!("migration 002 failed: {e}")))?;
     }
 
+    // 迁移 003：conversation_bindings 新增 switched_at 列（换角色生效时间）。
+    let has_switched_at: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM pragma_table_info('conversation_bindings')
+           WHERE name = 'switched_at'"#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 003 probe failed: {e}")))?;
+
+    if has_switched_at == 0 {
+        sqlx::query(MIGRATION_003_ADD_SWITCHED_AT)
+            .execute(pool)
+            .await
+            .map_err(|e| StorageError::Migration(format!("migration 003 failed: {e}")))?;
+    }
+
+    // 会话唯一约束（G1）：仅当无重复 conversation_id 时创建唯一索引。
+    // 存在脏数据（同一会话多角色）时 warn 并跳过，不自动删除、不崩。
+    let duplicates: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM (
+            SELECT conversation_id FROM conversation_bindings
+            GROUP BY conversation_id HAVING COUNT(*) > 1
+        )"#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 003 duplicate probe failed: {e}")))?;
+
+    if duplicates == 0 {
+        sqlx::query(MIGRATION_003_CONVERSATION_UNIQUE)
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                StorageError::Migration(format!("migration 003 unique index failed: {e}"))
+            })?;
+    } else {
+        tracing::warn!(target: "storage", duplicates, "检测到同一会话存在多个角色绑定（脏数据），跳过会话唯一索引创建；行为层将取第一个绑定");
+    }
+
+    // 迁移 004：为 memories 表新增 `embedding` 列，并创建 semantic_memories 表。
+    let has_embedding: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM pragma_table_info('memories')
+           WHERE name = 'embedding'"#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 004 probe failed: {e}")))?;
+
+    if has_embedding == 0 {
+        sqlx::query(MIGRATION_004_ADD_EMBEDDING)
+            .execute(pool)
+            .await
+            .map_err(|e| StorageError::Migration(format!("migration 004 failed: {e}")))?;
+    }
+
+    // semantic_memories 表（使用 CREATE TABLE IF NOT EXISTS 保证幂等）。
+    sqlx::query(MIGRATION_004_SEMANTIC_MEMORIES)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            StorageError::Migration(format!("migration 004 semantic_memories failed: {e}"))
+        })?;
+
+    // 迁移 005：conversation_bindings 新增 cross_reply_enabled 列（群聊多 Bot 场景）。
+    let has_cross_reply_enabled: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM pragma_table_info('conversation_bindings')
+           WHERE name = 'cross_reply_enabled'"#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 005 probe failed: {e}")))?;
+
+    if has_cross_reply_enabled == 0 {
+        sqlx::query(MIGRATION_005_CROSS_REPLY_ENABLED)
+            .execute(pool)
+            .await
+            .map_err(|e| StorageError::Migration(format!("migration 005 failed: {e}")))?;
+    }
+
     Ok(())
 }
 
@@ -210,4 +289,44 @@ CREATE TABLE IF NOT EXISTS plugin_data (
 /// 用于记录主动行为最后一次触发的时间，供 proactive cooldown 判断。
 const MIGRATION_002: &str = r#"
 ALTER TABLE character_states ADD COLUMN last_proactive_at TEXT;
+"#;
+
+/// 迁移 003：为 conversation_bindings 新增 `switched_at` 列（换角色生效时间）。
+const MIGRATION_003_ADD_SWITCHED_AT: &str = r#"
+ALTER TABLE conversation_bindings ADD COLUMN switched_at TEXT;
+"#;
+
+/// 迁移 003b：会话唯一索引——一个会话最多一个角色绑定（G1 强制单绑定）。
+const MIGRATION_003_CONVERSATION_UNIQUE: &str = r#"
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_bindings_conversation_unique
+    ON conversation_bindings(conversation_id);
+"#;
+
+/// 迁移 004：为 memories 表新增 `embedding` 列（可空 TEXT，存储 JSON 数组）。
+const MIGRATION_004_ADD_EMBEDDING: &str = r#"
+ALTER TABLE memories ADD COLUMN embedding TEXT;
+"#;
+
+/// 迁移 004：语义记忆表（独立的 embedding 存储，不依赖外部向量数据库）。
+const MIGRATION_004_SEMANTIC_MEMORIES: &str = r#"
+CREATE TABLE IF NOT EXISTS semantic_memories (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id    INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
+    memory_type     TEXT NOT NULL CHECK (memory_type IN ('semantic', 'relationship', 'system')),
+    content         TEXT NOT NULL,
+    embedding       TEXT NOT NULL,
+    importance      REAL NOT NULL DEFAULT 0.5,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    last_accessed   TEXT NOT NULL DEFAULT (datetime('now')),
+    metadata        TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_memories_character
+    ON semantic_memories(character_id, memory_type);
+"#;
+
+/// 迁移 005：conversation_bindings 新增 cross_reply_enabled 列（群聊多 Bot 场景）。
+const MIGRATION_005_CROSS_REPLY_ENABLED: &str = r#"
+ALTER TABLE conversation_bindings ADD COLUMN cross_reply_enabled INTEGER NOT NULL DEFAULT 0;
 "#;

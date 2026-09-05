@@ -9,6 +9,8 @@ pub mod binding;
 pub mod character_import;
 pub mod clock;
 pub mod cognition;
+pub mod cognition_driver;
+pub mod command;
 pub mod config;
 pub mod context;
 pub mod conversation;

@@ -6,6 +6,15 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// 向量检索结果（包含分数），用于语义相似度搜索。
+#[derive(Debug, Clone)]
+pub struct SemanticMatchResult {
+    /// 匹配到的记忆。
+    pub memory: Memory,
+    /// 向量相似度分数（余弦相似度）。
+    pub score: f32,
+}
+
 /// 一条持久化记忆条目。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
@@ -29,6 +38,9 @@ pub struct Memory {
 
     /// 该记忆最后一次访问的时间（用于近因加权）。
     pub last_accessed: DateTime<Utc>,
+
+    /// 语义向量（JSON 数组），由 EmbeddingScheduler 生成后填充。
+    pub embedding: Option<String>,
 
     /// 任意元数据。
     pub metadata: serde_json::Value,
@@ -69,6 +81,7 @@ impl Memory {
             importance: importance.clamp(0.0, 1.0),
             created_at: now,
             last_accessed: now,
+            embedding: None,
             metadata: serde_json::Value::Null,
         }
     }

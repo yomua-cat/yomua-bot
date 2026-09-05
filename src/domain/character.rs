@@ -171,6 +171,17 @@ pub struct CharacterBinding {
     /// 上下文策略（包含多少历史等）。
     pub context_policy: serde_json::Value,
 
+    /// 最近一次换角色的生效时间。None 表示从未换过角色（该会话绑定创建即当前角色）。
+    /// 换角色后，新角色的上下文只包含该时间之后的消息（硬性约束 A）。
+    #[serde(default)]
+    pub switched_at: Option<DateTime<Utc>>,
+
+    /// 是否允许回复其他角色的消息（群聊多 Bot 场景）。
+    /// - false（默认）：只回复 sender_id == 当前 Bot participant_id 的消息
+    /// - true：回复群内所有消息（由 BehaviorEngine 决定是否回复）
+    #[serde(default)]
+    pub cross_reply_enabled: bool,
+
     pub created_at: DateTime<Utc>,
 }
 

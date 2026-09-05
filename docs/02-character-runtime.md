@@ -60,6 +60,7 @@ metadata
 4. CharacterBinding
 
 Character 与 Conversation 之间通过 Binding 关联。
+一个会话（私聊或群聊）最多存在一个绑定——绑定决定该会话当前的唯一角色。
 
 Character
     │
@@ -74,28 +75,27 @@ proactive_enabled
 mute_schedule
 behavior_overrides
 context_policy
+switched_at（最近一次换角色的生效时间）
+
+换角色 = 更新绑定的 character_id，并把 switched_at 置为当前时间。
+会话配置字段（reply_mode / proactive_enabled / mute_schedule / behavior_overrides /
+context_policy）随绑定保留，不随角色迁移。
 
 5. 多 Character
 
-一个 Conversation 可以绑定多个 Character。
+系统内可以同时存在多个角色（Multiple Character Runtime），每个角色拥有独立的
+人格、状态、情绪、关系与记忆（按 character_id 逻辑隔离，数据互相不可见）。
 
-例如：
+但一个会话恰好绑定一个角色（每会话单角色）：
 
-Group 123456
+Group 123456 → 绑定角色 A
+Private user42 → 绑定角色 B
+Group 888888 → 绑定角色 C
 
-Character A
-Character B
-Character C
+不同会话可以绑定不同角色；换角色后，新角色只看到 switched_at 之后的消息
+（此前历史不可见，含用户消息）。
 
-不同 Character 可以根据：
-
-- mention
-- conversation context
-- behavior probability
-- relationship
-- current state
-
-决定是否参与。
+角色互动（Character interaction）与"同群多角色"后置，不在本期范围。
 
 6. Character Runtime 生命周期
 

@@ -972,6 +972,12 @@ mod tests {
         async fn insert(&self, _m: &Message) -> Result<i64, RepositoryError> {
             Ok(1)
         }
+        async fn latest_message_time(
+            &self,
+            _conversation_id: i64,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, RepositoryError> {
+            Ok(None)
+        }
     }
 
     struct MemEmotionRepo;
@@ -1012,11 +1018,22 @@ mod tests {
         ) -> Result<Vec<crate::domain::character::CharacterBinding>, RepositoryError> {
             Ok(vec![])
         }
+        async fn find_all_enabled(
+            &self,
+        ) -> Result<Vec<crate::domain::character::CharacterBinding>, RepositoryError> {
+            Ok(vec![])
+        }
         async fn insert(
             &self,
             _b: &crate::domain::character::CharacterBinding,
         ) -> Result<i64, RepositoryError> {
             Ok(1)
+        }
+        async fn update(
+            &self,
+            _b: &crate::domain::character::CharacterBinding,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
         }
         async fn delete(&self, _id: i64) -> Result<(), RepositoryError> {
             Ok(())

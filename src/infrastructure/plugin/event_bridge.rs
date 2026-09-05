@@ -26,7 +26,10 @@ impl EventBridge {
     /// 每收到一条事件：映射 → 序列化 → 逐个通知订阅插件。
     pub async fn run(&self, mut subscription: EventSubscription) {
         while let Some(event) = subscription.recv().await {
-            let event_type = EventType::from_core_event(&event);
+            let Some(event_type) = EventType::from_core_event(&event) else {
+                // 不对插件暴露的事件（如系统指令）直接跳过。
+                continue;
+            };
             let data = match serde_json::to_value(&event) {
                 Ok(data) => data,
                 Err(e) => {
@@ -246,7 +249,7 @@ mod tests {
             timestamp: ts(),
             is_mentioned: false,
         });
-        let ty = EventType::from_core_event(&ev);
+        let ty = EventType::from_core_event(&ev).expect("MessageReceived 应对插件可见");
         let data = serde_json::to_value(&ev).unwrap();
         h.bridge.dispatch_to_subscribers(ty, data);
 

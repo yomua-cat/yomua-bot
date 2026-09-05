@@ -107,6 +107,25 @@ impl MessageRepository for SqliteMessageRepository {
 
         Ok(result.last_insert_rowid())
     }
+
+    async fn latest_message_time(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, RepositoryError> {
+        let row: Option<(String,)> =
+            sqlx::query_as(r#"SELECT MAX(timestamp) FROM messages WHERE conversation_id = ?"#)
+                .bind(conversation_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        match row {
+            Some((timestamp,)) => {
+                let dt = super::timestamp::parse_timestamp(&timestamp)?;
+                Ok(Some(dt))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 type MessageRow = (

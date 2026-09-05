@@ -5,8 +5,12 @@
 //! [`ConversationContext`]，供上层（认知 / 行为）使用。它不负责 LLM
 //! prompt 格式设计（那在认知层完成）。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
+use crate::application::llm_scheduler::EmbeddingScheduler;
 use crate::domain::character::{Character, CharacterBinding, LorebookEntry};
 use crate::domain::conversation::Conversation;
 use crate::domain::emotion::EmotionState;
@@ -28,6 +32,56 @@ pub struct ContextLimits {
     pub memory_limit: usize,
     /// 命中的 lorebook 条数上限。
     pub lorebook_limit: usize,
+}
+
+/// Lorebook 检索的匹配类型。
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchType {
+    /// 向量相似度匹配。
+    Vector,
+    /// 关键词匹配。
+    Keyword,
+    /// 同时被向量和关键词匹配。
+    Both,
+}
+
+/// Lorebook 匹配结果（包含匹配元数据）。
+#[derive(Debug, Clone)]
+pub struct LorebookMatch {
+    /// Lorebook 条目内容。
+    pub entry: String,
+    /// 优先级。
+    pub priority: i64,
+    /// 命中的关键词（若是关键词匹配）。
+    pub key: String,
+    /// 综合评分（向量分数 * 权重 + 关键词分数 * 权重）。
+    pub score: f32,
+    /// 匹配类型。
+    pub match_type: MatchType,
+}
+
+/// Lorebook 检索的限制参数。
+#[derive(Debug, Clone, Copy)]
+pub struct LorebookLimits {
+    /// 向量相似度阈值（默认 0.7）。
+    pub vector_threshold: f32,
+    /// 向量权重（默认 0.6）。
+    pub vector_weight: f32,
+    /// 关键词权重（默认 0.4）。
+    pub keyword_weight: f32,
+    /// 最大返回条数。
+    pub limit: i64,
+}
+
+impl Default for LorebookLimits {
+    fn default() -> Self {
+        Self {
+            vector_threshold: 0.7,
+            vector_weight: 0.6,
+            keyword_weight: 0.4,
+            limit: 5,
+        }
+    }
 }
 
 impl Default for ContextLimits {
@@ -75,6 +129,10 @@ pub struct ContextBuilder {
     relationship_repo: Arc<dyn RelationshipRepository>,
     emotion_repo: Arc<dyn EmotionStateRepository>,
     binding_repo: Arc<dyn CharacterBindingRepository>,
+    /// 向量嵌入调度器（可选，无时退化为纯关键词匹配）。
+    embedding_scheduler: Option<Arc<dyn EmbeddingScheduler>>,
+    /// Lorebook 检索的限制参数。
+    lorebook_limits: LorebookLimits,
 }
 
 impl ContextBuilder {
@@ -94,15 +152,30 @@ impl ContextBuilder {
             relationship_repo,
             emotion_repo,
             binding_repo,
+            embedding_scheduler: None,
+            lorebook_limits: LorebookLimits::default(),
         }
+    }
+
+    /// 设置向量嵌入调度器。
+    pub fn with_embedding_scheduler(mut self, s: Arc<dyn EmbeddingScheduler>) -> Self {
+        self.embedding_scheduler = Some(s);
+        self
+    }
+
+    /// 设置 Lorebook 检索的限制参数。
+    pub fn with_lorebook_limits(mut self, limits: LorebookLimits) -> Self {
+        self.lorebook_limits = limits;
+        self
     }
 
     /// 组装一个会话的上下文。
     ///
     /// - 加载会话与最近消息（上限 `limits.context_limit`）；
-    /// - 从角色 lorebook 挑选启用且命中最近消息关键词的条目，按优先级降序并截断；
-    /// - 加载该会话中该角色的绑定；
-    /// - 加载该角色的记忆、与参与者的关系、当前情绪；
+    /// - 加载该会话中该角色的绑定，并按换角色生效时间（switched_at）过滤消息
+    ///   （硬性约束 A：换角色后的上下文只包含切换之后的消息）；
+    /// - 从角色 lorebook 挑选启用且命中过滤后消息关键词的条目，按优先级降序并截断；
+    /// - 加载该角色的记忆（关键词检索基于过滤后的消息）、与参与者的关系、当前情绪；
     /// - 携带角色定义的场景与历史后指令。
     pub async fn build(
         &self,
@@ -124,19 +197,55 @@ impl ContextBuilder {
             .find_recent(conversation_id, limits.context_limit as i64)
             .await?;
 
-        let matching_lorebook = {
-            let mut matched = self.match_lorebook(character, &recent_messages);
-            matched.truncate(limits.lorebook_limit);
-            matched
-        };
-
-        // 该会话中该角色的绑定。
+        // 该会话中该角色的绑定（提前加载，供硬性约束 A 过滤使用）。
         let binding = self
             .binding_repo
             .find_by_conversation_id(conversation_id)
             .await?
             .into_iter()
             .find(|b| b.character_id == character.id);
+
+        // 硬性约束 A：按换角色生效时间过滤。switched_at 为 None（未换过角色）不过滤，
+        // 保持既有行为不变（回归保障）。
+        let recent_messages = filter_messages_by_switched_at(
+            recent_messages,
+            binding.as_ref().and_then(|b| b.switched_at),
+        );
+
+        // Lorebook 匹配：优先使用混合检索（向量 + 关键词），无 embedding 时退化为纯关键词。
+        let matching_lorebook = {
+            let prompt_text = recent_messages_text(&recent_messages);
+            if self.embedding_scheduler.is_some() {
+                // 混合检索：向量相似度 ∪ 关键词命中，取并集后重排
+                match self
+                    .match_lorebook_hybrid(character, &prompt_text, self.lorebook_limits)
+                    .await
+                {
+                    Ok(matches) => matches
+                        .into_iter()
+                        .map(|m| LorebookEntry {
+                            keywords: vec![m.key],
+                            content: m.entry,
+                            enabled: true,
+                            priority: m.priority as i32,
+                        })
+                        .collect(),
+                    Err(e) => {
+                        tracing::warn!("混合检索失败，退化为关键词匹配: {}", e);
+                        self.match_lorebook_by_keywords(character, &prompt_text)
+                            .into_iter()
+                            .map(|(e, _)| e)
+                            .collect()
+                    }
+                }
+            } else {
+                // 纯关键词匹配（既有行为不变）
+                self.match_lorebook_by_keywords(character, &prompt_text)
+                    .into_iter()
+                    .map(|(e, _)| e)
+                    .collect()
+            }
+        };
 
         // 记忆：结合「按重要度的近期记忆」与「按最近消息关键词的结构化检索」，
         // 合并去重后截断到上限（MVP 不做向量检索）。
@@ -179,32 +288,145 @@ impl ContextBuilder {
         })
     }
 
-    /// 从角色 lorebook 中选出匹配最近消息文本的启用条目，按优先级降序。
-    fn match_lorebook(&self, character: &Character, messages: &[Message]) -> Vec<LorebookEntry> {
-        let haystack = messages
-            .iter()
-            .map(message_text)
-            .collect::<Vec<_>>()
-            .join("\n")
-            .to_lowercase();
+    /// 从角色 lorebook 中选出匹配文本的启用条目及其命中的关键词。
+    ///
+    /// 返回 (LorebookEntry, 第一个匹配的关键词)。
+    fn match_lorebook_by_keywords(
+        &self,
+        character: &Character,
+        prompt: &str,
+    ) -> Vec<(LorebookEntry, String)> {
+        let haystack = prompt.to_lowercase();
 
-        let mut matched: Vec<LorebookEntry> = character
+        let mut matched: Vec<(LorebookEntry, String)> = character
             .definition
             .lorebook
             .iter()
-            .filter(|entry| entry.enabled)
-            .filter(|entry| {
+            .filter_map(|entry| {
+                if !entry.enabled {
+                    return None;
+                }
                 entry
                     .keywords
                     .iter()
-                    .any(|kw| !kw.trim().is_empty() && haystack.contains(&kw.to_lowercase()))
+                    .find(|kw| !kw.trim().is_empty() && haystack.contains(&kw.to_lowercase()))
+                    .map(|kw| (entry.clone(), kw.clone()))
             })
-            .cloned()
             .collect();
 
         // 按 priority 降序（越重要的越靠前）。
-        matched.sort_by_key(|e| std::cmp::Reverse(e.priority));
+        matched.sort_by_key(|(e, _)| std::cmp::Reverse(e.priority));
         matched
+    }
+
+    /// 混合检索 lorebook：向量相似度 ∪ 关键词命中，取并集后重排。
+    ///
+    /// 向量检索使用 EmbeddingScheduler 生成查询向量，从 semantic_memories 表匹配。
+    /// 当 embedding_scheduler 不可用时退化为纯关键词匹配。
+    async fn match_lorebook_hybrid(
+        &self,
+        character: &Character,
+        query_text: &str,
+        limits: LorebookLimits,
+    ) -> Result<Vec<LorebookMatch>, RuntimeError> {
+        // 1. 向量检索（如有 embedding_scheduler）
+        let vector_matches = if let Some(ref scheduler) = self.embedding_scheduler {
+            let query_embedding = scheduler
+                .submit_embedding(vec![query_text.to_string()])
+                .await?;
+            let query_vec = &query_embedding[0];
+
+            let results = self
+                .memory_repo
+                .search_by_embedding(character.id, query_vec, Some("lorebook"), limits.limit)
+                .await?;
+
+            // 过滤低于阈值的向量匹配，并标记为 Vector 类型
+            results
+                .into_iter()
+                .filter(|r| r.score >= limits.vector_threshold)
+                .map(|r| {
+                    (
+                        r.memory.content,
+                        r.memory.importance as i64,
+                        r.score,
+                        MatchType::Vector,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        // 2. 关键词检索（复用现有逻辑）
+        let keyword_matches = self.match_lorebook_by_keywords(character, query_text);
+        let keyword_entries: Vec<(String, i64, String)> = keyword_matches
+            .into_iter()
+            .map(|(e, kw)| (e.content, e.priority as i64, kw))
+            .collect();
+
+        // 3. 合并去重（按 entry 内容）
+        let mut all_matches: Vec<LorebookMatch> = Vec::new();
+        let mut seen_entries: HashSet<String> = HashSet::new();
+
+        for (content, priority, score, match_type) in vector_matches {
+            if !seen_entries.contains(&content) {
+                seen_entries.insert(content.clone());
+                all_matches.push(LorebookMatch {
+                    entry: content,
+                    priority,
+                    key: String::new(),
+                    score,
+                    match_type,
+                });
+            }
+        }
+
+        for (content, priority, key) in keyword_entries {
+            if !seen_entries.contains(&content) {
+                seen_entries.insert(content.clone());
+                all_matches.push(LorebookMatch {
+                    entry: content,
+                    priority,
+                    key,
+                    score: 1.0,
+                    match_type: MatchType::Keyword,
+                });
+            }
+        }
+
+        // 4. 重排：score = vector_score * vector_weight + keyword_score * keyword_weight
+        // keyword_score = 1.0（命中关键词）
+        for m in &mut all_matches {
+            m.score = match m.match_type {
+                MatchType::Vector => m.score * limits.vector_weight,
+                MatchType::Keyword => 1.0 * limits.keyword_weight,
+                MatchType::Both => m.score * limits.vector_weight + limits.keyword_weight,
+            };
+        }
+        all_matches.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+        // 5. 转换为 LorebookMatch 并截断
+        let final_matches: Vec<LorebookMatch> = all_matches
+            .into_iter()
+            .take(limits.limit as usize)
+            .collect();
+
+        Ok(final_matches)
+    }
+}
+
+/// 按换角色生效时间过滤消息：只保留 `switched_at` 之后（含）的消息。
+///
+/// `switched_at` 为 None（该会话从未换过角色）时不过滤，保持既有行为不变。
+/// 被过滤的消息同时不进入后续的 lorebook 匹配与关键词检索（顺序上先过滤再组装）。
+fn filter_messages_by_switched_at(
+    messages: Vec<Message>,
+    switched_at: Option<DateTime<Utc>>,
+) -> Vec<Message> {
+    match switched_at {
+        None => messages,
+        Some(t) => messages.into_iter().filter(|m| m.timestamp >= t).collect(),
     }
 }
 
@@ -311,6 +533,12 @@ mod tests {
         }
         async fn insert(&self, _m: &Message) -> Result<i64, RepositoryError> {
             Ok(1)
+        }
+        async fn latest_message_time(
+            &self,
+            _conversation_id: i64,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, RepositoryError> {
+            Ok(None)
         }
     }
 
@@ -486,8 +714,25 @@ mod tests {
         async fn find_all(&self) -> Result<Vec<CharacterBinding>, RepositoryError> {
             Ok(self.bindings.lock().unwrap().clone())
         }
+        async fn find_all_enabled(&self) -> Result<Vec<CharacterBinding>, RepositoryError> {
+            Ok(self
+                .bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| b.proactive_enabled)
+                .cloned()
+                .collect())
+        }
         async fn insert(&self, _b: &CharacterBinding) -> Result<i64, RepositoryError> {
             Ok(1)
+        }
+        async fn update(&self, binding: &CharacterBinding) -> Result<(), RepositoryError> {
+            let mut bindings = self.bindings.lock().unwrap();
+            if let Some(existing) = bindings.iter_mut().find(|b| b.id == binding.id) {
+                *existing = binding.clone();
+            }
+            Ok(())
         }
         async fn delete(&self, _id: i64) -> Result<(), RepositoryError> {
             Ok(())
@@ -527,6 +772,7 @@ mod tests {
             importance,
             created_at: chrono::Utc::now(),
             last_accessed: chrono::Utc::now(),
+            embedding: None,
             metadata: serde_json::json!({}),
         }
     }
@@ -643,6 +889,8 @@ mod tests {
             mute_schedule: None,
             behavior_overrides: serde_json::json!({}),
             context_policy: serde_json::json!({}),
+            switched_at: None,
+            cross_reply_enabled: false,
             created_at: chrono::Utc::now(),
         };
         let rel = Relationship {
@@ -723,6 +971,7 @@ mod tests {
             importance: 0.3,
             created_at: chrono::Utc::now(),
             last_accessed: chrono::Utc::now(),
+            embedding: None,
             metadata: serde_json::json!({}),
         };
         let builder = build_builder(
@@ -782,5 +1031,143 @@ mod tests {
             .build(&build_character(), 999, 1, ContextLimits::default())
             .await;
         assert!(result.is_err());
+    }
+
+    /// 构造一个会话 10 / 角色 1 的绑定，switched_at 可指定。
+    fn binding_with_switched_at(switched_at: Option<chrono::DateTime<Utc>>) -> CharacterBinding {
+        CharacterBinding {
+            id: 1,
+            character_id: 1,
+            conversation_id: 10,
+            reply_mode: crate::domain::character::ReplyMode::Natural,
+            proactive_enabled: false,
+            mute_schedule: None,
+            behavior_overrides: serde_json::json!({}),
+            context_policy: serde_json::json!({}),
+            switched_at,
+            cross_reply_enabled: false,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// 构造一条指定时间戳的消息（其余字段沿用默认）。
+    fn text_message_at(id: i64, content: &str, timestamp: chrono::DateTime<Utc>) -> Message {
+        let mut m = text_message(id, content);
+        m.timestamp = timestamp;
+        m
+    }
+
+    fn base_time() -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[tokio::test]
+    async fn build_filters_messages_before_switched_at() {
+        let base = base_time();
+        let t1 = base;
+        let t2 = base + chrono::Duration::minutes(1);
+        let t3 = base + chrono::Duration::minutes(2);
+        let messages = vec![
+            text_message_at(1, "第一条", t1),
+            text_message_at(2, "第二条", t2),
+            text_message_at(3, "第三条", t3),
+        ];
+
+        // 绑定 switched_at = t2（t2 时换过角色）。
+        let binding = binding_with_switched_at(Some(t2));
+        let builder = build_builder(messages, vec![], vec![], vec![binding]).await;
+        let ctx = builder
+            .build(&build_character(), 10, 99, ContextLimits::default())
+            .await
+            .expect("build 应成功");
+
+        // 只保留 t2、t3 两条，且顺序保持最旧在前。
+        assert_eq!(ctx.recent_messages.len(), 2);
+        assert_eq!(ctx.recent_messages[0].id, 2);
+        assert_eq!(ctx.recent_messages[1].id, 3);
+        assert!(
+            ctx.recent_messages.iter().all(|m| m.id != 1),
+            "t1 消息（换角色之前）应被过滤"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_keeps_all_messages_without_switched_at() {
+        let base = base_time();
+        let messages = vec![
+            text_message_at(1, "第一条", base),
+            text_message_at(2, "第二条", base + chrono::Duration::minutes(1)),
+            text_message_at(3, "第三条", base + chrono::Duration::minutes(2)),
+        ];
+
+        // 绑定 switched_at = None（从未换过角色）→ 不过滤，保持既有行为。
+        let binding = binding_with_switched_at(None);
+        let builder = build_builder(messages, vec![], vec![], vec![binding]).await;
+        let ctx = builder
+            .build(&build_character(), 10, 99, ContextLimits::default())
+            .await
+            .expect("build 应成功");
+
+        assert_eq!(ctx.recent_messages.len(), 3);
+    }
+
+    #[test]
+    fn filter_messages_by_switched_at_unit() {
+        let base = base_time();
+        let t1 = base;
+        let t2 = base + chrono::Duration::minutes(1);
+        let t3 = base + chrono::Duration::minutes(2);
+        let messages = vec![
+            text_message_at(1, "第一条", t1),
+            text_message_at(2, "第二条", t2),
+            text_message_at(3, "第三条", t3),
+        ];
+
+        // None 不过滤。
+        let kept = filter_messages_by_switched_at(messages.clone(), None);
+        assert_eq!(kept.len(), 3);
+
+        // Some(t2)：t2 之前（不含）被过滤，边界 == t2 保留。
+        let kept = filter_messages_by_switched_at(messages.clone(), Some(t2));
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|m| m.timestamp >= t2));
+
+        // Some(t3)：只保留 t3 本身。
+        let kept = filter_messages_by_switched_at(messages, Some(t3));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, 3);
+    }
+
+    #[tokio::test]
+    async fn build_does_not_trigger_lorebook_from_filtered_messages() {
+        let base = base_time();
+        let t1 = base;
+        let t2 = base + chrono::Duration::minutes(1);
+        // t1 含 lorebook 关键词「禁词」，但在换角色之前被过滤。
+        let messages = vec![
+            text_message_at(1, "这是禁词消息", t1),
+            text_message_at(2, "第二条", t2),
+            text_message_at(3, "第三条", t2 + chrono::Duration::minutes(1)),
+        ];
+        let mut character = build_character();
+        character
+            .definition
+            .lorebook
+            .push(lorebook_entry(&["禁词"], 3, true));
+
+        let binding = binding_with_switched_at(Some(t2));
+        let builder = build_builder(messages, vec![], vec![], vec![binding]).await;
+        let ctx = builder
+            .build(&character, 10, 99, ContextLimits::default())
+            .await
+            .expect("build 应成功");
+
+        // 被过滤的消息不得触发 lorebook 匹配。
+        assert!(
+            ctx.matching_lorebook.is_empty(),
+            "换角色之前的消息不应触发 lorebook"
+        );
     }
 }

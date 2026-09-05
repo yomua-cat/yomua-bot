@@ -74,6 +74,26 @@ pub struct TokenUsage {
     pub total_tokens: u32,
 }
 
+/// Embedding 请求。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbedRequest {
+    /// 要嵌入的文本列表。
+    pub texts: Vec<String>,
+    /// 可选的模型名称。
+    pub model: Option<String>,
+}
+
+/// Embedding 响应。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbedResponse {
+    /// 嵌入向量列表。
+    pub embeddings: Vec<Vec<f32>>,
+    /// 实际使用的模型。
+    pub model: String,
+    /// token 使用统计。
+    pub usage: TokenUsage,
+}
+
 /// LLM 提供商 trait。
 ///
 /// 具体实现（OpenAI、Anthropic 等）位于基础设施层。
@@ -82,6 +102,16 @@ pub struct TokenUsage {
 pub trait LlmProvider: Send + Sync {
     /// 从 LLM 生成一个响应。
     async fn generate(&self, request: LlmRequest) -> Result<LlmResponse, RuntimeError>;
+
+    /// 生成文本的嵌入向量。
+    ///
+    /// 默认实现返回"未实现"错误，OpenAI-compatible 实现提供完整功能。
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, RuntimeError> {
+        let _ = texts;
+        Err(RuntimeError::Llm(
+            "embed not implemented for this provider".to_string(),
+        ))
+    }
 
     /// 检查提供商是否可用。
     async fn health_check(&self) -> Result<bool, RuntimeError>;

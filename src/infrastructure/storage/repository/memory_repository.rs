@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 
-use crate::domain::memory::{Memory, MemoryType};
+use crate::domain::memory::{Memory, MemoryType, SemanticMatchResult};
 use crate::domain::repository::MemoryRepository;
 use crate::error::RepositoryError;
 
@@ -32,20 +32,10 @@ impl MemoryRepository for SqliteMemoryRepository {
             MemoryType::System => "system",
         });
 
-        let rows: Vec<(
-            i64,
-            i64,
-            Option<i64>,
-            String,
-            String,
-            f64,
-            String,
-            String,
-            String,
-        )> = if let Some(t) = type_str {
+        let rows: Vec<MemoryRow> = if let Some(t) = type_str {
             sqlx::query_as(
                 r#"SELECT id, character_id, conversation_id, memory_type, content,
-                        importance, created_at, last_accessed, metadata
+                        importance, created_at, last_accessed, metadata, embedding
                      FROM memories WHERE character_id = ? AND memory_type = ?
                      ORDER BY importance DESC, created_at DESC LIMIT ?"#,
             )
@@ -57,7 +47,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         } else {
             sqlx::query_as(
                 r#"SELECT id, character_id, conversation_id, memory_type, content,
-                        importance, created_at, last_accessed, metadata
+                        importance, created_at, last_accessed, metadata, embedding
                      FROM memories WHERE character_id = ?
                      ORDER BY importance DESC, created_at DESC LIMIT ?"#,
             )
@@ -93,7 +83,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         // 用 QueryBuilder 构造动态 `OR content LIKE ?` 子句。
         let mut builder = sqlx::QueryBuilder::new(
             "SELECT id, character_id, conversation_id, memory_type, content, importance, \
-             created_at, last_accessed, metadata \
+             created_at, last_accessed, metadata, embedding \
              FROM memories WHERE character_id = ",
         );
         builder.push_bind(character_id);
@@ -130,8 +120,8 @@ impl MemoryRepository for SqliteMemoryRepository {
 
         let result = sqlx::query(
             r#"INSERT INTO memories
-                (character_id, conversation_id, memory_type, content, importance, metadata)
-             VALUES (?, ?, ?, ?, ?, ?)"#,
+                (character_id, conversation_id, memory_type, content, importance, metadata, embedding)
+             VALUES (?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(memory.character_id)
         .bind(memory.conversation_id)
@@ -139,6 +129,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .bind(&memory.content)
         .bind(memory.importance)
         .bind(&metadata)
+        .bind(&memory.embedding)
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -175,6 +166,95 @@ impl MemoryRepository for SqliteMemoryRepository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         Ok(())
     }
+
+    async fn search_by_embedding(
+        &self,
+        character_id: i64,
+        query_embedding: &[f32],
+        memory_type: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SemanticMatchResult>, RepositoryError> {
+        // 从 semantic_memories 表读取同角色、同类型的全部记录。
+        let type_filter = memory_type.map(|t| format!("AND memory_type = '{}'", t));
+        let query = if let Some(tf) = &type_filter {
+            format!(
+                r#"SELECT id, character_id, conversation_id, memory_type, content,
+                          importance, created_at, last_accessed, metadata, embedding
+                   FROM semantic_memories
+                   WHERE character_id = {} {}
+                   ORDER BY importance DESC, created_at DESC"#,
+                character_id, tf
+            )
+        } else {
+            format!(
+                r#"SELECT id, character_id, conversation_id, memory_type, content,
+                          importance, created_at, last_accessed, metadata, embedding
+                   FROM semantic_memories
+                   WHERE character_id = {}
+                   ORDER BY importance DESC, created_at DESC"#,
+                character_id
+            )
+        };
+
+        let rows: Vec<MemoryRow> = sqlx::query_as(&query)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // 计算每条记录的余弦相似度，过滤无效 embedding，按相似度降序排列。
+        let mut scored: Vec<SemanticMatchResult> = Vec::new();
+        for row in rows {
+            if let Ok(memory) = parse_memory_row(row) {
+                if let Some(ref emb_str) = memory.embedding {
+                    if let Ok(stored) = serde_json::from_str::<Vec<f32>>(emb_str) {
+                        if let Some(sim) = cosine_similarity(query_embedding, &stored) {
+                            scored.push(SemanticMatchResult { memory, score: sim });
+                        }
+                    }
+                }
+            }
+        }
+
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(limit as usize);
+        Ok(scored)
+    }
+
+    async fn insert_semantic(
+        &self,
+        character_id: i64,
+        conversation_id: Option<i64>,
+        memory_type: &str,
+        content: &str,
+        embedding: &[f32],
+        importance: f64,
+        metadata: &str,
+    ) -> Result<i64, RepositoryError> {
+        let embedding_json = serde_json::to_string(embedding)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let result = sqlx::query(
+            r#"INSERT INTO semantic_memories
+                (character_id, conversation_id, memory_type, content, embedding, importance, metadata)
+             VALUES (?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(character_id)
+        .bind(conversation_id)
+        .bind(memory_type)
+        .bind(content)
+        .bind(&embedding_json)
+        .bind(importance)
+        .bind(metadata)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(result.last_insert_rowid())
+    }
 }
 
 type MemoryRow = (
@@ -187,6 +267,7 @@ type MemoryRow = (
     String,
     String,
     String,
+    Option<String>,
 );
 
 fn parse_memory_row(row: MemoryRow) -> Result<Memory, RepositoryError> {
@@ -200,6 +281,7 @@ fn parse_memory_row(row: MemoryRow) -> Result<Memory, RepositoryError> {
         created_at,
         last_accessed,
         metadata_json,
+        embedding,
     ) = row;
 
     let memory_type = match memory_type_str.as_str() {
@@ -229,6 +311,33 @@ fn parse_memory_row(row: MemoryRow) -> Result<Memory, RepositoryError> {
         importance,
         created_at,
         last_accessed,
+        embedding,
         metadata,
     })
+}
+
+/// 计算两个向量的余弦相似度。
+///
+/// 返回 `None` 当任一向量为零向量（无法归一化）。
+fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+
+    for (av, bv) in a.iter().zip(b.iter()) {
+        dot += av * bv;
+        norm_a += av * av;
+        norm_b += bv * bv;
+    }
+
+    let norm_product = norm_a.sqrt() * norm_b.sqrt();
+    if norm_product < 1e-10 {
+        return None;
+    }
+
+    Some(dot / norm_product)
 }

@@ -52,6 +52,9 @@ png = "0.17"
 # HTTP client (OpenAI-compatible LLM provider)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# 随机数（用于多 Bot 回复打乱顺序）
+rand = "0.8"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

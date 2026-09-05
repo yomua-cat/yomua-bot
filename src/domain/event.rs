@@ -40,6 +40,12 @@ pub enum CoreEvent {
 
     /// 定时任务被触发。
     ScheduledTaskTriggered(ScheduledTaskTriggeredEvent),
+
+    /// 收到了一条系统指令。
+    ///
+    /// 与 `MessageReceived` 互斥：指令消息在消息发布位被截流，
+    /// 只发布本事件（硬性约束 B）。
+    CommandReceived(CommandReceivedEvent),
 }
 
 /// 从用户处收到了一条消息。
@@ -146,4 +152,27 @@ pub struct ScheduledTaskTriggeredEvent {
     pub task_id: i64,
     pub task_type: String,
     pub timestamp: DateTime<Utc>,
+}
+
+/// 系统指令（平台无关语义）。
+///
+/// 由适配层在消息发布位识别产生；指令消息不发布 `MessageReceived`，
+/// 因此不落库、不进角色上下文、不进插件 message 订阅（硬性约束 B）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Command {
+    /// 把当前会话切换到指定角色。
+    SwitchCharacter { character_name: String },
+}
+
+/// 收到了一条系统指令。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandReceivedEvent {
+    pub conversation_id: i64,
+    pub sender_id: i64,
+    /// 发送者外部平台 ID（如 QQ 号），供权限校验使用。
+    pub external_sender_id: String,
+    pub message_id: i64,
+    pub content: String,
+    pub timestamp: DateTime<Utc>,
+    pub command: Command,
 }

@@ -543,9 +543,26 @@ mod tests {
         async fn find_all(&self) -> Result<Vec<CharacterBinding>, RepositoryError> {
             Ok(self.bindings.lock().unwrap().clone())
         }
+        async fn find_all_enabled(&self) -> Result<Vec<CharacterBinding>, RepositoryError> {
+            Ok(self
+                .bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| b.proactive_enabled)
+                .cloned()
+                .collect())
+        }
         async fn insert(&self, b: &CharacterBinding) -> Result<i64, RepositoryError> {
             self.bindings.lock().unwrap().push(b.clone());
             Ok(b.id)
+        }
+        async fn update(&self, binding: &CharacterBinding) -> Result<(), RepositoryError> {
+            let mut bindings = self.bindings.lock().unwrap();
+            if let Some(existing) = bindings.iter_mut().find(|b| b.id == binding.id) {
+                *existing = binding.clone();
+            }
+            Ok(())
         }
         async fn delete(&self, _id: i64) -> Result<(), RepositoryError> {
             Ok(())
@@ -663,6 +680,8 @@ mod tests {
             mute_schedule: mute_schedule.map(String::from),
             behavior_overrides: serde_json::json!({}),
             context_policy: serde_json::json!({}),
+            switched_at: None,
+            cross_reply_enabled: false,
             created_at: chrono::Utc::now(),
         }
     }

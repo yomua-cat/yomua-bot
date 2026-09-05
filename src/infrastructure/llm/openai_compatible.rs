@@ -10,6 +10,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::Deserialize;
 
 use crate::error::RuntimeError;
 use crate::infrastructure::llm::{LlmProvider, LlmRequest, LlmResponse, LlmRole, TokenUsage};
@@ -23,8 +24,32 @@ pub struct OpenAiCompatibleConfig {
     pub api_key: Option<String>,
     /// 使用的模型名称。
     pub model: String,
+    /// 用于 embedding 的模型（可选，默认为 `text-embedding-3-small`）。
+    pub embedding_model: Option<String>,
     /// 超时时间。
     pub timeout: Duration,
+}
+
+impl OpenAiCompatibleConfig {
+    /// 返回用于 embedding 的模型名称。
+    pub fn model_for_embedding(&self) -> Option<String> {
+        self.embedding_model.clone()
+    }
+}
+
+/// Embeddings API 响应。
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct EmbeddingsResponse {
+    data: Vec<EmbeddingData>,
+    model: String,
+    usage: TokenUsage,
+}
+
+/// 单个 embedding 数据项。
+#[derive(Deserialize)]
+struct EmbeddingData {
+    embedding: Vec<f32>,
 }
 
 /// OpenAI-compatible 的具体实现。
@@ -205,6 +230,42 @@ impl LlmProvider for OpenAiCompatibleProvider {
         Ok(resp.status().is_success())
     }
 
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, RuntimeError> {
+        let url = format!("{}/embeddings", self.config.base_url.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": self
+                .config
+                .model_for_embedding()
+                .unwrap_or_else(|| "text-embedding-3-small".to_string()),
+            "input": texts,
+        });
+
+        let mut builder = self.client.post(&url).json(&body);
+        if let Some(key) = &self.config.api_key {
+            builder = builder.bearer_auth(key);
+        }
+
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| RuntimeError::HttpError(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(RuntimeError::Llm(format!(
+                "Embeddings API 返回错误 {status}: {text}"
+            )));
+        }
+
+        let parsed: EmbeddingsResponse = resp
+            .json()
+            .await
+            .map_err(|e| RuntimeError::ParseError(e.to_string()))?;
+
+        Ok(parsed.data.into_iter().map(|item| item.embedding).collect())
+    }
+
     fn name(&self) -> &str {
         "openai-compatible"
     }
@@ -220,6 +281,7 @@ mod tests {
             base_url: "http://127.0.0.1:11434/v1".to_string(),
             api_key: Some("sk-test".to_string()),
             model: "qwen".to_string(),
+            embedding_model: None,
             timeout: Duration::from_secs(30),
         })
     }

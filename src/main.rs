@@ -21,13 +21,17 @@ use yomua_bot::application::character_import::{
     BindOptions, CharacterImportService, ImportOptions,
 };
 use yomua_bot::application::cognition::CognitionLayer;
+use yomua_bot::application::cognition_driver::CognitionDriver;
+use yomua_bot::application::command::CommandHandler;
 use yomua_bot::application::config::{load_llm, load_onebot, load_runtime, LlmConfig};
 use yomua_bot::application::context::ContextBuilder;
 use yomua_bot::application::conversation::ConversationManager;
 use yomua_bot::application::emotion_service::EmotionService;
 use yomua_bot::application::event_bus::EventBus;
 use yomua_bot::application::event_processor::EventProcessor;
-use yomua_bot::application::llm_scheduler::{DefaultLlmScheduler, LlmScheduler};
+use yomua_bot::application::llm_scheduler::{
+    DefaultLlmScheduler, EmbeddingScheduler, LlmScheduler,
+};
 use yomua_bot::application::memory_service::MemoryService;
 use yomua_bot::application::message_persistence::MessagePersistence;
 use yomua_bot::application::plugin_api::PluginApi;
@@ -99,6 +103,7 @@ fn build_openai_provider(cfg: &LlmConfig) -> Result<OpenAiCompatibleProvider, Ru
         base_url,
         api_key,
         model,
+        embedding_model: None,
         timeout: Duration::from_secs(timeout_secs),
     }))
 }
@@ -107,9 +112,14 @@ fn build_openai_provider(cfg: &LlmConfig) -> Result<OpenAiCompatibleProvider, Ru
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // 子命令分发：`import-card` 走导入流程；其余参数视为配置目录（兼容旧用法）。
-    if args.first().map(String::as_str) == Some("import-card") {
-        return run_import(&args[1..]).await;
+    // 子命令分发：import-card / list-characters / list-bindings / switch-character
+    // 走各自命令流程；其余参数视为配置目录（兼容旧用法，直接启动运行时）。
+    match args.first().map(String::as_str) {
+        Some("import-card") => return run_import(&args[1..]).await,
+        Some("list-characters") => return run_list_characters(&args[1..]).await,
+        Some("list-bindings") => return run_list_bindings(&args[1..]).await,
+        Some("switch-character") => return run_switch_character(&args[1..]).await,
+        _ => {}
     }
 
     let config_dir = PathBuf::from(args.first().map(String::as_str).unwrap_or_default());
@@ -170,6 +180,24 @@ async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>
     let plugin_data_repo: Arc<dyn PluginDataRepository> =
         Arc::new(SqlitePluginDataRepository::new(pool.clone()));
 
+    // G1 启动检测：同一会话存在多个角色绑定为脏数据（旧版模型遗留），
+    // 仅 warn 不自动删除；行为层取第一个绑定。
+    let all_bindings = binding_repo.find_all().await?;
+    let mut conv_counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for b in &all_bindings {
+        *conv_counts.entry(b.conversation_id).or_insert(0) += 1;
+    }
+    let mut dirty = 0;
+    for (conv, count) in conv_counts {
+        if count > 1 {
+            dirty += 1;
+            tracing::warn!(target: "runtime", conversation_id = conv, count, "会话存在多个角色绑定（脏数据），行为层将取第一个绑定");
+        }
+    }
+    if dirty == 0 {
+        tracing::info!(target: "runtime", "会话绑定检查通过：所有会话均为单角色绑定");
+    }
+
     // 5. 建立事件总线。
     let bus = EventBus::new();
 
@@ -192,7 +220,7 @@ async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>
     ));
 
     let context_builder = Arc::new(ContextBuilder::new(
-        message_repo,
+        message_repo.clone(),
         conversation_repo.clone(),
         memory_repo.clone(),
         relationship_repo.clone(),
@@ -216,7 +244,7 @@ async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>
     ));
 
     // LLM 是能力不是生命线：enabled=false 时 scheduler 为 None，走确定性回复。
-    let scheduler: Option<Arc<dyn LlmScheduler>> = if llm_cfg.enabled {
+    let llm_scheduler: Option<Arc<DefaultLlmScheduler>> = if llm_cfg.enabled {
         let provider: Arc<dyn LlmProvider> = Arc::new(build_openai_provider(&llm_cfg)?);
         tracing::info!(target: "llm", model = %provider.name(), "LLM 已启用");
         Some(Arc::new(DefaultLlmScheduler::new(provider)))
@@ -224,11 +252,13 @@ async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>
         tracing::info!(target: "llm", "LLM 未启用，使用确定性回复");
         None
     };
+    let scheduler: Option<Arc<dyn LlmScheduler>> =
+        llm_scheduler.clone().map(|s| s as Arc<dyn LlmScheduler>);
     let cognition = Arc::new(CognitionLayer::new(scheduler, context_builder.clone()));
 
     // 7. 建立会话管理器、动作执行器、OneBot 适配器。
     let conversation_manager =
-        ConversationManager::new(conversation_repo.clone(), participant_repo);
+        ConversationManager::new(conversation_repo.clone(), participant_repo.clone());
     let adapter = OneBotAdapterImpl::new(onebot_cfg, bus.clone(), conversation_manager).await;
     let adapter = Arc::new(adapter);
 
@@ -254,16 +284,25 @@ async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>
     let delay_executor: Arc<dyn DelayExecutor> = Arc::new(TokioDelayExecutor);
     let reply_processor = Arc::new(ReplyProcessor::new(
         runtime,
-        binding_manager,
+        binding_manager.clone(),
         behavior_engine.clone(),
         cognition,
         relationship_service,
         emotion_service,
         memory_service,
-        action_dispatcher,
+        action_dispatcher.clone(),
         bus.clone(),
         delay_executor,
+        participant_repo.clone(),
     ));
+
+    // 系统指令处理器（硬性约束 B）：订阅 CommandReceived，执行换角色并中文回复。
+    let command_handler = CommandHandler::new(
+        binding_manager.clone(),
+        character_repo.clone() as Arc<dyn CharacterRepository>,
+        action_dispatcher.clone(),
+        runtime_cfg.admin_users.clone(),
+    );
 
     // 8. 启动订阅者（消息持久化、事件路由）。
     let persistence_bus = bus.clone();
@@ -282,6 +321,11 @@ async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>
             .await;
     });
 
+    let command_bus = bus.clone();
+    tokio::spawn(async move {
+        command_handler.run(&command_bus).await;
+    });
+
     // 9. 启动主动行为驱动（后台 tick，无 LLM，仅状态维护）。
     let proactive_driver = ProactiveDriver::new(
         binding_repo.clone(),
@@ -293,6 +337,22 @@ async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>
     tokio::spawn(async move {
         proactive_driver.run().await;
     });
+
+    // 9.1. 启动后台认知驱动（LLM 启用时才有意义）。
+    if let Some(ref sched) = llm_scheduler {
+        let cognition_driver = Arc::new(CognitionDriver::new(
+            sched.clone() as Arc<dyn EmbeddingScheduler>,
+            sched.clone() as Arc<dyn LlmScheduler>,
+            memory_repo.clone(),
+            binding_repo.clone(),
+            message_repo.clone(),
+            character_repo.clone() as Arc<dyn CharacterRepository>,
+            yomua_bot::application::clock::system_clock(),
+        ));
+        tokio::spawn(async move {
+            cognition_driver.run().await;
+        });
+    }
 
     // 10. 插件系统（条件启用）：plugins_dir 为 None 时不启动任何插件相关任务。
     let supervisor: Option<Arc<PluginSupervisor>> =
@@ -459,6 +519,206 @@ async fn run_import(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(pid) = result.participant_id {
             println!("参与者 id={pid}");
+        }
+    }
+
+    storage.close().await;
+    Ok(())
+}
+
+/// 打开配置目录下的 SQLite 存储并迁移，装配 CLI 只读命令所需的仓储。
+///
+/// 返回 `(storage, character_repo, conversation_repo, binding_repo)`；
+/// 调用方在使用完毕后负责 `storage.close().await`。
+#[allow(clippy::type_complexity)]
+async fn open_cli_storage(
+    config_dir: &Path,
+) -> Result<
+    (
+        SqliteStorage,
+        Arc<dyn CharacterRepository>,
+        Arc<dyn ConversationRepository>,
+        Arc<dyn CharacterBindingRepository>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let runtime_cfg = load_runtime(&config_dir.join(RUNTIME_CONFIG).display().to_string())?;
+    std::fs::create_dir_all(&runtime_cfg.data_dir).map_err(|e| {
+        RuntimeError::Config(format!("无法创建数据目录 {}: {e}", runtime_cfg.data_dir))
+    })?;
+    let db_path = format!("{}/runtime.db", runtime_cfg.data_dir);
+    let storage = SqliteStorage::open(&db_path).await?;
+    storage.migrate().await?;
+    let pool = storage.pool().clone();
+
+    Ok((
+        storage,
+        Arc::new(SqliteCharacterRepository::new(pool.clone())) as Arc<dyn CharacterRepository>,
+        Arc::new(SqliteConversationRepository::new(pool.clone()))
+            as Arc<dyn ConversationRepository>,
+        Arc::new(SqliteCharacterBindingRepository::new(pool.clone()))
+            as Arc<dyn CharacterBindingRepository>,
+    ))
+}
+
+/// 解析 CLI 公共参数：`--config-dir <目录>`（默认当前目录）。
+fn parse_config_dir_arg(args: &[String]) -> Result<PathBuf, RuntimeError> {
+    let mut config_dir = PathBuf::from(".");
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--config-dir" => config_dir = PathBuf::from(arg_value(args, &mut i, arg)?),
+            _ => return Err(RuntimeError::Config(format!("未知参数：{arg}"))),
+        }
+        i += 1;
+    }
+    Ok(config_dir)
+}
+
+/// 运行 `list-characters` 子命令：列出全部角色（id + 名称）。
+///
+/// 用法：`cargo run -- list-characters [--config-dir <目录>]`
+async fn run_list_characters(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let config_dir = parse_config_dir_arg(args)?;
+    let (storage, character_repo, _, _) = open_cli_storage(&config_dir).await?;
+
+    let characters = character_repo.find_all().await?;
+    if characters.is_empty() {
+        println!("暂无角色。可使用 `import-card` 导入角色卡。");
+    } else {
+        for c in characters {
+            println!("{}\t{}", c.id, c.definition.name);
+        }
+    }
+
+    storage.close().await;
+    Ok(())
+}
+
+/// 运行 `list-bindings` 子命令：列出全部会话的角色绑定关系。
+///
+/// 用法：`cargo run -- list-bindings [--config-dir <目录>]`
+async fn run_list_bindings(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let config_dir = parse_config_dir_arg(args)?;
+    let (storage, character_repo, conversation_repo, binding_repo) =
+        open_cli_storage(&config_dir).await?;
+
+    let bindings = binding_repo.find_all().await?;
+    if bindings.is_empty() {
+        println!("暂无绑定关系。可先导入角色并绑定会话。");
+        storage.close().await;
+        return Ok(());
+    }
+
+    // 建会话与角色的 id → 实体映射，用于展示外部 ID 与角色名。
+    let conversations = conversation_repo.find_all().await?;
+    let characters = character_repo.find_all().await?;
+    let conv_by_id: std::collections::HashMap<i64, &yomua_bot::domain::conversation::Conversation> =
+        conversations.iter().map(|c| (c.id, c)).collect();
+    let char_by_id: std::collections::HashMap<i64, &yomua_bot::domain::character::Character> =
+        characters.iter().map(|c| (c.id, c)).collect();
+
+    println!("绑定ID\t会话外部ID\t会话类型\t角色\t切换时间");
+    for b in bindings {
+        let external_id = conv_by_id
+            .get(&b.conversation_id)
+            .map(|c| c.external_id.as_str())
+            .unwrap_or("-");
+        let conv_type = conv_by_id
+            .get(&b.conversation_id)
+            .map(|c| match c.conversation_type {
+                ConversationType::Group => "群聊",
+                ConversationType::Private => "私聊",
+            })
+            .unwrap_or("-");
+        let name = char_by_id
+            .get(&b.character_id)
+            .map(|c| c.definition.name.as_str())
+            .unwrap_or("-");
+        let switched_at = b
+            .switched_at
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{}\t{external_id}\t{conv_type}\t{name}\t{switched_at}",
+            b.id
+        );
+    }
+
+    storage.close().await;
+    Ok(())
+}
+
+/// 运行 `switch-character` 子命令：把一个已存在会话的角色切换到指定角色。
+///
+/// 用法：`cargo run -- switch-character <角色名> --conversation <外部ID> [--group] [--config-dir <目录>]`
+///
+/// `--group` 表示目标会话为群聊（默认私聊）；本命令只查询已存在会话，
+/// 不会像 `import-card` 那样创建会话。
+async fn run_switch_character(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config_dir = PathBuf::from(".");
+    let mut conversation_external_id: Option<String> = None;
+    let mut character_name: Option<String> = None;
+    let mut conversation_type = ConversationType::Private;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--config-dir" => config_dir = PathBuf::from(arg_value(args, &mut i, arg)?),
+            "--conversation" => conversation_external_id = Some(arg_value(args, &mut i, arg)?),
+            "--group" => conversation_type = ConversationType::Group,
+            _ if arg.starts_with('-') => {
+                return Err(RuntimeError::Config(format!("未知参数：{arg}")).into());
+            }
+            _ => character_name = Some(arg.to_string()),
+        }
+        i += 1;
+    }
+
+    let character_name = character_name.ok_or_else(|| {
+        RuntimeError::Config(
+            "请指定角色名（例：switch-character 木然 --conversation 123456）".to_string(),
+        )
+    })?;
+    let external_id = conversation_external_id.ok_or_else(|| {
+        RuntimeError::Config("请用 --conversation 指定目标会话外部 ID（群号或用户号）".to_string())
+    })?;
+
+    tracing::debug!(target: "cli", ?conversation_type, "准备切换会话角色");
+
+    // 打开存储并装配局部仓储（只读查询，不创建会话）。
+    let (storage, character_repo, conversation_repo, binding_repo) =
+        open_cli_storage(&config_dir).await?;
+
+    let target_conversation = conversation_repo
+        .find_by_external_id(&external_id)
+        .await?
+        .ok_or_else(|| RuntimeError::Config(format!("未找到会话 {external_id}")))?;
+
+    let target_character = character_repo
+        .find_all()
+        .await?
+        .into_iter()
+        .find(|c| c.definition.name == character_name)
+        .ok_or_else(|| RuntimeError::Config(format!("未找到角色 {character_name}")))?;
+
+    let binding_manager = BindingManager::new(
+        binding_repo,
+        character_repo.clone(),
+        conversation_repo.clone(),
+    );
+    match binding_manager
+        .switch_character(target_conversation.id, target_character.id)
+        .await
+    {
+        Ok(_) => {
+            println!("已把会话 {external_id} 的角色切换为「{character_name}」");
+        }
+        Err(e) => {
+            eprintln!("换角色失败：{e}");
+            return Err(e.into());
         }
     }
 

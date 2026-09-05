@@ -334,19 +334,23 @@ pub enum EventType {
 
 impl EventType {
     /// 将核心事件映射为事件类型（忽略数据字段）。
-    pub fn from_core_event(e: &CoreEvent) -> EventType {
+    ///
+    /// 返回 `None` 表示该事件不对插件暴露（如系统指令 —— 硬性约束 B）。
+    pub fn from_core_event(e: &CoreEvent) -> Option<EventType> {
         match e {
-            CoreEvent::MessageReceived(_) => EventType::MessageReceived,
-            CoreEvent::MessageSent(_) => EventType::MessageSent,
-            CoreEvent::CharacterStateChanged(_) => EventType::CharacterStateChanged,
-            CoreEvent::EmotionChanged(_) => EventType::EmotionChanged,
-            CoreEvent::RelationshipChanged(_) => EventType::RelationshipChanged,
-            CoreEvent::MemoryCreated(_) => EventType::MemoryCreated,
-            CoreEvent::BehaviorDecided(_) => EventType::BehaviorDecided,
-            CoreEvent::ResponseGenerated(_) => EventType::ResponseGenerated,
-            CoreEvent::AdapterConnected(_) => EventType::AdapterConnected,
-            CoreEvent::AdapterDisconnected(_) => EventType::AdapterDisconnected,
-            CoreEvent::ScheduledTaskTriggered(_) => EventType::ScheduledTaskTriggered,
+            CoreEvent::MessageReceived(_) => Some(EventType::MessageReceived),
+            CoreEvent::MessageSent(_) => Some(EventType::MessageSent),
+            CoreEvent::CharacterStateChanged(_) => Some(EventType::CharacterStateChanged),
+            CoreEvent::EmotionChanged(_) => Some(EventType::EmotionChanged),
+            CoreEvent::RelationshipChanged(_) => Some(EventType::RelationshipChanged),
+            CoreEvent::MemoryCreated(_) => Some(EventType::MemoryCreated),
+            CoreEvent::BehaviorDecided(_) => Some(EventType::BehaviorDecided),
+            CoreEvent::ResponseGenerated(_) => Some(EventType::ResponseGenerated),
+            CoreEvent::AdapterConnected(_) => Some(EventType::AdapterConnected),
+            CoreEvent::AdapterDisconnected(_) => Some(EventType::AdapterDisconnected),
+            CoreEvent::ScheduledTaskTriggered(_) => Some(EventType::ScheduledTaskTriggered),
+            // 系统指令不对插件暴露（硬性约束 B）：插件收不到指令消息。
+            CoreEvent::CommandReceived(_) => None,
         }
     }
 
@@ -657,8 +661,25 @@ mod tests {
             EventType::ScheduledTaskTriggered,
         ];
         for (event, ty) in events.iter().zip(expected) {
-            assert_eq!(EventType::from_core_event(event), ty);
+            assert_eq!(EventType::from_core_event(event), Some(ty));
         }
+    }
+
+    #[test]
+    fn from_core_event_command_received_is_none() {
+        // 系统指令不对插件暴露（硬性约束 B）：插件收不到指令消息。
+        let event = CoreEvent::CommandReceived(crate::domain::event::CommandReceivedEvent {
+            conversation_id: 1,
+            sender_id: 2,
+            external_sender_id: "900001".to_string(),
+            message_id: 3,
+            content: "换角色 木然".to_string(),
+            timestamp: ts(),
+            command: crate::domain::event::Command::SwitchCharacter {
+                character_name: "木然".to_string(),
+            },
+        });
+        assert_eq!(EventType::from_core_event(&event), None);
     }
 
     #[test]

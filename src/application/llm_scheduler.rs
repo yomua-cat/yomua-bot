@@ -24,6 +24,15 @@ pub trait LlmScheduler: Send + Sync {
     async fn submit(&self, request: LlmRequest) -> Result<LlmResponse, RuntimeError>;
 }
 
+/// Embedding 调度器 trait —— 所有 embedding 调用的统一抽象。
+///
+/// 使用独立的信号量限制并发（默认 4），优先级固定为 P3（后台任务，满载丢弃）。
+#[async_trait::async_trait]
+pub trait EmbeddingScheduler: Send + Sync {
+    /// 提交一个 embedding 请求并返回向量列表。
+    async fn submit_embedding(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, RuntimeError>;
+}
+
 /// 基于 [`LlmProvider`] 的默认调度器实现。
 ///
 /// 内部使用 `tokio::sync::Semaphore` 限制并发请求数（`pending_limit`，默认 4）。
@@ -34,19 +43,31 @@ pub trait LlmScheduler: Send + Sync {
 pub struct DefaultLlmScheduler {
     inner: Arc<dyn LlmProvider>,
     semaphore: Arc<Semaphore>,
+    /// embedding 专用信号量（默认 4）。
+    embedding_semaphore: Arc<Semaphore>,
 }
 
 impl DefaultLlmScheduler {
-    /// 创建一个默认调度器（pending_limit 默认 4）。
+    /// 创建一个默认调度器（pending_limit 默认 4，embedding_limit 默认 4）。
     pub fn new(inner: Arc<dyn LlmProvider>) -> Self {
-        Self::with_limit(inner, 4)
+        Self::with_limits(inner, 4, 4)
     }
 
-    /// 创建一个可配置并发上限的调度器。
+    /// 创建一个可配置并发上限的调度器（embedding 使用相同上限）。
     pub fn with_limit(inner: Arc<dyn LlmProvider>, pending_limit: usize) -> Self {
+        Self::with_limits(inner, pending_limit, pending_limit)
+    }
+
+    /// 创建一个可分别配置 LLM 和 embedding 并发上限的调度器。
+    pub fn with_limits(
+        inner: Arc<dyn LlmProvider>,
+        pending_limit: usize,
+        embedding_limit: usize,
+    ) -> Self {
         Self {
             inner,
             semaphore: Arc::new(Semaphore::new(pending_limit.max(1))),
+            embedding_semaphore: Arc::new(Semaphore::new(embedding_limit.max(1))),
         }
     }
 
@@ -104,6 +125,20 @@ impl DefaultLlmScheduler {
 impl LlmScheduler for DefaultLlmScheduler {
     async fn submit(&self, request: LlmRequest) -> Result<LlmResponse, RuntimeError> {
         self.dispatch(request).await
+    }
+}
+
+#[async_trait::async_trait]
+impl EmbeddingScheduler for DefaultLlmScheduler {
+    async fn submit_embedding(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, RuntimeError> {
+        // P3：满载时丢弃（背压保护）。
+        match self.embedding_semaphore.clone().try_acquire_owned() {
+            Ok(_permit) => self.inner.embed(texts).await,
+            Err(_) => {
+                tracing::debug!(target: "llm", "Embedding 请求在满载时被丢弃（背压保护）");
+                Err(RuntimeError::Llm("Embedding 请求因满载被丢弃".to_string()))
+            }
+        }
     }
 }
 

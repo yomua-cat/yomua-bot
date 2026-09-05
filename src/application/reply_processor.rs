@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use rand::seq::SliceRandom;
 
 use crate::application::action::ActionDispatcher;
 use crate::application::behavior_engine::RuleBehaviorEngine;
@@ -21,9 +22,11 @@ use crate::application::memory_service::MemoryService;
 use crate::application::relationship_service::RelationshipService;
 use crate::application::runtime::CharacterRuntime;
 use crate::domain::behavior::{Action, BehaviorAction};
+use crate::domain::conversation::ParticipantRole;
 use crate::domain::event::{
     BehaviorDecidedEvent, CoreEvent, MessageReceivedEvent, ResponseGeneratedEvent, ResponseSource,
 };
+use crate::domain::repository::ParticipantRepository;
 use crate::error::RuntimeError;
 
 /// 单次回复最长允许的拟人化延迟（毫秒）。
@@ -35,6 +38,18 @@ const MAX_REPLY_DELAY_MS: u64 = 3_000;
 /// 把行为引擎给出的延迟截断到安全上限。
 fn capped_delay_ms(delay_ms: u64) -> u64 {
     delay_ms.min(MAX_REPLY_DELAY_MS)
+}
+
+/// 待发送的回复（延迟发送，打乱顺序）。
+struct PendingReply {
+    /// 所属绑定 ID（用于日志追踪）。
+    binding_id: i64,
+    /// 回复内容。
+    content: String,
+    /// 目标会话 ID。
+    conversation_id: i64,
+    /// 延迟时长。
+    delay: Duration,
 }
 
 /// 延迟执行器 —— 把"等待 N 毫秒"抽象为可注入依赖。
@@ -69,6 +84,8 @@ pub struct ReplyProcessor {
     action_dispatcher: Arc<ActionDispatcher>,
     event_bus: EventBus,
     delay_executor: Arc<dyn DelayExecutor>,
+    /// 参与者仓储（用于跨回复场景：查询当前 Bot 的 participant_id）。
+    participant_repo: Arc<dyn ParticipantRepository>,
 }
 
 impl ReplyProcessor {
@@ -85,6 +102,7 @@ impl ReplyProcessor {
         action_dispatcher: Arc<ActionDispatcher>,
         event_bus: EventBus,
         delay_executor: Arc<dyn DelayExecutor>,
+        participant_repo: Arc<dyn ParticipantRepository>,
     ) -> Self {
         Self {
             runtime,
@@ -97,91 +115,169 @@ impl ReplyProcessor {
             action_dispatcher,
             event_bus,
             delay_executor,
+            participant_repo,
         }
     }
 
     /// 处理一条收到的消息事件。
     ///
-    /// 若该会话没有绑定任何角色，则记录日志并忽略（MVP 单角色每会话）。
+    /// 遍历该会话的所有绑定，每个绑定独立决策是否回复。
+    /// 多 Bot 共群时，所有待发送回复延迟随机打乱后顺序发送。
     pub async fn process(&self, event: &MessageReceivedEvent) -> Result<(), RuntimeError> {
-        // 1. 确定参与角色：MVP 取该会话的第一个绑定。
+        // 1. 获取该会话的所有绑定。
         let bindings = self
             .binding_manager
             .by_conversation(event.conversation_id)
             .await?;
-        let Some(binding) = bindings.first() else {
+        if bindings.is_empty() {
             tracing::debug!(
                 target: "runtime",
                 conversation_id = event.conversation_id,
                 "该会话未绑定角色，忽略消息"
             );
             return Ok(());
-        };
-        let character_id = binding.character_id;
-
-        // 2. 加载角色（运行时缓存 + 状态持久化）。
-        let character = self.runtime.load_character(character_id).await?;
-
-        // 2.5 记忆提取：用户消息可能包含值得长期记住的信息（确定性启发式）。
-        self.memory_service
-            .extract_and_store(
-                character_id,
-                Some(event.conversation_id),
-                event.sender_id,
-                &event.content,
-            )
-            .await?;
-
-        // 3. 更新关系与情绪并持久化。
-        let _relationship = self
-            .relationship_service
-            .record_interaction(character_id, event.sender_id)
-            .await?;
-        let _emotion = self
-            .emotion_service
-            .apply_message_event(character_id, &event.content)
-            .await?;
-
-        // 4. 行为决策。
-        let decision = self
-            .behavior_engine
-            .decide_response(
-                character_id,
-                event.conversation_id,
-                &event.content,
-                event.is_mentioned,
-                Some(event.sender_id),
-            )
-            .await?;
-
-        self.event_bus
-            .publish(&CoreEvent::BehaviorDecided(BehaviorDecidedEvent {
-                character_id,
-                conversation_id: event.conversation_id,
-                action: format!("{:?}", decision.action),
-                reason: decision.reason,
-                timestamp: Utc::now(),
-            }));
-
-        // 仅回复动作继续。
-        if decision.action != BehaviorAction::Reply {
-            return Ok(());
         }
 
-        // 5. 生成响应内容。
-        let content = self.generate_reply(event, &character, character_id).await?;
+        // 2. 收集所有待发送回复（延迟发送，打乱顺序）。
+        let mut pending_replies: Vec<PendingReply> = Vec::new();
 
-        // 6. 发送前按决策延迟（拟人化输入间隔），并截断到安全上限。
-        let wait_ms = capped_delay_ms(decision.delay_ms);
-        self.delay_executor.delay(wait_ms).await;
+        for binding in &bindings {
+            // 2a. cross_reply_enabled 检查：非跨回复模式下只处理自己收到的消息。
+            if !binding.cross_reply_enabled {
+                let my_participant_id = match self.get_my_participant_id(binding).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "runtime",
+                            binding_id = binding.id,
+                            "获取当前 Bot participant_id 失败: {e}"
+                        );
+                        continue;
+                    }
+                };
+                if event.sender_id != my_participant_id {
+                    continue;
+                }
+            }
 
-        // 7. 分派发送动作。
-        self.action_dispatcher
-            .execute(&Action::SendMessage {
-                conversation_id: event.conversation_id,
+            let character_id = binding.character_id;
+
+            // 2b. 加载角色（运行时缓存 + 状态持久化）。
+            let character = match self.runtime.load_character(character_id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "runtime",
+                        binding_id = binding.id,
+                        character_id,
+                        "加载角色失败: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            // 2c. 记忆提取：用户消息可能包含值得长期记住的信息（确定性启发式）。
+            if let Err(e) = self
+                .memory_service
+                .extract_and_store(
+                    character_id,
+                    Some(event.conversation_id),
+                    event.sender_id,
+                    &event.content,
+                )
+                .await
+            {
+                tracing::warn!(target: "runtime", binding_id = binding.id, "记忆提取失败: {e}");
+            }
+
+            // 2d. 更新关系与情绪并持久化。
+            if let Err(e) = self
+                .relationship_service
+                .record_interaction(character_id, event.sender_id)
+                .await
+            {
+                tracing::warn!(target: "runtime", binding_id = binding.id, "关系更新失败: {e}");
+            }
+            if let Err(e) = self
+                .emotion_service
+                .apply_message_event(character_id, &event.content)
+                .await
+            {
+                tracing::warn!(target: "runtime", binding_id = binding.id, "情绪更新失败: {e}");
+            }
+
+            // 2e. 行为决策。
+            let decision = match self
+                .behavior_engine
+                .decide_response(
+                    character_id,
+                    event.conversation_id,
+                    &event.content,
+                    event.is_mentioned,
+                    Some(event.sender_id),
+                )
+                .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(target: "runtime", binding_id = binding.id, "行为决策失败: {e}");
+                    continue;
+                }
+            };
+
+            self.event_bus
+                .publish(&CoreEvent::BehaviorDecided(BehaviorDecidedEvent {
+                    character_id,
+                    conversation_id: event.conversation_id,
+                    action: format!("{:?}", decision.action),
+                    reason: decision.reason.clone(),
+                    timestamp: Utc::now(),
+                }));
+
+            // 仅回复动作继续。
+            if decision.action != BehaviorAction::Reply {
+                continue;
+            }
+
+            // 2f. 生成响应内容。
+            let content = match self.generate_reply(event, &character, character_id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(target: "runtime", binding_id = binding.id, "生成回复失败: {e}");
+                    continue;
+                }
+            };
+
+            // 2g. 收集待发送回复，延迟使用 BehaviorEngine 返回的延迟（截断到安全上限）。
+            pending_replies.push(PendingReply {
+                binding_id: binding.id,
                 content,
-            })
-            .await?;
+                conversation_id: event.conversation_id,
+                delay: Duration::from_millis(capped_delay_ms(decision.delay_ms)),
+            });
+        }
+
+        // 3. 延迟 + 随机打乱顺序后发送。
+        pending_replies.shuffle(&mut rand::thread_rng());
+        for pending in pending_replies {
+            self.delay_executor
+                .delay(pending.delay.as_millis() as u64)
+                .await;
+            if let Err(e) = self
+                .action_dispatcher
+                .execute(&Action::SendMessage {
+                    conversation_id: pending.conversation_id,
+                    content: pending.content,
+                })
+                .await
+            {
+                tracing::warn!(
+                    target: "runtime",
+                    binding_id = pending.binding_id,
+                    "发送回复失败: {e}"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -230,6 +326,33 @@ impl ReplyProcessor {
             }));
         Ok(content)
     }
+
+    /// 获取当前 Bot 在该 binding 对应会话中的 participant_id。
+    ///
+    /// 通过查询 participants 表：role='character' AND conversation_id=binding.conversation_id。
+    /// 返回该会话中 Bot 参与者（role='character'）的 ID。
+    async fn get_my_participant_id(
+        &self,
+        binding: &crate::domain::character::CharacterBinding,
+    ) -> Result<i64, RuntimeError> {
+        let participants = self
+            .participant_repo
+            .find_by_conversation_id(binding.conversation_id)
+            .await
+            .map_err(RuntimeError::Repository)?;
+
+        // 查找 role='character' 的参与者（表示 Bot 自身）。
+        let character_participant = participants
+            .into_iter()
+            .find(|p| p.role == ParticipantRole::Character);
+
+        character_participant.map(|p| p.id).ok_or_else(|| {
+            RuntimeError::Repository(crate::error::RepositoryError::NotFound(format!(
+                "未找到会话 {} 中的 character 参与者",
+                binding.conversation_id
+            )))
+        })
+    }
 }
 
 /// 在未启用 LLM 时给出的确定性礼貌确认。
@@ -260,7 +383,7 @@ mod tests {
     use crate::domain::repository::{
         CharacterBindingRepository, CharacterRepository, CharacterStateRepository,
         ConversationRepository, EmotionStateRepository, MemoryRepository, MessageRepository,
-        RelationshipRepository,
+        ParticipantRepository, RelationshipRepository,
     };
     use crate::error::RepositoryError;
     use crate::infrastructure::llm::{LlmProvider, LlmRequest, LlmResponse, TokenUsage};
@@ -343,8 +466,25 @@ mod tests {
         async fn find_all(&self) -> Result<Vec<CharacterBinding>, RepositoryError> {
             Ok(self.bindings.lock().unwrap().clone())
         }
+        async fn find_all_enabled(&self) -> Result<Vec<CharacterBinding>, RepositoryError> {
+            Ok(self
+                .bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| b.proactive_enabled)
+                .cloned()
+                .collect())
+        }
         async fn insert(&self, _b: &CharacterBinding) -> Result<i64, RepositoryError> {
             Ok(1)
+        }
+        async fn update(&self, binding: &CharacterBinding) -> Result<(), RepositoryError> {
+            let mut bindings = self.bindings.lock().unwrap();
+            if let Some(existing) = bindings.iter_mut().find(|b| b.id == binding.id) {
+                *existing = binding.clone();
+            }
+            Ok(())
         }
         async fn delete(&self, _id: i64) -> Result<(), RepositoryError> {
             Ok(())
@@ -405,6 +545,12 @@ mod tests {
         }
         async fn insert(&self, _m: &Message) -> Result<i64, RepositoryError> {
             Ok(1)
+        }
+        async fn latest_message_time(
+            &self,
+            _conversation_id: i64,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, RepositoryError> {
+            Ok(None)
         }
     }
 
@@ -482,6 +628,52 @@ mod tests {
         async fn upsert(&self, id: i64, state: &EmotionState) -> Result<(), RepositoryError> {
             self.states.lock().unwrap().insert(id, state.clone());
             Ok(())
+        }
+    }
+
+    struct MemParticipantRepo {
+        /// 预设的参与者列表（每个会话一个 role='character' 的 Bot 参与者）。
+        participants: Mutex<Vec<crate::domain::conversation::Participant>>,
+    }
+    #[async_trait]
+    impl ParticipantRepository for MemParticipantRepo {
+        async fn find_by_id(
+            &self,
+            id: i64,
+        ) -> Result<Option<crate::domain::conversation::Participant>, RepositoryError> {
+            Ok(self
+                .participants
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|p| p.id == id)
+                .cloned())
+        }
+        async fn find_by_external_id(
+            &self,
+            _conversation_id: i64,
+            _external_id: &str,
+        ) -> Result<Option<crate::domain::conversation::Participant>, RepositoryError> {
+            Ok(None)
+        }
+        async fn find_by_conversation_id(
+            &self,
+            conversation_id: i64,
+        ) -> Result<Vec<crate::domain::conversation::Participant>, RepositoryError> {
+            Ok(self
+                .participants
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.conversation_id == conversation_id)
+                .cloned()
+                .collect())
+        }
+        async fn insert(
+            &self,
+            _participant: &crate::domain::conversation::Participant,
+        ) -> Result<i64, RepositoryError> {
+            Ok(1)
         }
     }
 
@@ -617,6 +809,7 @@ mod tests {
         Arc<MemRelationshipRepo>,
         Arc<MemStateRepo>,
         Arc<MemBindingRepo>,
+        Arc<MemParticipantRepo>,
     );
 
     async fn wire(onbot_conv: bool, use_llm: bool) -> Wiring {
@@ -649,6 +842,8 @@ mod tests {
                 mute_schedule: None,
                 behavior_overrides: serde_json::json!({}),
                 context_policy: serde_json::json!({}),
+                switched_at: None,
+                cross_reply_enabled: false,
                 created_at: chrono::Utc::now(),
             }]),
         });
@@ -679,6 +874,17 @@ mod tests {
         });
         let emotion_repo = Arc::new(MemEmotionRepo {
             states: Mutex::new(HashMap::new()),
+        });
+        // 预设 Bot 参与者（sender_id=55 对应 id=55，role='character'）。
+        let participant_repo = Arc::new(MemParticipantRepo {
+            participants: Mutex::new(vec![crate::domain::conversation::Participant {
+                id: 55,
+                conversation_id: 100,
+                external_id: "bot123".to_string(),
+                display_name: "TestBot".to_string(),
+                role: crate::domain::conversation::ParticipantRole::Character,
+                metadata: serde_json::json!({}),
+            }]),
         });
 
         let bus = EventBus::new();
@@ -756,6 +962,7 @@ mod tests {
             action_dispatcher,
             bus,
             delay_executor,
+            participant_repo.clone(),
         ));
 
         (
@@ -766,6 +973,7 @@ mod tests {
             relationship_repo,
             state_repo,
             binding_repo,
+            participant_repo,
         )
     }
 
@@ -783,7 +991,7 @@ mod tests {
     #[tokio::test]
     async fn no_binding_ignores_message() {
         // 覆盖空绑定场景：清空 bindings，process 应正常返回且不发送。
-        let (processor, adapter, _, _, _, _, binding_repo) = wire(false, false).await;
+        let (processor, adapter, _, _, _, _, binding_repo, _) = wire(false, false).await;
         binding_repo.bindings.lock().unwrap().clear();
         processor
             .process(&received_event(true))
@@ -794,7 +1002,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_llm_uses_deterministic_reply() {
-        let (processor, adapter, provider, emotion_repo, rel_repo, state_repo, _) =
+        let (processor, adapter, provider, emotion_repo, rel_repo, state_repo, _, _) =
             wire(false, false).await;
         processor
             .process(&received_event(true))
@@ -818,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn enabled_llm_uses_provider_reply() {
-        let (processor, adapter, provider, _, _, _, _) = wire(false, true).await;
+        let (processor, adapter, provider, _, _, _, _, _) = wire(false, true).await;
         processor
             .process(&received_event(true))
             .await
@@ -835,7 +1043,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_conversation_routes_to_group_adapter() {
-        let (processor, adapter, _, _, _, _, _) = wire(true, false).await;
+        let (processor, adapter, _, _, _, _, _, _) = wire(true, false).await;
         processor
             .process(&received_event(true))
             .await
@@ -878,7 +1086,8 @@ mod tests {
             release: Arc::new(Mutex::new(Some(release_rx))),
         });
 
-        let (processor, adapter, _, _, _, _, _) = wire_with_delay(false, false, controlled).await;
+        let (processor, adapter, _, _, _, _, _, _) =
+            wire_with_delay(false, false, controlled).await;
 
         // 在任务中处理消息（MentionOnly + mentioned → delay 1600 > 0）。
         let proc = processor.clone();
@@ -914,7 +1123,7 @@ mod tests {
         let recording: Arc<dyn DelayExecutor> = Arc::new(RecordingDelay {
             delays: recorded.clone(),
         });
-        let (processor, adapter, _, _, _, _, _) = wire_with_delay(false, false, recording).await;
+        let (processor, adapter, _, _, _, _, _, _) = wire_with_delay(false, false, recording).await;
 
         processor
             .process(&received_event(true))

@@ -430,6 +430,8 @@ mod storage_tests {
             mute_schedule: Some("23:00-07:00".to_string()),
             behavior_overrides: serde_json::json!({}),
             context_policy: serde_json::json!({}),
+            switched_at: None,
+            cross_reply_enabled: false,
             created_at: chrono::Utc::now(),
         };
         binding_repo.insert(&b1).await.unwrap();
@@ -442,6 +444,144 @@ mod storage_tests {
             all[0].mute_schedule.as_deref(),
             Some("23:00-07:00"),
             "mute_schedule 应持久化"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_binding_switched_at_roundtrip() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let conv_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let binding_repo =
+            crate::infrastructure::storage::repository::SqliteCharacterBindingRepository::new(
+                storage.pool().clone(),
+            );
+
+        let character = Character {
+            id: 0,
+            definition: CharacterDefinition {
+                name: "BindSwitch".to_string(),
+                description: None,
+                personality: None,
+                scenario: None,
+                style: None,
+                background: None,
+                greetings: vec![],
+                example_messages: vec![],
+                system_prompt: None,
+                post_history_instructions: None,
+                lorebook: vec![],
+                metadata: serde_json::json!({}),
+            },
+            state: CharacterState::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let char_id = char_repo.insert(&character).await.unwrap();
+
+        let conv = Conversation {
+            id: 0,
+            conversation_type: ConversationType::Private,
+            external_id: "bind-switch-user".to_string(),
+            name: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let conv_id = conv_repo.insert(&conv).await.unwrap();
+
+        // switched_at = Some(固定时间) → 应能往返持久化。
+        let switched_at = chrono::DateTime::parse_from_rfc3339("2026-05-01T08:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let b1 = CharacterBinding {
+            id: 0,
+            character_id: char_id,
+            conversation_id: conv_id,
+            reply_mode: crate::domain::character::ReplyMode::Occasionally,
+            proactive_enabled: true,
+            mute_schedule: None,
+            behavior_overrides: serde_json::json!({"tone": "cool"}),
+            context_policy: serde_json::json!({"history": 30}),
+            switched_at: Some(switched_at),
+            cross_reply_enabled: false,
+            created_at: chrono::Utc::now(),
+        };
+        let b1_id = binding_repo.insert(&b1).await.unwrap();
+        assert!(b1_id > 0);
+
+        let found = binding_repo.find_all().await.expect("find_all 应成功");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].switched_at,
+            Some(switched_at),
+            "switched_at 应持久化为原值"
+        );
+
+        // switched_at = None → 回来仍为 None（G1：需换一个会话插入，同会话仅允许一个绑定）。
+        let conv2 = Conversation {
+            id: 0,
+            conversation_type: ConversationType::Private,
+            external_id: "bind-switch-user-2".to_string(),
+            name: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let conv2_id = conv_repo.insert(&conv2).await.unwrap();
+        let b2 = CharacterBinding {
+            id: 0,
+            character_id: char_id,
+            conversation_id: conv2_id,
+            reply_mode: crate::domain::character::ReplyMode::Natural,
+            proactive_enabled: false,
+            mute_schedule: None,
+            behavior_overrides: serde_json::json!({}),
+            context_policy: serde_json::json!({}),
+            switched_at: None,
+            cross_reply_enabled: false,
+            created_at: chrono::Utc::now(),
+        };
+        let b2_id = binding_repo.insert(&b2).await.unwrap();
+        let by_conv = binding_repo
+            .find_by_conversation_id(conv2_id)
+            .await
+            .expect("find_by_conversation_id 应成功");
+        assert_eq!(by_conv.len(), 1);
+        let b2_back = by_conv.iter().find(|b| b.id == b2_id).unwrap();
+        assert_eq!(b2_back.switched_at, None, "None 应保持 None");
+
+        // update：整体替换字段（换角色 + 更新 switched_at）。
+        let switched_at2 = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut updated = found[0].clone();
+        updated.character_id = char_id;
+        updated.reply_mode = crate::domain::character::ReplyMode::MentionOnly;
+        updated.proactive_enabled = false;
+        updated.switched_at = Some(switched_at2);
+        binding_repo.update(&updated).await.expect("update 应成功");
+
+        let after = binding_repo
+            .find_by_conversation_id(conv_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == b1_id)
+            .unwrap();
+        assert_eq!(after.character_id, char_id);
+        assert_eq!(
+            after.reply_mode,
+            crate::domain::character::ReplyMode::MentionOnly
+        );
+        assert!(!after.proactive_enabled);
+        assert_eq!(
+            after.switched_at,
+            Some(switched_at2),
+            "update 应写入新 switched_at"
         );
     }
 

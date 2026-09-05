@@ -24,6 +24,12 @@ pub enum RuntimeError {
     #[error("LLM 错误：{0}")]
     Llm(String),
 
+    #[error("HTTP 错误：{0}")]
+    HttpError(String),
+
+    #[error("解析错误：{0}")]
+    ParseError(String),
+
     #[error("角色卡导入错误：{0}")]
     CardImport(String),
 

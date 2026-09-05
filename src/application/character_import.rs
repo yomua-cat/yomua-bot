@@ -312,13 +312,10 @@ mod tests {
         assert!(result.binding_id.is_some());
         assert!(result.participant_id.is_some());
 
-        // 同一会话可绑定多个角色（多角色方向允许），第二次导入应生成新角色与新绑定。
-        let second = service
-            .import_card(V3_CARD.as_bytes(), &options)
-            .await
-            .expect("再次导入应成功");
-        assert_ne!(second.character_id, result.character_id);
-        assert!(second.binding_id.is_some());
+        // G1 强制单绑定：一个会话最多一个角色绑定。
+        // 同一会话再次导入并绑定 → 应被拒绝（换角色走 switch_character，而非重复绑定）。
+        let second = service.import_card(V3_CARD.as_bytes(), &options).await;
+        assert!(second.is_err(), "同会话第二次绑定应被拒绝（G1）");
     }
 
     #[tokio::test]

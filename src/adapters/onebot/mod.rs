@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::application::conversation::ConversationManager;
 use crate::application::event_bus::EventBus;
-use crate::domain::event::{CoreEvent, MessageReceivedEvent};
+use crate::domain::event::{CommandReceivedEvent, CoreEvent, MessageReceivedEvent};
 use crate::error::RuntimeError;
 
 pub mod connection;
@@ -317,6 +317,28 @@ impl InboundProcessor {
         };
         let (conversation_id, sender_id) = resolved;
 
+        // 硬性约束 B：指令消息在发布位截流——不发布 MessageReceived（不落库、
+        // 不进角色上下文、不进插件 message 订阅），改为发布 CommandReceived。
+        if let Some(command) = crate::application::command::classify(
+            &inbound.content,
+            inbound.is_mentioned,
+            inbound.conversation_type,
+        ) {
+            let cmd_event = CoreEvent::CommandReceived(CommandReceivedEvent {
+                conversation_id,
+                sender_id,
+                external_sender_id: inbound.external_sender_id.clone(),
+                message_id: inbound.platform_message_id,
+                content: inbound.content,
+                timestamp: chrono::DateTime::from_timestamp(inbound.unix_time, 0)
+                    .unwrap_or_else(chrono::Utc::now),
+                command,
+            });
+            let receivers = self.bus.publish(&cmd_event);
+            tracing::info!(target: "adapter", conversation_id, receivers, "收到系统指令，已截流发布 CommandReceived（不落库、不进角色上下文）");
+            return;
+        }
+
         let event_out = CoreEvent::MessageReceived(MessageReceivedEvent {
             conversation_id,
             sender_id,
@@ -350,4 +372,232 @@ pub struct OneBotApiResponse {
     pub data: Option<serde_json::Value>,
     pub message: Option<String>,
     pub wording: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::conversation::ConversationManager;
+    use crate::application::event_bus::EventSubscription;
+    use crate::domain::conversation::{Conversation, Participant};
+    use crate::domain::event::Command;
+    use crate::domain::repository::{ConversationRepository, ParticipantRepository};
+    use crate::error::RepositoryError;
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+
+    // ---- 内存仓储：会话与参与者（供 ConversationManager 解析外部 ID）----
+
+    struct MemConversationRepo {
+        convs: StdMutex<Vec<Conversation>>,
+    }
+    #[async_trait]
+    impl ConversationRepository for MemConversationRepo {
+        async fn find_by_id(&self, id: i64) -> Result<Option<Conversation>, RepositoryError> {
+            Ok(self
+                .convs
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|c| c.id == id)
+                .cloned())
+        }
+        async fn find_by_external_id(
+            &self,
+            _id: &str,
+        ) -> Result<Option<Conversation>, RepositoryError> {
+            Ok(None)
+        }
+        async fn find_all(&self) -> Result<Vec<Conversation>, RepositoryError> {
+            Ok(self.convs.lock().unwrap().clone())
+        }
+        async fn insert(&self, _c: &Conversation) -> Result<i64, RepositoryError> {
+            Ok(1)
+        }
+        async fn update(&self, _c: &Conversation) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn delete(&self, _id: i64) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    struct MemParticipantRepo;
+    #[async_trait]
+    impl ParticipantRepository for MemParticipantRepo {
+        async fn find_by_id(&self, _id: i64) -> Result<Option<Participant>, RepositoryError> {
+            Ok(None)
+        }
+        async fn find_by_external_id(
+            &self,
+            _conversation_id: i64,
+            _external_id: &str,
+        ) -> Result<Option<Participant>, RepositoryError> {
+            Ok(None)
+        }
+        async fn find_by_conversation_id(
+            &self,
+            _conversation_id: i64,
+        ) -> Result<Vec<Participant>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn insert(&self, _p: &Participant) -> Result<i64, RepositoryError> {
+            Ok(1)
+        }
+    }
+
+    /// 构造直接面向 `InboundProcessor::handle_raw` 的测试处理器（不启动连接循环）。
+    fn processor() -> InboundProcessor {
+        let conversation_manager = ConversationManager::new(
+            Arc::new(MemConversationRepo {
+                convs: StdMutex::new(vec![]),
+            }),
+            Arc::new(MemParticipantRepo),
+        );
+        let (_event_tx, event_rx) = mpsc::channel(8);
+        InboundProcessor {
+            event_rx,
+            conversation_manager,
+            bus: EventBus::new(),
+        }
+    }
+
+    /// 把当前排队的全部总线事件取出来（handle_raw 已 await 完成，无竞态）。
+    fn drain(sub: &mut EventSubscription) -> Vec<CoreEvent> {
+        let mut events = Vec::new();
+        while let Some(ev) = sub.try_recv() {
+            events.push(ev);
+        }
+        events
+    }
+
+    /// 群聊消息 JSON（可选 at 段；文本内容由 `text` 给出）。
+    fn group_message_json(text: &str, with_at: bool) -> String {
+        let mut message = vec![serde_json::json!({"type": "text", "data": {"text": text}})];
+        if with_at {
+            message.insert(
+                0,
+                serde_json::json!({"type": "at", "data": {"qq": "123456", "name": "小助手"}}),
+            );
+        }
+        serde_json::json!({
+            "post_type": "message",
+            "time": 1690000000,
+            "self_id": 123456,
+            "message_type": "group",
+            "message_id": 1001,
+            "group_id": 500000,
+            "user_id": 900001,
+            "message": message,
+            "sender": {"user_id": 900001, "nickname": "小明", "card": "", "role": "member"}
+        })
+        .to_string()
+    }
+
+    /// 私聊消息 JSON（无 at 段概念）。
+    fn private_message_json(text: &str) -> String {
+        serde_json::json!({
+            "post_type": "message",
+            "time": 1690000000,
+            "self_id": 123456,
+            "message_type": "private",
+            "message_id": 1002,
+            "user_id": 555,
+            "message": text,
+            "sender": {"user_id": 555, "nickname": "小红"}
+        })
+        .to_string()
+    }
+
+    // ------------------------------------------------------------------
+    // 发布前截流（硬性约束 B）测试
+    // ------------------------------------------------------------------
+
+    /// 群聊 @ + "换角色 木然" → 只发布 CommandReceived，绝不发布 MessageReceived。
+    #[tokio::test]
+    async fn command_message_is_intercepted_not_forwarded_as_message() {
+        let p = processor();
+        let mut sub = p.bus.subscribe();
+
+        p.handle_raw(&group_message_json("换角色 木然", true)).await;
+
+        let events = drain(&mut sub);
+        assert_eq!(events.len(), 1, "应只发布一条事件（指令被截流）");
+        match &events[0] {
+            CoreEvent::CommandReceived(e) => {
+                assert_eq!(e.conversation_id, 1);
+                assert_eq!(e.sender_id, 1);
+                assert_eq!(e.external_sender_id, "900001");
+                assert_eq!(e.message_id, 1001);
+                assert_eq!(e.content, "换角色 木然");
+                assert_eq!(
+                    e.command,
+                    Command::SwitchCharacter {
+                        character_name: "木然".to_string(),
+                    }
+                );
+            }
+            other => panic!("期望 CommandReceived，实际 {other:?}"),
+        }
+    }
+
+    /// 普通消息（不含指令前缀）→ 仍发布 MessageReceived（回归保障）。
+    #[tokio::test]
+    async fn normal_message_still_published_as_message_received() {
+        let p = processor();
+        let mut sub = p.bus.subscribe();
+
+        p.handle_raw(&group_message_json("你好", false)).await;
+
+        let events = drain(&mut sub);
+        assert_eq!(events.len(), 1, "普通消息应只发布一条事件");
+        assert!(
+            matches!(&events[0], CoreEvent::MessageReceived(e) if e.content == "你好"),
+            "普通消息应发布 MessageReceived，实际 {:?}",
+            events[0]
+        );
+    }
+
+    /// 私聊无 at 的"换角色 木然" → 同样识别为指令（私聊无需 @）。
+    #[tokio::test]
+    async fn private_command_without_at_is_intercepted() {
+        let p = processor();
+        let mut sub = p.bus.subscribe();
+
+        p.handle_raw(&private_message_json("换角色 木然")).await;
+
+        let events = drain(&mut sub);
+        assert_eq!(events.len(), 1, "私聊指令应只发布一条事件");
+        match &events[0] {
+            CoreEvent::CommandReceived(e) => {
+                assert_eq!(e.external_sender_id, "555");
+                assert_eq!(e.message_id, 1002);
+                assert_eq!(
+                    e.command,
+                    Command::SwitchCharacter {
+                        character_name: "木然".to_string(),
+                    }
+                );
+            }
+            other => panic!("期望 CommandReceived，实际 {other:?}"),
+        }
+    }
+
+    /// 群聊未 at 的"换角色 木然" → 不识别，继续发布 MessageReceived。
+    #[tokio::test]
+    async fn group_command_without_mention_not_intercepted() {
+        let p = processor();
+        let mut sub = p.bus.subscribe();
+
+        p.handle_raw(&group_message_json("换角色 木然", false))
+            .await;
+
+        let events = drain(&mut sub);
+        assert_eq!(events.len(), 1, "未 @ 的群聊消息应走普通路径");
+        assert!(
+            matches!(&events[0], CoreEvent::MessageReceived(e) if e.content == "换角色 木然"),
+            "未 @ 的群聊指令应发布 MessageReceived，实际 {:?}",
+            events[0]
+        );
+    }
 }

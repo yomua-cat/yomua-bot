@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use crate::domain::character::{Character, CharacterBinding, CharacterState};
 use crate::domain::conversation::{Conversation, Participant};
 use crate::domain::emotion::EmotionState;
-use crate::domain::memory::Memory;
+use crate::domain::memory::{Memory, SemanticMatchResult};
 use crate::domain::message::Message;
 use crate::domain::relationship::Relationship;
 use crate::error::RepositoryError;
@@ -76,8 +76,14 @@ pub trait CharacterBindingRepository: Send + Sync {
     /// 查找所有绑定（供主动行为驱动枚举）。
     async fn find_all(&self) -> Result<Vec<CharacterBinding>, RepositoryError>;
 
+    /// 查找所有启用了主动行为的绑定（供认知驱动枚举）。
+    async fn find_all_enabled(&self) -> Result<Vec<CharacterBinding>, RepositoryError>;
+
     /// 插入一个新绑定。
     async fn insert(&self, binding: &CharacterBinding) -> Result<i64, RepositoryError>;
+
+    /// 更新一个既有绑定的全部字段（按 id 定位）。
+    async fn update(&self, binding: &CharacterBinding) -> Result<(), RepositoryError>;
 
     /// 按 ID 删除一个绑定。
     async fn delete(&self, id: i64) -> Result<(), RepositoryError>;
@@ -155,6 +161,12 @@ pub trait MessageRepository: Send + Sync {
 
     /// 插入一条新消息。返回生成的消息 ID。
     async fn insert(&self, message: &Message) -> Result<i64, RepositoryError>;
+
+    /// 获取一个会话中最新消息的时间戳（用于 idle 检测）。
+    async fn latest_message_time(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, RepositoryError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +204,48 @@ pub trait MemoryRepository: Send + Sync {
 
     /// 按 ID 删除一条记忆。
     async fn delete(&self, id: i64) -> Result<(), RepositoryError>;
+
+    /// 语义检索：按向量相似度 TopK 返回（纯 Rust 余弦相似度）。
+    ///
+    /// 默认实现返回空集，方便测试桩；SQLite 实现从 `semantic_memories` 表读取。
+    async fn search_by_embedding(
+        &self,
+        character_id: i64,
+        query_embedding: &[f32],
+        memory_type: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SemanticMatchResult>, RepositoryError> {
+        let _ = (character_id, query_embedding, memory_type, limit);
+        Ok(Vec::new())
+    }
+
+    /// 插入语义记忆到 semantic_memories 表（embedding 必须）。
+    ///
+    /// 默认实现返回"未实现"错误，SQLite 实现提供完整功能。
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_semantic(
+        &self,
+        character_id: i64,
+        conversation_id: Option<i64>,
+        memory_type: &str,
+        content: &str,
+        embedding: &[f32],
+        importance: f64,
+        metadata: &str,
+    ) -> Result<i64, RepositoryError> {
+        let _ = (
+            character_id,
+            conversation_id,
+            memory_type,
+            content,
+            embedding,
+            importance,
+            metadata,
+        );
+        Err(RepositoryError::Internal(
+            "insert_semantic not implemented for in-memory repository".to_string(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

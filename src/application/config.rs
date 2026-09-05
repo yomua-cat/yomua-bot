@@ -26,6 +26,9 @@ pub struct RuntimeConfig {
 
     /// 插件目录（为 `None` 时默认禁用插件系统）。
     pub plugins_dir: Option<String>,
+
+    /// 管理员用户外部 ID 列表（如 QQ 号）。为 None 时无人可执行系统指令。
+    pub admin_users: Option<Vec<String>>,
 }
 
 impl Default for RuntimeConfig {
@@ -35,6 +38,7 @@ impl Default for RuntimeConfig {
             log_level: "info".to_string(),
             shutdown_timeout_secs: 10,
             plugins_dir: None,
+            admin_users: None,
         }
     }
 }
@@ -144,6 +148,31 @@ mod tests {
         .unwrap();
         let cfg = load_runtime(path.to_str().unwrap()).unwrap();
         assert_eq!(cfg.plugins_dir.as_deref(), Some("plugins"));
+    }
+
+    #[test]
+    fn runtime_config_admin_users_default_none() {
+        // 未配置 admin_users → None（无人可执行系统指令）。
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        let cfg = load_runtime(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.admin_users, None);
+    }
+
+    #[test]
+    fn runtime_config_admin_users_parses() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        fs::write(
+            &path,
+            "data_dir = \"/tmp/runtime-data\"\nlog_level = \"info\"\nshutdown_timeout_secs = 10\nadmin_users = [\"10001\", \"10002\"]\n",
+        )
+        .unwrap();
+        let cfg = load_runtime(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            cfg.admin_users,
+            Some(vec!["10001".to_string(), "10002".to_string()])
+        );
     }
 
     #[test]

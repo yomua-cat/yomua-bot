@@ -61,13 +61,13 @@ Message
 
 消息必须保存。
 
-5. GroupContext
+5. GroupContext（后置）
 
-群聊额外拥有：
+群聊额外拥有（本期未实现，后置）：
 
 GroupContext
 ├── participants
-├── active_characters
+├── active_characters   ← 依赖多角色并存；当前模型为每会话单角色
 ├── recent_topics
 ├── group_state
 └── group_memory

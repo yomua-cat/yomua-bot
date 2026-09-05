@@ -32,10 +32,13 @@ impl CharacterBindingRepository for SqliteCharacterBindingRepository {
             Option<String>,
             String,
             String,
+            Option<String>,
             String,
+            i32,
         )> = sqlx::query_as(
             r#"SELECT id, character_id, conversation_id, reply_mode, proactive_enabled,
-                    mute_schedule, behavior_overrides, context_policy, created_at
+                    mute_schedule, behavior_overrides, context_policy, switched_at, created_at,
+                    cross_reply_enabled
                  FROM conversation_bindings WHERE character_id = ?"#,
         )
         .bind(character_id)
@@ -58,10 +61,13 @@ impl CharacterBindingRepository for SqliteCharacterBindingRepository {
             Option<String>,
             String,
             String,
+            Option<String>,
             String,
+            i32,
         )> = sqlx::query_as(
             r#"SELECT id, character_id, conversation_id, reply_mode, proactive_enabled,
-                    mute_schedule, behavior_overrides, context_policy, created_at
+                    mute_schedule, behavior_overrides, context_policy, switched_at, created_at,
+                    cross_reply_enabled
                  FROM conversation_bindings WHERE conversation_id = ?"#,
         )
         .bind(conversation_id)
@@ -74,8 +80,22 @@ impl CharacterBindingRepository for SqliteCharacterBindingRepository {
     async fn find_all(&self) -> Result<Vec<CharacterBinding>, RepositoryError> {
         let rows: Vec<BindingRow> = sqlx::query_as(
             r#"SELECT id, character_id, conversation_id, reply_mode, proactive_enabled,
-                    mute_schedule, behavior_overrides, context_policy, created_at
+                    mute_schedule, behavior_overrides, context_policy, switched_at, created_at,
+                    cross_reply_enabled
                  FROM conversation_bindings"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(parse_binding_row).collect()
+    }
+
+    async fn find_all_enabled(&self) -> Result<Vec<CharacterBinding>, RepositoryError> {
+        let rows: Vec<BindingRow> = sqlx::query_as(
+            r#"SELECT id, character_id, conversation_id, reply_mode, proactive_enabled,
+                    mute_schedule, behavior_overrides, context_policy, switched_at, created_at,
+                    cross_reply_enabled
+                 FROM conversation_bindings WHERE proactive_enabled = 1"#,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -97,8 +117,9 @@ impl CharacterBindingRepository for SqliteCharacterBindingRepository {
         let result = sqlx::query(
             r#"INSERT INTO conversation_bindings
                 (character_id, conversation_id, reply_mode, proactive_enabled,
-                 mute_schedule, behavior_overrides, context_policy)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"#,
+                 mute_schedule, behavior_overrides, context_policy, switched_at,
+                 cross_reply_enabled)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(binding.character_id)
         .bind(binding.conversation_id)
@@ -107,11 +128,48 @@ impl CharacterBindingRepository for SqliteCharacterBindingRepository {
         .bind(&binding.mute_schedule)
         .bind(&behavior_overrides)
         .bind(&context_policy)
+        .bind(binding.switched_at.map(|t| t.to_rfc3339()))
+        .bind(binding.cross_reply_enabled as i32)
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         Ok(result.last_insert_rowid())
+    }
+
+    async fn update(&self, binding: &CharacterBinding) -> Result<(), RepositoryError> {
+        let reply_mode = match binding.reply_mode {
+            ReplyMode::MentionOnly => "mention_only",
+            ReplyMode::Occasionally => "occasional",
+            ReplyMode::Natural => "natural",
+        };
+        let behavior_overrides = serde_json::to_string(&binding.behavior_overrides)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let context_policy = serde_json::to_string(&binding.context_policy)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // 单行原子 UPDATE：换角色核心。更新全部可变字段，created_at 不更新。
+        sqlx::query(
+            r#"UPDATE conversation_bindings
+                SET character_id = ?, reply_mode = ?, proactive_enabled = ?,
+                    mute_schedule = ?, behavior_overrides = ?, context_policy = ?,
+                    switched_at = ?, cross_reply_enabled = ?
+              WHERE id = ?"#,
+        )
+        .bind(binding.character_id)
+        .bind(reply_mode)
+        .bind(binding.proactive_enabled as i32)
+        .bind(&binding.mute_schedule)
+        .bind(&behavior_overrides)
+        .bind(&context_policy)
+        .bind(binding.switched_at.map(|t| t.to_rfc3339()))
+        .bind(binding.cross_reply_enabled as i32)
+        .bind(binding.id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
     }
 
     async fn delete(&self, id: i64) -> Result<(), RepositoryError> {
@@ -133,7 +191,9 @@ type BindingRow = (
     Option<String>,
     String,
     String,
+    Option<String>,
     String,
+    i32,
 );
 
 fn parse_binding_row(row: BindingRow) -> Result<CharacterBinding, RepositoryError> {
@@ -146,7 +206,9 @@ fn parse_binding_row(row: BindingRow) -> Result<CharacterBinding, RepositoryErro
         mute_schedule,
         behavior_overrides_json,
         context_policy_json,
+        switched_at,
         created_at,
+        cross_reply_enabled,
     ) = row;
 
     let reply_mode = match reply_mode_str.as_str() {
@@ -166,6 +228,11 @@ fn parse_binding_row(row: BindingRow) -> Result<CharacterBinding, RepositoryErro
         .map_err(|e| RepositoryError::Database(format!("invalid context_policy JSON: {e}")))?;
 
     let created_at = super::timestamp::parse_timestamp(&created_at)?;
+    // switched_at 列可能为 NULL（从未换过角色）——保持 None。
+    let switched_at = match switched_at {
+        Some(s) => Some(super::timestamp::parse_timestamp(&s)?),
+        None => None,
+    };
 
     Ok(CharacterBinding {
         id,
@@ -176,6 +243,8 @@ fn parse_binding_row(row: BindingRow) -> Result<CharacterBinding, RepositoryErro
         mute_schedule,
         behavior_overrides,
         context_policy,
+        switched_at,
+        cross_reply_enabled: cross_reply_enabled != 0,
         created_at,
     })
 }

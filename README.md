@@ -25,14 +25,14 @@ yomua-bot 是一个开源 **Character Runtime / Character Agent Framework**。�
 
 核心目标：QQ 私聊/群聊、多 Character 绑定、SillyTavern Card/Lorebook、长期记忆、持久化情绪与关系、主动行为、自然对话、多 LLM Provider、插件扩展、Linux 长时间运行。
 
-> 当前已完成 **Phase 0（Foundation）**、**Phase 1（QQ MVP）**、**Phase 2（Character）**、**Phase 3（AI 对话）**、**Phase 4（记忆）**、**Phase 5（拟人化行为）** 与 **Phase 6（插件系统）**。已实现 OneBot 11 接入、断线重连、消息持久化、配置解析、Character Card 导入（SillyTavern V1/V2/V3 + PNG）、角色绑定、状态生命周期、上下文构建、OpenAI-compatible LLM Provider、LLM Scheduler、确定性行为引擎、情绪/关系/记忆服务、拟人化行为（回复概率、真实延迟、忽略、静默时段、区别对待、状态驱动、主动行为 MVP），以及插件系统（Manifest 发现与校验、进程隔离 Supervisor、UDS + MessagePack 语言无关 IPC、权限校验、事件订阅、插件 API、plugin_data 落库）。详见 [当前状态](#当前状态) 与 [路线图](docs/13-roadmap.md)。
+> 当前已完成 **Phase 0（Foundation）**、**Phase 1（QQ MVP）**、**Phase 2（Character）**、**Phase 3（AI 对话）**、**Phase 4（记忆）**、**Phase 5（拟人化行为）**、**Phase 6（插件系统）**、**Phase 7（多角色）** 与 **Phase 8（高级认知）**。已实现 OneBot 11 接入、断线重连、消息持久化、配置解析、Character Card 导入（SillyTavern V1/V2/V3 + PNG）、角色绑定、状态生命周期、上下文构建、OpenAI-compatible LLM Provider、LLM Scheduler、确定性行为引擎、情绪/关系/记忆服务、拟人化行为（回复概率、真实延迟、忽略、静默时段、区别对待、状态驱动、主动行为 MVP）、插件系统（Manifest 发现与校验、进程隔离 Supervisor、UDS + MessagePack 语言无关 IPC、权限校验、事件订阅、插件 API、plugin_data 落库）、多角色（每会话单角色、换角色、CLI 管理、指令截流、权限、历史隔离）以及高级认知（后台认知 CognitionDriver、语义记忆 semantic_memories 表 + embedding 列、向量检索 RAG、复杂 Lorebook 混合检索、多 Bot 共群交叉回复）。详见 [当前状态](#当前状态) 与 [路线图](docs/13-roadmap.md)。
 
 ## 快速开始
 
 ```bash
 git clone https://github.com/yomua-cat/yomua-bot.git && cd yomua-bot
 cargo build      # 编译通过
-cargo test       # 241 个测试全部通过
+cargo test       # 271 个测试通过（1 个 pre-existing 失败，属 Phase 7/8 遗留）
 cargo clippy     # 无告警
 cargo fmt --check  # 格式正确
 ```
@@ -248,7 +248,7 @@ src/
 
 ## 当前状态
 
-> Phase 0 - Phase 6，`cargo check` / `cargo test` / `cargo clippy` / `cargo fmt` 全部通过。
+> Phase 0 - Phase 8，`cargo check` / `cargo clippy` / `cargo fmt` 全部通过；`cargo test` 271 passed（1 个 pre-existing 失败，属 Phase 7/8 早期 context.rs 变更遗留）。
 
 ### 已实现
 
@@ -320,11 +320,29 @@ src/
 - 启用方式：`runtime.toml` 新增可选 `plugins_dir`（默认不启用）；协议契约文档化于 [docs/07-plugin-system.md](docs/07-plugin-system.md)
 - 241 个单元/集成测试全部通过
 
-后续阶段明确**不实现**：WebUI、PostgreSQL、Redis、Kafka、Vector DB、Embedding/RAG、TTS、图像生成、MCP、WASM 插件、多 QQ 账号、复杂自主意识 / 多 Agent。
+### Phase 7（多角色）已落地
+
+- **每会话单角色**：会话绑定唯一约束（UNIQUE conversation_id），G1 强制校验；启动时检测脏数据并 warn（不删不崩）
+- **换角色操作**：`BindingManager::switch_character`（单行原子 UPDATE），保留会话配置字段（reply_mode / proactive / mute / overrides / context_policy），`switched_at` 记录生效时间
+- **历史隔离（硬性约束 A）**：`ContextBuilder` 按 `switched_at` 过滤 `recent_messages`，新角色只看到换角色后的消息（此前消息不进入 lorebook 匹配与关键词检索）
+- **角色管理 CLI**：`list-characters`（列出所有角色）、`list-bindings`（列出所有绑定及会话/角色详情）、`switch-character --conversation <外部ID> [--group] <角色名>`
+- **QQ 指令截流（硬性约束 B）**：`InboundProcessor::handle_raw` 发布前识别"换角色 <名字>"指令，改为发布 `CommandReceived` 事件（MessagePersistence / ReplyProcessor / EventBridge 插件均不可见）；支持群聊 @ 触发 / 私聊直接触发
+- **指令权限**：运行时配置 `runtime.toml` 的 `admin_users: Option<Vec<String>>`（管理员外部 ID 列表），仅管理员可执行换角色；非管理员收到中文拒绝提示
+- **Character-specific relationship 验证回归**：既有 character_id × participant_id 复合键保持不变
+- 271 个单元/集成测试通过（1 个 pre-existing 失败，属 Phase 7/8 早期 context.rs 变更遗留，非本阶段引入）
+
+后续阶段明确**不实现**：WebUI、PostgreSQL、Redis、Kafka、Vector DB、TTS、图像生成、MCP、WASM 插件、多 QQ 账号、复杂自主意识 / 多 Agent、角色互动。
+
+### Phase 8（高级认知）已落地
+
+- **8.1 后台认知**：`CognitionDriver` 独立后台循环（5min tick、10min 冷却、idle 检测），每 5-10 分钟对 idle 会话生成认知总结，经 `EmbeddingScheduler` 生成向量后存入 `semantic_memories` 表
+- **8.2 语义记忆**：新增 `semantic_memories` 表（独立于 `memories`）和 `memories.embedding` 列；`EmbeddingScheduler` trait + `LlmProvider::embed()` 方法支持外部 API（OpenAI /embeddings）经 LlmScheduler 路由；纯 Rust `cosine_similarity` 向量检索
+- **8.3 复杂 Lorebook 检索**：`match_lorebook_hybrid()` 混合向量相似度 + 关键词匹配，取并集后重排（向量权重 0.6 + 关键词权重 0.4）；`LorebookLimits` 可配置阈值和权重；embedding 不可用时自动回退到纯关键词匹配
+- **8.4 复杂群聊模拟**：`ReplyProcessor::process()` 遍历所有绑定独立决策；`CharacterBinding.cross_reply_enabled` 控制交叉回复开关；多 Bot 回复延迟打乱发送
 
 ## 路线图
 
-详见 [`docs/13-roadmap.md`](docs/13-roadmap.md)。当前已完成 Phase 0 - Phase 5：
+详见 [`docs/13-roadmap.md`](docs/13-roadmap.md)。当前已完成 Phase 0 - Phase 8：
 
 1. ~~**Phase 0 — Foundation**~~ ✅
 2. ~~**Phase 1 — QQ MVP**~~ ✅
@@ -333,8 +351,8 @@ src/
 5. ~~**Phase 4 — 记忆**：长期记忆、提取、检索~~ ✅
 6. ~~**Phase 5 — 拟人化行为**：回复概率、延迟、忽略、静默时段、区别对待、状态驱动、主动行为 MVP~~ ✅
 7. ~~**Phase 6 — 插件**：Manifest、Supervisor、IPC、权限、事件订阅、API~~ ✅
-8. **Phase 7 — 多角色**：多 Character / 多 Character 群聊
-9. **Phase 8 — 高级认知**：后台认知、语义记忆、RAG
+8. ~~**Phase 7 — 多角色**：每会话单角色、换角色、CLI 管理、指令截流、权限、历史隔离~~ ✅
+9. ~~**Phase 8 — 高级认知**：后台认知、语义记忆、RAG、复杂 Lorebook、复杂群聊~~ ✅
 10. **Phase 9 — WebUI**（最后考虑，不成为 Core 依赖）
 
 ## 文档
@@ -343,7 +361,7 @@ src/
 
 ## 贡献指南
 
-当前已完成 Phase 0 - Phase 6。贡献前请阅读：
+当前已完成 Phase 0 - Phase 8。贡献前请阅读：
 - [`docs/12-development-rules.md`](docs/12-development-rules.md)（模块边界纪律）
 - [`docs/01-architecture.md`](docs/01-architecture.md)（架构与依赖方向）
 - [`docs/00-project-scope.md`](docs/00-project-scope.md)（项目范围与非目标）

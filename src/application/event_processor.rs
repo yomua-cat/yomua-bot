@@ -94,6 +94,13 @@ impl EventProcessor {
                     "已触发计划任务"
                 );
             }
+            CoreEvent::CommandReceived(e) => {
+                tracing::debug!(
+                    conversation_id = e.conversation_id,
+                    command = ?e.command,
+                    "收到系统指令"
+                );
+            }
         }
 
         Ok(())

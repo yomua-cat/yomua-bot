@@ -75,6 +75,17 @@ impl BindingManager {
             ))));
         }
 
+        // G1：一个会话最多一个绑定（无论角色），保证"每会话单角色"。
+        let by_conversation = self
+            .binding_repo
+            .find_by_conversation_id(conversation_id)
+            .await?;
+        if !by_conversation.is_empty() {
+            return Err(RuntimeError::Domain(DomainError::InvalidState(format!(
+                "会话 {conversation_id} 已绑定角色，一个会话只能绑定一个角色"
+            ))));
+        }
+
         let binding = CharacterBinding {
             id: 0,
             character_id,
@@ -84,6 +95,8 @@ impl BindingManager {
             mute_schedule,
             behavior_overrides,
             context_policy,
+            switched_at: None,
+            cross_reply_enabled: false,
             created_at: Utc::now(),
         };
         self.binding_repo.insert(&binding).await?;
@@ -125,6 +138,46 @@ impl BindingManager {
         character_id: i64,
     ) -> Result<Vec<CharacterBinding>, RuntimeError> {
         Ok(self.binding_repo.find_by_character_id(character_id).await?)
+    }
+
+    /// 把会话切换到另一个角色（换角色）。
+    ///
+    /// - 校验目标角色存在；
+    /// - 取该会话当前绑定（多绑定脏数据时取第一个）；
+    /// - 更新 character_id 并把 switched_at 置为当前时间；
+    /// - 会话配置字段（reply_mode / proactive_enabled / mute_schedule /
+    ///   behavior_overrides / context_policy）随绑定保留，不随角色迁移；
+    /// - 使用仓储的单行原子 UPDATE，最小化与回复链路/主动 tick 的竞态窗口。
+    pub async fn switch_character(
+        &self,
+        conversation_id: i64,
+        new_character_id: i64,
+    ) -> Result<CharacterBinding, RuntimeError> {
+        // 校验新角色存在。
+        self.character_repo
+            .find_by_id(new_character_id)
+            .await?
+            .ok_or(RuntimeError::Domain(DomainError::CharacterNotFound(
+                new_character_id,
+            )))?;
+
+        // 取该会话当前绑定（脏数据时取第一个）。
+        let bindings = self
+            .binding_repo
+            .find_by_conversation_id(conversation_id)
+            .await?;
+        let Some(current) = bindings.into_iter().next() else {
+            return Err(RuntimeError::Domain(DomainError::InvalidState(format!(
+                "会话 {conversation_id} 未绑定角色，无法换角色"
+            ))));
+        };
+
+        // 构造更新后的绑定：保留会话配置字段，仅换角色并记录生效时间。
+        let mut updated = current.clone();
+        updated.character_id = new_character_id;
+        updated.switched_at = Some(Utc::now());
+        self.binding_repo.update(&updated).await?;
+        Ok(updated)
     }
 }
 
@@ -249,6 +302,16 @@ mod tests {
         async fn find_all(&self) -> Result<Vec<CharacterBinding>, RepositoryError> {
             Ok(self.bindings.lock().unwrap().clone())
         }
+        async fn find_all_enabled(&self) -> Result<Vec<CharacterBinding>, RepositoryError> {
+            Ok(self
+                .bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| b.proactive_enabled)
+                .cloned()
+                .collect())
+        }
         async fn insert(&self, b: &CharacterBinding) -> Result<i64, RepositoryError> {
             let mut bindings = self.bindings.lock().unwrap();
             let mut next = self.next_id.lock().unwrap();
@@ -257,6 +320,13 @@ mod tests {
             b.id = *next;
             bindings.push(b);
             Ok(*next)
+        }
+        async fn update(&self, binding: &CharacterBinding) -> Result<(), RepositoryError> {
+            let mut bindings = self.bindings.lock().unwrap();
+            if let Some(existing) = bindings.iter_mut().find(|b| b.id == binding.id) {
+                *existing = binding.clone();
+            }
+            Ok(())
         }
         async fn delete(&self, id: i64) -> Result<(), RepositoryError> {
             let mut bindings = self.bindings.lock().unwrap();
@@ -352,6 +422,8 @@ mod tests {
         assert_eq!(binding.reply_mode, ReplyMode::MentionOnly);
         assert!(binding.proactive_enabled);
         assert!(binding.id > 0);
+        // 新绑定的 switched_at 应为 None（从未换过角色）。
+        assert!(binding.switched_at.is_none());
     }
 
     #[tokio::test]
@@ -470,5 +542,124 @@ mod tests {
         manager.unbind(binding.id).await.expect("unbind 应成功");
         let by_conv = manager.by_conversation(1).await.unwrap();
         assert!(by_conv.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_second_character_for_same_conversation() {
+        let (manager, char_repo, _) = setup().await;
+        let now = chrono::Utc::now();
+        // 插入角色 2（MemCharacterRepo.insert 自动分配 id=2）。
+        char_repo
+            .insert(&Character {
+                id: 0,
+                definition: sample_definition("Bob"),
+                state: CharacterState::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        // 角色 1 → 会话 1 成功。
+        manager
+            .bind(
+                1,
+                1,
+                ReplyMode::MentionOnly,
+                true,
+                None,
+                serde_json::json!({}),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("首次绑定应成功");
+
+        // G1：角色 2 → 会话 1 必须被拒绝（一个会话最多一个绑定）。
+        let second = manager
+            .bind(
+                2,
+                1,
+                ReplyMode::Natural,
+                false,
+                None,
+                serde_json::json!({}),
+                serde_json::json!({}),
+            )
+            .await;
+        assert!(second.is_err(), "同一会话的第二角色绑定应被拒绝");
+    }
+
+    #[tokio::test]
+    async fn switch_character_updates_character_preserves_config() {
+        let (manager, char_repo, _) = setup().await;
+        let now = chrono::Utc::now();
+        // 插入角色 2。
+        char_repo
+            .insert(&Character {
+                id: 0,
+                definition: sample_definition("Bob"),
+                state: CharacterState::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let binding = manager
+            .bind(
+                1,
+                1,
+                ReplyMode::MentionOnly,
+                true,
+                Some("22:00-07:00".to_string()),
+                serde_json::json!({"tone": "cool"}),
+                serde_json::json!({"history": 30}),
+            )
+            .await
+            .expect("首次绑定应成功");
+        assert!(binding.switched_at.is_none());
+
+        let switched = manager.switch_character(1, 2).await.expect("换角色应成功");
+        // 角色已切换，并记录了生效时间。
+        assert_eq!(switched.character_id, 2);
+        assert!(switched.switched_at.is_some(), "切换后应记录 switched_at");
+        // 会话配置字段随绑定保留，不随角色迁移。
+        assert_eq!(switched.reply_mode, ReplyMode::MentionOnly);
+        assert!(switched.proactive_enabled);
+        assert_eq!(switched.mute_schedule.as_deref(), Some("22:00-07:00"));
+        assert_eq!(
+            switched.behavior_overrides,
+            serde_json::json!({"tone": "cool"})
+        );
+        assert_eq!(switched.context_policy, serde_json::json!({"history": 30}));
+        assert_eq!(switched.id, binding.id, "绑定 id 应保持不变");
+    }
+
+    #[tokio::test]
+    async fn switch_character_rejects_missing_character() {
+        let (manager, _, _) = setup().await;
+        manager
+            .bind(
+                1,
+                1,
+                ReplyMode::Natural,
+                true,
+                None,
+                serde_json::json!({}),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+
+        // 目标角色不存在 → 报错。
+        assert!(manager.switch_character(1, 999).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn switch_character_rejects_unbound_conversation() {
+        let (manager, _, _) = setup().await;
+        // 会话 2 存在但未绑定角色（setup 已创建会话 2）。
+        let result = manager.switch_character(2, 1).await;
+        assert!(result.is_err(), "未绑定角色的会话换角色应报错");
     }
 }
