@@ -18,6 +18,7 @@ pub mod event_processor;
 pub mod llm_scheduler;
 pub mod memory_service;
 pub mod message_persistence;
+pub mod plugin_api;
 pub mod proactive;
 pub mod relationship_service;
 pub mod reply_processor;

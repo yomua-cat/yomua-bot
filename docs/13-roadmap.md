@@ -80,6 +80,14 @@ Permissions
 Event Subscription
 Plugin API
 
+本阶段进展（按实施批次推进，每批四命令全绿）：
+
+1. 清单/发现/校验、权限判定、Plugin API 与线协议（长度前缀 + MessagePack）已完成。
+2. 运行时注册表（状态机 + 连接挂接）、UDS 传输（握手/请求/通知/协议错误隔离）、
+   Supervisor 生命周期（spawn/监控/崩溃重启预算/优雅停止）与事件订阅桥接已完成。
+3. main.rs 装配接线（Supervisor/EventBridge 条件启用与优雅关停）、示例 echo 插件
+   与协议文档已完成。
+
 Phase 7 — Multiple Characters
 
 实现：

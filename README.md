@@ -25,19 +25,19 @@ yomua-bot 是一个开源 **Character Runtime / Character Agent Framework**。�
 
 核心目标：QQ 私聊/群聊、多 Character 绑定、SillyTavern Card/Lorebook、长期记忆、持久化情绪与关系、主动行为、自然对话、多 LLM Provider、插件扩展、Linux 长时间运行。
 
-> 当前已完成 **Phase 0（Foundation）**、**Phase 1（QQ MVP）**、**Phase 2（Character）**、**Phase 3（AI 对话）**、**Phase 4（记忆）** 与 **Phase 5（拟人化行为）**。已实现 OneBot 11 接入、断线重连、消息持久化、配置解析、Character Card 导入（SillyTavern V1/V2/V3 + PNG）、角色绑定、状态生命周期、上下文构建、OpenAI-compatible LLM Provider、LLM Scheduler、确定性行为引擎、情绪/关系/记忆服务，以及拟人化行为（回复概率、真实延迟、忽略、静默时段、区别对待、状态驱动、主动行为 MVP）；**尚未**接入插件进程。详见 [当前状态](#当前状态) 与 [路线图](docs/13-roadmap.md)。
+> 当前已完成 **Phase 0（Foundation）**、**Phase 1（QQ MVP）**、**Phase 2（Character）**、**Phase 3（AI 对话）**、**Phase 4（记忆）**、**Phase 5（拟人化行为）** 与 **Phase 6（插件系统）**。已实现 OneBot 11 接入、断线重连、消息持久化、配置解析、Character Card 导入（SillyTavern V1/V2/V3 + PNG）、角色绑定、状态生命周期、上下文构建、OpenAI-compatible LLM Provider、LLM Scheduler、确定性行为引擎、情绪/关系/记忆服务、拟人化行为（回复概率、真实延迟、忽略、静默时段、区别对待、状态驱动、主动行为 MVP），以及插件系统（Manifest 发现与校验、进程隔离 Supervisor、UDS + MessagePack 语言无关 IPC、权限校验、事件订阅、插件 API、plugin_data 落库）。详见 [当前状态](#当前状态) 与 [路线图](docs/13-roadmap.md)。
 
 ## 快速开始
 
 ```bash
 git clone https://github.com/yomua-cat/yomua-bot.git && cd yomua-bot
 cargo build      # 编译通过
-cargo test       # 121 个测试全部通过
+cargo test       # 241 个测试全部通过
 cargo clippy     # 无告警
 cargo fmt --check  # 格式正确
 ```
 
-**当前限制**：以上只验证骨架代码与测试。要真正连接 QQ 还需要本机运行 NapCat（OneBot 11）并配置 `onebot.toml`；LLM 功能需配置 `llm.toml`（默认未启用，未启用时使用确定性回复）。配置文件可选，缺失时使用默认值：`runtime.toml`、`onebot.toml`、`llm.toml`。
+**当前限制**：以上只验证骨架代码与测试。要真正连接 QQ 还需要本机运行 NapCat（OneBot 11）并配置 `onebot.toml`；LLM 功能需配置 `llm.toml`（默认未启用，未启用时使用确定性回复）。配置文件可选，缺失时使用默认值：`runtime.toml`、`onebot.toml`、`llm.toml`。插件系统默认关闭，需在 `runtime.toml` 配置 `plugins_dir` 启用（见 [Phase 6](#phase-6插件系统已落地)）。
 
 ### 角色卡导入（import-card）
 
@@ -97,6 +97,7 @@ cargo run -- import-card 油木然-bot.png \
   data_dir = "data"
   log_level = "info"
   shutdown_timeout_secs = 10
+  # plugins_dir = "plugins"   # 可选：填写后启用插件系统（默认关闭）
   ```
 - `onebot.toml`：
   ```toml
@@ -142,7 +143,7 @@ Storage != Domain
 | 日志 | tracing / tracing-subscriber |
 | OneBot 接入 | WebSocket（`tokio-tungstenite`）+ `futures-util` |
 | 配置 | toml |
-| IPC（插件） | rmp-serde（接口层，尚未实现） |
+| IPC（插件） | UDS + MessagePack（`rmp-serde`，长度前缀帧协议） |
 | LLM | OpenAI-compatible Provider（`reqwest`，Chat Completions） |
 | 目标平台 | Linux 长时间运行（开发环境 macOS 亦可） |
 
@@ -178,7 +179,7 @@ flowchart TB
     subgraph I["Infrastructure 基础设施层"]
         storage["SQLite Storage<br/>migration + Repository 实现"]
         llm["LLM Provider trait<br/>OpenAI-Compatible HTTP 实现"]
-        plugin["Plugin Host trait<br/>（未实现）"]
+        plugin["Plugin 子系统<br/>Manifest / Supervisor /<br/>UDS+MessagePack IPC / API"]
     end
 
     onebot -->|入站事件| eventbus
@@ -231,12 +232,13 @@ src/
 │   ├── reply_processor.rs      # Reply Pipeline（消息回复编排）
 │   ├── emotion_service.rs      # 情绪读取/更新/持久化
 │   ├── relationship_service.rs # 关系读取/更新/持久化
+│   ├── plugin_api.rs           # 插件 API 分发（权限门 + 领域能力调用）
 │   └── scheduler.rs            # Scheduler trait
 ├── infrastructure/             # 基础设施层 —— 具体实现
-│   ├── storage/                # SQLite 连接池 + migration + 9 个 Repository 实现
+│   ├── storage/                # SQLite 连接池 + migration + 10 个 Repository 实现
 │   ├── llm/                    # LlmProvider trait + OpenAI-compatible HTTP 实现
 │   ├── character_card/         # SillyTavern 卡片导入（V1/V2/V3 JSON + PNG）
-│   └── plugin/                 # PluginHost / PluginTransport trait
+│   └── plugin/                 # 插件系统：协议/清单/权限/注册表/传输/Supervisor/事件桥接
 └── adapters/                   # 适配器层
     └── onebot/                 # OneBot 适配器
         ├── mod.rs              # OneBotAdapter trait + 装配
@@ -246,7 +248,7 @@ src/
 
 ## 当前状态
 
-> Phase 0 - Phase 5，`cargo check` / `cargo test` / `cargo clippy` / `cargo fmt` 全部通过。
+> Phase 0 - Phase 6，`cargo check` / `cargo test` / `cargo clippy` / `cargo fmt` 全部通过。
 
 ### 已实现
 
@@ -285,8 +287,8 @@ src/
 
 ### 尚未实现（后续 Phase）
 
-- 插件进程管理与 IPC
-- 高级记忆（embedding / 向量检索 / RAG）、多角色群聊、WebUI、主动对话的 LLM 参与等
+- 多角色群聊（同群多角色决策与互动）、角色间关系
+- 高级记忆（embedding / 向量检索 / RAG）、WebUI、主动对话的 LLM 参与等
 
 ### Phase 4（记忆）MVP 已落地
 
@@ -305,6 +307,19 @@ src/
 - 状态驱动：精力、注意力、压力（0-100）调制回复概率与延迟
 - 主动行为 MVP（`application/proactive`）：后台 `ProactiveDriver`（固定 60s tick、30min 冷却），仅处理已启用主动且不在静默时段的绑定；`decide_proactive` 以角色/会话/小时桶内容哈希对比阈值；触发时写回 `character_states.last_proactive_at` 并发布行为事件（不发送消息、不调用 LLM）
 
+### Phase 6（插件系统）已落地
+
+- 插件清单（`infrastructure/plugin/manifest`）：`plugin.toml`（TOML）发现与校验 —— 目录布局 `plugins/<name>/plugin.toml`，executable 相对路径禁越界，坏清单跳过不阻塞整体
+- 进程隔离 Supervisor（`infrastructure/plugin/supervisor`）：spawn → 握手 → Running → stop/崩溃检测 → 受限重启（连续崩溃上限 3 次、指数退避、稳定运行 60s 后重新计数）；插件崩溃/协议错误不影响 Core
+- IPC（`infrastructure/plugin/protocol`）：语言无关帧协议 —— 4 字节大端长度前缀 + MessagePack，五类消息（hello / hello_ack / request / response / notify），`infrastructure/plugin/transport` 为 UDS 服务端（握手超时、连接清理 Drop 守卫）
+- 权限（`infrastructure/plugin/permissions`）：11 个 API 方法 ↔ 11 种权限一一对应，API 入口统一校验；`message.read` / `scheduler.create` 本期拒绝
+- 事件订阅（`infrastructure/plugin/event_bridge`）：插件握手时声明订阅，CoreEvent 经 EventBus 按订阅类型过滤转发为 Notify
+- 插件 API（`application/plugin_api`）：message.send（经 ActionDispatcher）/ character / character.state / memory / relationship 读写 / llm.call（经 CognitionLayer → LlmScheduler）/ plugin_data.*（免权限、按插件名自作用域）
+- plugin_data 落库（`PluginDataRepository`）：`plugin_name + key` 复合主键，JSON 值，跨插件隔离
+- 示例插件（`examples/echo_plugin`）：演示握手 / 事件订阅 / plugin_data 读写往返
+- 启用方式：`runtime.toml` 新增可选 `plugins_dir`（默认不启用）；协议契约文档化于 [docs/07-plugin-system.md](docs/07-plugin-system.md)
+- 241 个单元/集成测试全部通过
+
 后续阶段明确**不实现**：WebUI、PostgreSQL、Redis、Kafka、Vector DB、Embedding/RAG、TTS、图像生成、MCP、WASM 插件、多 QQ 账号、复杂自主意识 / 多 Agent。
 
 ## 路线图
@@ -317,7 +332,7 @@ src/
 4. ~~**Phase 3 — AI 对话**：LLM Provider、Context Builder、Behavior Engine~~ ✅
 5. ~~**Phase 4 — 记忆**：长期记忆、提取、检索~~ ✅
 6. ~~**Phase 5 — 拟人化行为**：回复概率、延迟、忽略、静默时段、区别对待、状态驱动、主动行为 MVP~~ ✅
-7. **Phase 6 — 插件**：Manifest、Supervisor、IPC、权限
+7. ~~**Phase 6 — 插件**：Manifest、Supervisor、IPC、权限、事件订阅、API~~ ✅
 8. **Phase 7 — 多角色**：多 Character / 多 Character 群聊
 9. **Phase 8 — 高级认知**：后台认知、语义记忆、RAG
 10. **Phase 9 — WebUI**（最后考虑，不成为 Core 依赖）
@@ -328,7 +343,7 @@ src/
 
 ## 贡献指南
 
-当前已完成 Phase 0 - Phase 5。贡献前请阅读：
+当前已完成 Phase 0 - Phase 6。贡献前请阅读：
 - [`docs/12-development-rules.md`](docs/12-development-rules.md)（模块边界纪律）
 - [`docs/01-architecture.md`](docs/01-architecture.md)（架构与依赖方向）
 - [`docs/00-project-scope.md`](docs/00-project-scope.md)（项目范围与非目标）

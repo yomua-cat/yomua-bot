@@ -446,6 +446,63 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn test_plugin_data_roundtrip() {
+        let storage = setup_storage().await;
+        let repo = crate::infrastructure::storage::repository::SqlitePluginDataRepository::new(
+            storage.pool().clone(),
+        );
+
+        // 未设置 → None
+        assert!(repo.get("alpha", "name").await.unwrap().is_none());
+
+        // set 简单值
+        repo.set("alpha", "name", &serde_json::json!("echo"))
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get("alpha", "name").await.unwrap(),
+            Some(serde_json::json!("echo"))
+        );
+
+        // upsert 覆盖
+        repo.set("alpha", "name", &serde_json::json!("echo-v2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get("alpha", "name").await.unwrap(),
+            Some(serde_json::json!("echo-v2"))
+        );
+
+        // JSON 复杂值
+        let complex = serde_json::json!({ "list": [1, 2, 3], "obj": { "a": true } });
+        repo.set("alpha", "cfg", &complex).await.unwrap();
+        assert_eq!(repo.get("alpha", "cfg").await.unwrap(), Some(complex));
+
+        // 跨插件隔离：别的插件读不到，也列不到
+        assert!(repo.get("beta", "name").await.unwrap().is_none());
+        assert!(repo.get("beta", "cfg").await.unwrap().is_none());
+        let mut alpha_keys = repo.list_keys("alpha").await.unwrap();
+        alpha_keys.sort();
+        assert_eq!(alpha_keys, vec!["cfg", "name"]);
+
+        // beta 的数据与 alpha 互不干扰
+        repo.set("beta", "k1", &serde_json::json!(1)).await.unwrap();
+        let beta_keys = repo.list_keys("beta").await.unwrap();
+        assert_eq!(beta_keys, vec!["k1"]);
+        let alpha_keys_again = repo.list_keys("alpha").await.unwrap();
+        assert_eq!(alpha_keys_again.len(), 2, "beta 写入不得影响 alpha 的键");
+
+        // delete：删除后读不到、列表不再含该键
+        repo.delete("alpha", "name").await.unwrap();
+        assert!(repo.get("alpha", "name").await.unwrap().is_none());
+        let alpha_keys_after = repo.list_keys("alpha").await.unwrap();
+        assert_eq!(alpha_keys_after, vec!["cfg"]);
+
+        // 对不存在的键 delete 也不报错
+        repo.delete("alpha", "missing").await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_character_state_upsert() {
         let storage = setup_storage().await;
         let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(

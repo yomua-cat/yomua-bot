@@ -30,6 +30,7 @@ use yomua_bot::application::event_processor::EventProcessor;
 use yomua_bot::application::llm_scheduler::{DefaultLlmScheduler, LlmScheduler};
 use yomua_bot::application::memory_service::MemoryService;
 use yomua_bot::application::message_persistence::MessagePersistence;
+use yomua_bot::application::plugin_api::PluginApi;
 use yomua_bot::application::proactive::ProactiveDriver;
 use yomua_bot::application::relationship_service::RelationshipService;
 use yomua_bot::application::reply_processor::{DelayExecutor, ReplyProcessor, TokioDelayExecutor};
@@ -40,17 +41,21 @@ use yomua_bot::domain::conversation::ConversationType;
 use yomua_bot::domain::repository::{
     CharacterBindingRepository, CharacterRepository, CharacterStateRepository,
     ConversationRepository, EmotionStateRepository, MemoryRepository, MessageRepository,
-    ParticipantRepository, RelationshipRepository,
+    ParticipantRepository, PluginDataRepository, RelationshipRepository,
 };
 use yomua_bot::error::RuntimeError;
 use yomua_bot::infrastructure::llm::openai_compatible::{
     OpenAiCompatibleConfig, OpenAiCompatibleProvider,
 };
 use yomua_bot::infrastructure::llm::LlmProvider;
+use yomua_bot::infrastructure::plugin::event_bridge::EventBridge;
+use yomua_bot::infrastructure::plugin::registry::PluginRegistry;
+use yomua_bot::infrastructure::plugin::supervisor::{PluginSupervisor, SupervisorConfig};
 use yomua_bot::infrastructure::storage::repository::{
     SqliteCharacterBindingRepository, SqliteCharacterRepository, SqliteCharacterStateRepository,
     SqliteConversationRepository, SqliteEmotionStateRepository, SqliteMemoryRepository,
-    SqliteMessageRepository, SqliteParticipantRepository, SqliteRelationshipRepository,
+    SqliteMessageRepository, SqliteParticipantRepository, SqlitePluginDataRepository,
+    SqliteRelationshipRepository,
 };
 use yomua_bot::infrastructure::storage::SqliteStorage;
 
@@ -114,8 +119,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// 启动常驻运行时。
 ///
 /// 加载配置 → 初始化日志 → 打开存储 → 建立仓库 → 装配应用层
-/// （Runtime / 行为 / 认知 / 情绪 / 关系）→ 启动订阅者 → 启动 OneBot 适配器 →
-/// 等待关停信号。
+/// （Runtime / 行为 / 认知 / 情绪 / 关系）→ 启动订阅者 → 启动插件系统
+/// （可选）→ 启动 OneBot 适配器 → 等待关停信号。
 async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // 1. 加载配置。
     let runtime_cfg = load_runtime(&config_dir.join(RUNTIME_CONFIG).display().to_string())?;
@@ -160,6 +165,10 @@ async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>
         Arc::new(SqliteRelationshipRepository::new(pool.clone()));
     let emotion_repo: Arc<dyn EmotionStateRepository> =
         Arc::new(SqliteEmotionStateRepository::new(pool.clone()));
+
+    // 插件数据仓储（plugin_data.* 免权限、按插件名命名空间隔离）。
+    let plugin_data_repo: Arc<dyn PluginDataRepository> =
+        Arc::new(SqlitePluginDataRepository::new(pool.clone()));
 
     // 5. 建立事件总线。
     let bus = EventBus::new();
@@ -228,6 +237,20 @@ async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>
         adapter.clone(),
     ));
 
+    // 插件系统装配：注册表 + API 分发器。仅创建不启动；plugins_dir 未配置时
+    // 不产生任何插件相关任务（保持既有部署行为不变）。
+    let plugin_registry = Arc::new(PluginRegistry::new());
+    let plugin_api = Arc::new(PluginApi::new(
+        character_repo.clone() as Arc<dyn CharacterRepository>,
+        state_repo.clone(),
+        memory_repo.clone(),
+        relationship_repo.clone(),
+        plugin_data_repo.clone(),
+        action_dispatcher.clone(),
+        cognition.clone(),
+        plugin_registry.clone(),
+    ));
+
     let delay_executor: Arc<dyn DelayExecutor> = Arc::new(TokioDelayExecutor);
     let reply_processor = Arc::new(ReplyProcessor::new(
         runtime,
@@ -271,18 +294,54 @@ async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>
         proactive_driver.run().await;
     });
 
-    // 10. 启动适配器并等待消息。
+    // 10. 插件系统（条件启用）：plugins_dir 为 None 时不启动任何插件相关任务。
+    let supervisor: Option<Arc<PluginSupervisor>> =
+        if let Some(plugins_dir) = &runtime_cfg.plugins_dir {
+            let cfg = SupervisorConfig {
+                plugins_dir: PathBuf::from(plugins_dir),
+                sockets_dir: PathBuf::from(&runtime_cfg.data_dir).join("plugin-sockets"),
+                ..SupervisorConfig::default()
+            };
+            let sup = Arc::new(PluginSupervisor::new(
+                cfg,
+                plugin_registry.clone(),
+                plugin_api.clone(),
+            ));
+            tracing::info!(plugins_dir = %plugins_dir, "插件系统已启用");
+
+            // EventBridge 订阅：把 Core 事件总线上的事件转发给已订阅插件。
+            let bridge = EventBridge::new(plugin_registry.clone());
+            let subscription = bus.subscribe();
+            tokio::spawn(async move { bridge.run(subscription).await });
+
+            // 启动全部插件；单个插件失败不致命（supervisor 内部已隔离），
+            // 插件目录不存在只 warn 记录，不中断 Core。
+            if let Err(e) = sup.start_all().await {
+                tracing::warn!(error = %e, "插件启动异常（插件系统保持启用，Core 继续运行）");
+            }
+            Some(sup)
+        } else {
+            tracing::info!("插件系统未启用（runtime.toml 未配置 plugins_dir）");
+            None
+        };
+
+    // 11. 启动适配器并等待消息。
     adapter.start().await?;
     tracing::info!(target: "runtime", "字符运行时已就绪，等待消息...");
 
-    // 11. 等待关停信号（Ctrl+C）。Core 常驻，适配器断线自动重连。
+    // 12. 等待关停信号（Ctrl+C）。Core 常驻，适配器断线自动重连。
     tracing::info!(target: "runtime", "正在运行；按 Ctrl+C 退出。");
     tokio::signal::ctrl_c()
         .await
         .map_err(|e| RuntimeError::Internal(format!("无法注册关停信号处理: {e}")))?;
     tracing::info!(target: "runtime", "收到关停信号，正在优雅关闭...");
 
-    // 11. 优雅关停。
+    // 13. 优雅关停：先停插件（发 shutdown 通知 → 等超时 → 杀残余）→ 停适配器 → 关数据库。
+    if let Some(sup) = &supervisor {
+        if let Err(e) = sup.shutdown_all().await {
+            tracing::warn!(target: "runtime", error = %e, "停止插件失败");
+        }
+    }
     if let Err(e) = adapter.stop().await {
         tracing::warn!(target: "runtime", error = %e, "停止适配器失败");
     }

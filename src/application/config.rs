@@ -23,6 +23,9 @@ pub struct RuntimeConfig {
 
     /// 优雅关停时的最大等待秒数。
     pub shutdown_timeout_secs: u64,
+
+    /// 插件目录（为 `None` 时默认禁用插件系统）。
+    pub plugins_dir: Option<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -31,6 +34,7 @@ impl Default for RuntimeConfig {
             data_dir: "data".to_string(),
             log_level: "info".to_string(),
             shutdown_timeout_secs: 10,
+            plugins_dir: None,
         }
     }
 }
@@ -118,6 +122,28 @@ mod tests {
         assert_eq!(cfg.data_dir, "/tmp/runtime-data");
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.shutdown_timeout_secs, 5);
+    }
+
+    #[test]
+    fn runtime_config_plugins_dir_default_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        let cfg = load_runtime(path.to_str().unwrap()).unwrap();
+        // 默认不启用插件系统
+        assert_eq!(cfg.plugins_dir, None);
+    }
+
+    #[test]
+    fn runtime_config_plugins_dir_parses_some() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        fs::write(
+            &path,
+            "data_dir = \"/tmp/runtime-data\"\nlog_level = \"info\"\nshutdown_timeout_secs = 10\nplugins_dir = \"plugins\"\n",
+        )
+        .unwrap();
+        let cfg = load_runtime(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.plugins_dir.as_deref(), Some("plugins"));
     }
 
     #[test]

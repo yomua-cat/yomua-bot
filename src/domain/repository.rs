@@ -232,3 +232,31 @@ pub trait EmotionStateRepository: Send + Sync {
     /// 对一个角色的情绪状态执行 upsert（插入或更新）。
     async fn upsert(&self, character_id: i64, state: &EmotionState) -> Result<(), RepositoryError>;
 }
+
+// ---------------------------------------------------------------------------
+// 插件数据
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+pub trait PluginDataRepository: Send + Sync {
+    /// 读取一个插件的一项持久化数据；不存在返回 `None`。
+    async fn get(
+        &self,
+        plugin_name: &str,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, RepositoryError>;
+
+    /// 写入（upsert）一个插件的一项持久化数据。
+    async fn set(
+        &self,
+        plugin_name: &str,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), RepositoryError>;
+
+    /// 删除一个插件的一项持久化数据。
+    async fn delete(&self, plugin_name: &str, key: &str) -> Result<(), RepositoryError>;
+
+    /// 列出某个插件的全部键。
+    async fn list_keys(&self, plugin_name: &str) -> Result<Vec<String>, RepositoryError>;
+}

@@ -12,7 +12,7 @@ use crate::application::context::{ContextBuilder, ContextLimits, ConversationCon
 use crate::application::llm_scheduler::LlmScheduler;
 use crate::domain::character::Character;
 use crate::error::RuntimeError;
-use crate::infrastructure::llm::{LlmMessage, LlmRequest, LlmRole};
+use crate::infrastructure::llm::{LlmMessage, LlmRequest, LlmResponse, LlmRole};
 
 /// 认知层 —— 构建上下文并（在启用时）调用 LLM。
 pub struct CognitionLayer {
@@ -84,6 +84,35 @@ impl CognitionLayer {
 
         let response = scheduler.submit(request).await?;
         Ok(Some(response.content))
+    }
+
+    /// 直接提交一组消息给 LLM（插件 API 等无角色上下文的调用方使用）。
+    ///
+    /// 与 `generate` 一致：LLM 未启用（`scheduler` 为 `None`）时返回
+    /// `Ok(None)`，调用方据此返回确定性结果。`system` 直接进入
+    /// [`LlmRequest::system`] 字段，不做上下文渲染。
+    pub async fn chat(
+        &self,
+        system: Option<String>,
+        messages: Vec<LlmMessage>,
+        priority: u8,
+    ) -> Result<Option<LlmResponse>, RuntimeError> {
+        let Some(scheduler) = &self.scheduler else {
+            return Ok(None);
+        };
+
+        let request = LlmRequest {
+            system,
+            messages,
+            model: None,            // 让 Provider 选择默认模型
+            temperature: Some(0.8), // 与 generate 保持一致
+            max_tokens: None,
+            priority,
+            metadata: serde_json::json!({}), // 无角色上下文，不带额外元数据
+        };
+
+        let response = scheduler.submit(request).await?;
+        Ok(Some(response))
     }
 
     /// 渲染系统提示词 —— 纯数据 → 提示词的组装，不访问任何外部依赖。
@@ -232,5 +261,281 @@ mod tests {
         let prompt = CognitionLayer::render_system_prompt(&ctx);
         assert!(prompt.contains("当前情绪"));
         assert!(prompt.contains("关系"));
+    }
+
+    // -----------------------------------------------------------------------
+    // chat —— 插件 API 直连 LLM 的无上下文通道
+    // -----------------------------------------------------------------------
+
+    use crate::domain::conversation::Conversation;
+    use crate::domain::message::Message;
+    use crate::domain::repository::{
+        CharacterBindingRepository, ConversationRepository, EmotionStateRepository,
+        MemoryRepository, MessageRepository, RelationshipRepository,
+    };
+    use crate::error::RepositoryError;
+    use crate::infrastructure::llm::{LlmResponse, TokenUsage};
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    /// 记录提交请求并返回固定响应的假调度器。
+    struct FakeScheduler {
+        submitted: Mutex<Vec<LlmRequest>>,
+    }
+    impl FakeScheduler {
+        fn new() -> Self {
+            Self {
+                submitted: Mutex::new(Vec::new()),
+            }
+        }
+        fn requests(&self) -> Vec<LlmRequest> {
+            self.submitted.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl LlmScheduler for FakeScheduler {
+        async fn submit(&self, request: LlmRequest) -> Result<LlmResponse, RuntimeError> {
+            self.submitted.lock().unwrap().push(request);
+            Ok(LlmResponse {
+                content: "插件回复".to_string(),
+                model: "fake".to_string(),
+                usage: TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 2,
+                    total_tokens: 3,
+                },
+                truncated: false,
+            })
+        }
+    }
+
+    struct MemMessageRepo;
+    #[async_trait]
+    impl MessageRepository for MemMessageRepo {
+        async fn find_by_id(&self, _id: i64) -> Result<Option<Message>, RepositoryError> {
+            Ok(None)
+        }
+        async fn find_recent(
+            &self,
+            _conversation_id: i64,
+            _limit: i64,
+        ) -> Result<Vec<Message>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn insert(&self, _m: &Message) -> Result<i64, RepositoryError> {
+            Ok(1)
+        }
+    }
+
+    struct MemConvRepo;
+    #[async_trait]
+    impl ConversationRepository for MemConvRepo {
+        async fn find_by_id(&self, _id: i64) -> Result<Option<Conversation>, RepositoryError> {
+            Ok(None)
+        }
+        async fn find_by_external_id(
+            &self,
+            _id: &str,
+        ) -> Result<Option<Conversation>, RepositoryError> {
+            Ok(None)
+        }
+        async fn find_all(&self) -> Result<Vec<Conversation>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn insert(&self, _c: &Conversation) -> Result<i64, RepositoryError> {
+            Ok(1)
+        }
+        async fn update(&self, _c: &Conversation) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn delete(&self, _id: i64) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    struct MemMemoryRepo;
+    #[async_trait]
+    impl MemoryRepository for MemMemoryRepo {
+        async fn find_by_character_id(
+            &self,
+            _character_id: i64,
+            _memory_type: Option<crate::domain::memory::MemoryType>,
+            _limit: i64,
+        ) -> Result<Vec<crate::domain::memory::Memory>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn insert(&self, _m: &crate::domain::memory::Memory) -> Result<i64, RepositoryError> {
+            Ok(1)
+        }
+        async fn update(&self, _m: &crate::domain::memory::Memory) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn delete(&self, _id: i64) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    struct MemRelationshipRepo;
+    #[async_trait]
+    impl RelationshipRepository for MemRelationshipRepo {
+        async fn find(
+            &self,
+            _character_id: i64,
+            _participant_id: i64,
+        ) -> Result<Option<crate::domain::relationship::Relationship>, RepositoryError> {
+            Ok(None)
+        }
+        async fn find_by_character_id(
+            &self,
+            _character_id: i64,
+        ) -> Result<Vec<crate::domain::relationship::Relationship>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn upsert(
+            &self,
+            _r: &crate::domain::relationship::Relationship,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    struct MemEmotionRepo;
+    #[async_trait]
+    impl EmotionStateRepository for MemEmotionRepo {
+        async fn find_by_character_id(
+            &self,
+            _character_id: i64,
+        ) -> Result<Option<crate::domain::emotion::EmotionState>, RepositoryError> {
+            Ok(None)
+        }
+        async fn upsert(
+            &self,
+            _character_id: i64,
+            _state: &crate::domain::emotion::EmotionState,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    struct MemBindingRepo;
+    #[async_trait]
+    impl CharacterBindingRepository for MemBindingRepo {
+        async fn find_by_character_id(
+            &self,
+            _character_id: i64,
+        ) -> Result<Vec<crate::domain::character::CharacterBinding>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn find_by_conversation_id(
+            &self,
+            _conversation_id: i64,
+        ) -> Result<Vec<crate::domain::character::CharacterBinding>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn find_all(
+            &self,
+        ) -> Result<Vec<crate::domain::character::CharacterBinding>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn insert(
+            &self,
+            _b: &crate::domain::character::CharacterBinding,
+        ) -> Result<i64, RepositoryError> {
+            Ok(1)
+        }
+        async fn delete(&self, _id: i64) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    /// 组装一个只含空桩仓储的上下文构建器（chat 不触碰上下文，仅满足构造）。
+    fn mem_context_builder() -> Arc<ContextBuilder> {
+        Arc::new(ContextBuilder::new(
+            Arc::new(MemMessageRepo),
+            Arc::new(MemConvRepo),
+            Arc::new(MemMemoryRepo),
+            Arc::new(MemRelationshipRepo),
+            Arc::new(MemEmotionRepo),
+            Arc::new(MemBindingRepo),
+        ))
+    }
+
+    #[tokio::test]
+    async fn chat_without_scheduler_returns_none() {
+        let layer = CognitionLayer::new(None, mem_context_builder());
+        let result = layer
+            .chat(
+                Some("你是助手".to_string()),
+                vec![LlmMessage {
+                    role: LlmRole::User,
+                    content: "你好".to_string(),
+                }],
+                2,
+            )
+            .await
+            .expect("未启用 LLM 不应报错");
+        assert!(result.is_none(), "未启用 LLM 应返回 None");
+    }
+
+    #[tokio::test]
+    async fn chat_submits_request_and_returns_response() {
+        let scheduler = Arc::new(FakeScheduler::new());
+        let layer = CognitionLayer::new(Some(scheduler.clone()), mem_context_builder());
+
+        let result = layer
+            .chat(
+                Some("你是插件助手".to_string()),
+                vec![
+                    LlmMessage {
+                        role: LlmRole::System,
+                        content: "系统提示".to_string(),
+                    },
+                    LlmMessage {
+                        role: LlmRole::User,
+                        content: "你好".to_string(),
+                    },
+                ],
+                2,
+            )
+            .await
+            .expect("提交应成功");
+        let resp = result.expect("有调度器应返回响应");
+        assert_eq!(resp.content, "插件回复");
+        assert_eq!(resp.model, "fake");
+
+        // scheduler 恰好收到一次请求，且 payload 组装正确。
+        let requests = scheduler.requests();
+        assert_eq!(requests.len(), 1, "应只提交一次");
+        let req = &requests[0];
+        assert_eq!(req.system.as_deref(), Some("你是插件助手"));
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(req.messages[0].role, LlmRole::System);
+        assert_eq!(req.messages[1].role, LlmRole::User);
+        assert_eq!(req.messages[1].content, "你好");
+        assert_eq!(req.priority, 2);
+        // 与 generate 对齐的默认参数。
+        assert_eq!(req.model, None);
+        assert_eq!(req.temperature, Some(0.8));
+        assert_eq!(req.max_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn chat_priority_is_passed_through() {
+        let scheduler = Arc::new(FakeScheduler::new());
+        let layer = CognitionLayer::new(Some(scheduler.clone()), mem_context_builder());
+
+        let _ = layer
+            .chat(
+                None,
+                vec![LlmMessage {
+                    role: LlmRole::User,
+                    content: "x".to_string(),
+                }],
+                1,
+            )
+            .await
+            .expect("提交应成功");
+        assert_eq!(scheduler.requests()[0].priority, 1);
+        assert_eq!(scheduler.requests()[0].system, None);
     }
 }

@@ -31,18 +31,52 @@ pub struct PluginManifest {
 }
 
 /// 插件可以请求的一种权限。
+///
+/// wire/TOML 统一使用 dotted 字符串（见各变体的 serde rename）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PluginPermission {
+    /// 读取收到的消息。
+    #[serde(rename = "message.read")]
     MessageRead,
+
+    /// 发送消息。
+    #[serde(rename = "message.send")]
     MessageSend,
+
+    /// 读取角色定义。
+    #[serde(rename = "character.read")]
     CharacterRead,
+
+    /// 读取角色状态。
+    #[serde(rename = "character.state.read")]
     CharacterStateRead,
+
+    /// 写入角色状态。
+    #[serde(rename = "character.state.write")]
     CharacterStateWrite,
+
+    /// 读取记忆。
+    #[serde(rename = "memory.read")]
     MemoryRead,
+
+    /// 写入记忆。
+    #[serde(rename = "memory.write")]
     MemoryWrite,
+
+    /// 读取关系。
+    #[serde(rename = "relationship.read")]
     RelationshipRead,
+
+    /// 写入关系。
+    #[serde(rename = "relationship.write")]
     RelationshipWrite,
+
+    /// 创建定时任务。
+    #[serde(rename = "scheduler.create")]
     ScheduleCreate,
+
+    /// 调用 LLM。
+    #[serde(rename = "llm.call")]
     LlmCall,
 }
 
@@ -108,3 +142,13 @@ pub trait PluginTransport: Send + Sync {
         params: serde_json::Value,
     ) -> Result<(), RuntimeError>;
 }
+
+// 本批实现：线协议、清单发现与校验、权限判定、运行时注册表、UDS 传输、
+// 生命周期监督、事件桥接。前三批完成 API/协议/权限逻辑（全绿）。
+pub mod event_bridge;
+pub mod manifest;
+pub mod permissions;
+pub mod protocol;
+pub mod registry;
+pub mod supervisor;
+pub mod transport;
