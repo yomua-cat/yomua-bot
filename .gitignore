@@ -1,0 +1,29 @@
+# Rust 构建产物
+/target
+
+# macOS
+.DS_Store
+
+# 编辑器
+.idea/
+.vscode/
+
+# 日志
+*.log
+
+# 角色卡素材（含自定义/本地卡，不入版本库）
+/assets/characters/
+
+# 配置文件（*.toml，可能含 API 密钥 / 访问令牌，不入版本库）
+*.toml
+!/Cargo.toml
+
+# 运行时数据（SQLite 数据库，含会话内容与角色数据，不入版本库）
+/data/
+
+# NapCat 持久化数据（QQ 账号会话、NapCat 配置与令牌、插件、缓存，不入版本库）
+/napcat/
+
+# Agent 记忆（项目本地记忆，不入版本库）
+agent.md
+AGENTS.md
