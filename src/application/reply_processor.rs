@@ -11,6 +11,7 @@ use std::time::Duration;
 use chrono::Utc;
 use rand::seq::SliceRandom;
 
+#[allow(unused_imports)]
 use crate::adapters::onebot::ActionResponse;
 use crate::application::action::ActionDispatcher;
 use crate::application::behavior_engine::RuleBehaviorEngine;
@@ -201,7 +202,7 @@ impl ReplyProcessor {
             }
             if let Err(e) = self
                 .emotion_service
-                .apply_message_event(character_id, &event.content)
+                .apply_message_event(character_id, event.conversation_id, &event.content)
                 .await
             {
                 tracing::warn!(target: "runtime", binding_id = binding.id, "情绪更新失败: {e}");
@@ -628,18 +629,44 @@ mod tests {
     }
 
     struct MemEmotionRepo {
-        states: Mutex<HashMap<i64, EmotionState>>,
+        states: Mutex<HashMap<(i64, i64), EmotionState>>,
     }
     #[async_trait]
     impl EmotionStateRepository for MemEmotionRepo {
+        #[allow(deprecated)]
         async fn find_by_character_id(
             &self,
-            id: i64,
+            _id: i64,
         ) -> Result<Option<EmotionState>, RepositoryError> {
-            Ok(self.states.lock().unwrap().get(&id).cloned())
+            Ok(self.states.lock().unwrap().values().next().cloned())
         }
+        async fn find_by_character_and_conversation(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+        ) -> Result<Option<EmotionState>, RepositoryError> {
+            Ok(self
+                .states
+                .lock()
+                .unwrap()
+                .get(&(character_id, conversation_id))
+                .cloned())
+        }
+        #[allow(deprecated)]
         async fn upsert(&self, id: i64, state: &EmotionState) -> Result<(), RepositoryError> {
-            self.states.lock().unwrap().insert(id, state.clone());
+            self.states.lock().unwrap().insert((id, 0), state.clone());
+            Ok(())
+        }
+        async fn upsert_scoped(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+            state: &EmotionState,
+        ) -> Result<(), RepositoryError> {
+            self.states
+                .lock()
+                .unwrap()
+                .insert((character_id, conversation_id), state.clone());
             Ok(())
         }
     }
@@ -1045,7 +1072,8 @@ mod tests {
         assert!(sent[0].0.contains("u100"));
 
         // 情绪与关系应更新且持久化。
-        assert!(emotion_repo.states.lock().unwrap().contains_key(&1));
+        // 情绪按 Character × Conversation 存储：character_id=1, conversation_id=100
+        assert!(emotion_repo.states.lock().unwrap().contains_key(&(1, 100)));
         assert!(!rel_repo.rels.lock().unwrap().is_empty());
         // 状态应被初始化。
         assert!(state_repo.states.lock().unwrap().contains_key(&1));

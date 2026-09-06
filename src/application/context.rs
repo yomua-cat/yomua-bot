@@ -272,8 +272,11 @@ impl ContextBuilder {
             .find(character.id, participant_id)
             .await?;
 
-        // 当前情绪。
-        let current_emotion = self.emotion_repo.find_by_character_id(character.id).await?;
+        // 当前情绪（Character × Conversation 范围）。
+        let current_emotion = self
+            .emotion_repo
+            .find_by_character_and_conversation(character.id, conversation_id)
+            .await?;
 
         Ok(ConversationContext {
             character: character.clone(),
@@ -688,16 +691,30 @@ mod tests {
     }
 
     struct MemEmotionRepo {
-        states: Mutex<HashMap<i64, EmotionState>>,
+        states: Mutex<HashMap<(i64, i64), EmotionState>>,
     }
     #[async_trait]
     impl EmotionStateRepository for MemEmotionRepo {
+        #[allow(deprecated)]
         async fn find_by_character_id(
             &self,
-            character_id: i64,
+            _character_id: i64,
         ) -> Result<Option<EmotionState>, RepositoryError> {
-            Ok(self.states.lock().unwrap().get(&character_id).cloned())
+            Ok(self.states.lock().unwrap().values().next().cloned())
         }
+        async fn find_by_character_and_conversation(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+        ) -> Result<Option<EmotionState>, RepositoryError> {
+            Ok(self
+                .states
+                .lock()
+                .unwrap()
+                .get(&(character_id, conversation_id))
+                .cloned())
+        }
+        #[allow(deprecated)]
         async fn upsert(
             &self,
             character_id: i64,
@@ -706,7 +723,19 @@ mod tests {
             self.states
                 .lock()
                 .unwrap()
-                .insert(character_id, state.clone());
+                .insert((character_id, 0), state.clone());
+            Ok(())
+        }
+        async fn upsert_scoped(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+            state: &EmotionState,
+        ) -> Result<(), RepositoryError> {
+            self.states
+                .lock()
+                .unwrap()
+                .insert((character_id, conversation_id), state.clone());
             Ok(())
         }
     }

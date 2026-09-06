@@ -84,7 +84,7 @@ impl RuleBehaviorEngine {
 
         let emotion = self
             .emotion_repo
-            .find_by_character_id(character_id)
+            .find_by_character_and_conversation(character_id, conversation_id)
             .await
             .map_err(repo_err)?;
 
@@ -574,16 +574,30 @@ mod tests {
     }
 
     struct MemEmotionRepo {
-        states: Mutex<HashMap<i64, EmotionState>>,
+        states: Mutex<HashMap<(i64, i64), EmotionState>>,
     }
     #[async_trait]
     impl EmotionStateRepository for MemEmotionRepo {
+        #[allow(deprecated)]
         async fn find_by_character_id(
             &self,
-            character_id: i64,
+            _character_id: i64,
         ) -> Result<Option<EmotionState>, RepositoryError> {
-            Ok(self.states.lock().unwrap().get(&character_id).cloned())
+            Ok(self.states.lock().unwrap().values().next().cloned())
         }
+        async fn find_by_character_and_conversation(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+        ) -> Result<Option<EmotionState>, RepositoryError> {
+            Ok(self
+                .states
+                .lock()
+                .unwrap()
+                .get(&(character_id, conversation_id))
+                .cloned())
+        }
+        #[allow(deprecated)]
         async fn upsert(
             &self,
             character_id: i64,
@@ -592,7 +606,19 @@ mod tests {
             self.states
                 .lock()
                 .unwrap()
-                .insert(character_id, state.clone());
+                .insert((character_id, 0), state.clone());
+            Ok(())
+        }
+        async fn upsert_scoped(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+            state: &EmotionState,
+        ) -> Result<(), RepositoryError> {
+            self.states
+                .lock()
+                .unwrap()
+                .insert((character_id, conversation_id), state.clone());
             Ok(())
         }
     }
@@ -740,11 +766,18 @@ mod tests {
         Arc<MemRelationshipRepo>,
         Arc<MemStateRepo>,
     ) {
+        // 从 bindings 中获取 conversation_id（默认 10 保持向后兼容）
+        let conversation_id = bindings.first().map(|b| b.conversation_id).unwrap_or(10);
         let binding_repo = Arc::new(MemBindingRepo {
             bindings: Mutex::new(bindings),
         });
         let emotion_repo = Arc::new(MemEmotionRepo {
-            states: Mutex::new(emotion.into_iter().map(|s| (1, s)).collect()),
+            states: Mutex::new(
+                emotion
+                    .into_iter()
+                    .map(|s| ((1, conversation_id), s))
+                    .collect(),
+            ),
         });
         let rel_repo = Arc::new(MemRelationshipRepo {
             relationships: Mutex::new(rel.into_iter().collect()),

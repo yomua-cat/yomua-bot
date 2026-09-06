@@ -108,6 +108,25 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
             .map_err(|e| StorageError::Migration(format!("migration 005 failed: {e}")))?;
     }
 
+    // 迁移 006：重建 emotion_states 为 Character × Conversation 范围。
+    // 通过检查旧表结构（character_id PRIMARY KEY）来判断是否需要迁移。
+    // 新表使用 (character_id, conversation_id) PRIMARY KEY，与旧表结构不兼容。
+    let old_emotion_table_rowid: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM sqlite_master
+           WHERE type='table' AND name='emotion_states'
+           AND sql LIKE '%PRIMARY KEY (character_id)'"#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 006 probe failed: {e}")))?;
+
+    if old_emotion_table_rowid > 0 {
+        sqlx::query(MIGRATION_006_RECREATE_EMOTION_STATES)
+            .execute(pool)
+            .await
+            .map_err(|e| StorageError::Migration(format!("migration 006 failed: {e}")))?;
+    }
+
     Ok(())
 }
 
@@ -329,4 +348,50 @@ CREATE INDEX IF NOT EXISTS idx_semantic_memories_character
 /// 迁移 005：conversation_bindings 新增 cross_reply_enabled 列（群聊多 Bot 场景）。
 const MIGRATION_005_CROSS_REPLY_ENABLED: &str = r#"
 ALTER TABLE conversation_bindings ADD COLUMN cross_reply_enabled INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// 迁移 006：重建 emotion_states 为 Character × Conversation 范围。
+///
+/// 旧表 `emotion_states` 使用 `character_id PRIMARY KEY`，导致所有 Conversation 共享同一情绪。
+/// 新表 `emotion_states` 使用 `(character_id, conversation_id) PRIMARY KEY`，
+/// 实现设计文档规定的「Emotion 属于 Character × Conversation」。
+///
+/// 对于既有数据库：先将旧表的全局情绪数据回填到每个 Character × Conversation 的组合中，
+/// 保持行为不变（相当于情绪在切换前是"全局"的，切换后自动"隔离"到新 conversation）。
+const MIGRATION_006_RECREATE_EMOTION_STATES: &str = r#"
+-- 1. 创建临时表，结构正确
+CREATE TABLE emotion_states_new (
+    character_id    INTEGER NOT NULL,
+    conversation_id INTEGER NOT NULL,
+    happiness       REAL NOT NULL DEFAULT 0.5,
+    anger           REAL NOT NULL DEFAULT 0.0,
+    sadness         REAL NOT NULL DEFAULT 0.0,
+    fear            REAL NOT NULL DEFAULT 0.0,
+    affection       REAL NOT NULL DEFAULT 0.3,
+    stress          REAL NOT NULL DEFAULT 0.1,
+    energy          REAL NOT NULL DEFAULT 0.7,
+    last_updated    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (character_id, conversation_id)
+);
+
+-- 2. 回填旧数据：每个角色的全局情绪复制到该角色所在的每个 conversation
+--    （保证历史数据不丢失，行为与重建前相同）
+INSERT INTO emotion_states_new (character_id, conversation_id, happiness, anger, sadness, fear, affection, stress, energy, last_updated)
+SELECT DISTINCT
+    e.character_id,
+    cb.conversation_id,
+    e.happiness,
+    e.anger,
+    e.sadness,
+    e.fear,
+    e.affection,
+    e.stress,
+    e.energy,
+    e.last_updated
+FROM emotion_states e
+JOIN conversation_bindings cb ON cb.character_id = e.character_id;
+
+-- 3. 替换旧表
+DROP TABLE emotion_states;
+ALTER TABLE emotion_states_new RENAME TO emotion_states;
 "#;

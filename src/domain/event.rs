@@ -81,6 +81,7 @@ pub struct CharacterStateChangedEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmotionChangedEvent {
     pub character_id: i64,
+    pub conversation_id: i64,
     pub timestamp: DateTime<Utc>,
 }
 

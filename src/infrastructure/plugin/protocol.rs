@@ -606,6 +606,7 @@ mod tests {
             }),
             CoreEvent::EmotionChanged(EmotionChangedEvent {
                 character_id: 4,
+                conversation_id: 1,
                 timestamp: ts(),
             }),
             CoreEvent::RelationshipChanged(RelationshipChangedEvent {

@@ -282,14 +282,35 @@ pub trait RelationshipRepository: Send + Sync {
 
 #[async_trait]
 pub trait EmotionStateRepository: Send + Sync {
-    /// 按角色 ID 查找情绪状态。
+    /// 按角色 ID 查找情绪状态（已废弃，请使用 find_by_character_and_conversation）。
+    #[deprecated(
+        note = "请使用 find_by_character_and_conversation 获取带 conversation 范围的 emotion"
+    )]
     async fn find_by_character_id(
         &self,
         character_id: i64,
     ) -> Result<Option<EmotionState>, RepositoryError>;
 
-    /// 对一个角色的情绪状态执行 upsert（插入或更新）。
+    /// 按 Character × Conversation 查找情绪状态。
+    ///
+    /// 这是符合设计文档规定的正确查询方式：Emotion 属于 Character × Conversation 范围。
+    async fn find_by_character_and_conversation(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+    ) -> Result<Option<EmotionState>, RepositoryError>;
+
+    /// 对一个角色的情绪状态执行 upsert（已废弃，请使用 upsert_scoped）。
+    #[deprecated(note = "请使用 upsert_scoped 传入 conversation_id")]
     async fn upsert(&self, character_id: i64, state: &EmotionState) -> Result<(), RepositoryError>;
+
+    /// 对 Character × Conversation 的情绪状态执行 upsert。
+    async fn upsert_scoped(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        state: &EmotionState,
+    ) -> Result<(), RepositoryError>;
 }
 
 // ---------------------------------------------------------------------------

@@ -417,15 +417,32 @@ mod tests {
     struct MemEmotionRepo;
     #[async_trait]
     impl EmotionStateRepository for MemEmotionRepo {
+        #[allow(deprecated)]
         async fn find_by_character_id(
             &self,
             _character_id: i64,
         ) -> Result<Option<crate::domain::emotion::EmotionState>, RepositoryError> {
             Ok(None)
         }
+        async fn find_by_character_and_conversation(
+            &self,
+            _character_id: i64,
+            _conversation_id: i64,
+        ) -> Result<Option<crate::domain::emotion::EmotionState>, RepositoryError> {
+            Ok(None)
+        }
+        #[allow(deprecated)]
         async fn upsert(
             &self,
             _character_id: i64,
+            _state: &crate::domain::emotion::EmotionState,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn upsert_scoped(
+            &self,
+            _character_id: i64,
+            _conversation_id: i64,
             _state: &crate::domain::emotion::EmotionState,
         ) -> Result<(), RepositoryError> {
             Ok(())
