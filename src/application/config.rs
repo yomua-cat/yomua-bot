@@ -1,11 +1,11 @@
 //! 配置系统 —— 从 TOML 文件读取运行配置。
 //!
-//! 第一阶段提供三个配置文件：
-//! - `runtime.toml` — 基础运行配置（数据目录、日志级别、关停超时）
+//! 提供三个配置文件：
+//! - `runtime.toml` — 基础运行配置（数据目录、日志级别、关停超时、管理员等）
 //! - `onebot.toml`  — OneBot WebSocket 连接配置（见 `crate::adapters::onebot::OneBotConfig`）
-//! - `llm.toml`     — LLM Provider 占位配置（本阶段未启用）
+//! - `llm.toml`     — LLM Provider 配置（见 `LlmConfig`）
 //!
-//! 保持简单：不做 WebUI，不做配置热重载。
+//! 支持首次启动自动生成模板文件、配置校验与热重载。
 
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,11 @@ pub struct RuntimeConfig {
 
     /// 管理员用户外部 ID 列表（如 QQ 号）。为 None 时无人可执行系统指令。
     pub admin_users: Option<Vec<String>>,
+
+    /// 事件总线广播通道容量（默认 256）。
+    /// 当订阅者消费速度慢于生产者发送速度时，超出容量的事件会被丢弃。
+    /// 高频消息场景下可适当调大。
+    pub broadcast_capacity: Option<usize>,
 }
 
 impl Default for RuntimeConfig {
@@ -39,6 +44,7 @@ impl Default for RuntimeConfig {
             shutdown_timeout_secs: 10,
             plugins_dir: None,
             admin_users: None,
+            broadcast_capacity: None,
         }
     }
 }
@@ -64,6 +70,116 @@ impl Default for LlmConfig {
             options: serde_json::json!({}),
         }
     }
+}
+
+/// 配置文件模板常量。
+/// runtime.toml 模板（首次启动自动生成）。
+pub const RUNTIME_TEMPLATE: &str = r#"# yomua-bot 运行时配置
+# 首次启动自动生成，请根据实际情况修改各字段。
+
+# 数据目录（存放 SQLite 数据库、插件 socket 等）。
+# 建议使用绝对路径。
+data_dir = "data"
+
+# 日志级别：trace / debug / info / warn / error。
+log_level = "info"
+
+# 优雅关停最大等待秒数。
+shutdown_timeout_secs = 10
+
+# 插件目录（为 null 则禁用插件系统）。
+# plugins_dir = "plugins"
+
+# 管理员用户外部 ID 列表（如 QQ 号）。
+# 【重要】未配置或为空将导致所有系统指令（换角色等）无法执行！
+admin_users = []
+
+# 事件总线广播通道容量（默认 256）。
+# high-throughput 场景可调大。
+# broadcast_capacity = 256
+"#;
+
+/// onebot.toml 模板。
+pub const ONEBOT_TEMPLATE: &str = r#"# yomua-bot OneBot 连接配置
+# 首次启动自动生成，请根据实际情况修改。
+
+# NapCat WebSocket 地址。
+websocket_url = "ws://127.0.0.1:3001"
+
+# 访问令牌（与 NapCat 配置的 access_token 一致，留空则不认证）。
+# access_token = ""
+
+# 重连相关。
+reconnect_interval_secs = 1
+max_reconnect_interval_secs = 30
+heartbeat_interval_secs = 30
+"#;
+
+/// llm.toml 模板。
+pub const LLM_TEMPLATE: &str = r#"# yomua-bot LLM 配置
+# 首次启动自动生成。默认 LLM 未启用（enabled = false）。
+
+enabled = false
+
+# Provider：ollama / openai / openai-compatible。
+# provider = "ollama"
+
+# 附加选项（provider 不同配置项不同）。
+[options]
+# model = "qwen2.5"
+# base_url = "http://localhost:11434/v1"
+# api_key = "ollama"
+"#;
+
+/// 将模板内容写入 path（如果文件不存在）。
+/// 成功写入返回 true，文件已存在返回 false。
+pub fn write_template_if_missing(path: &str, template: &str) -> std::io::Result<bool> {
+    let path = std::path::Path::new(path);
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, template)?;
+    Ok(true)
+}
+
+/// 校验运行时配置，返回所有错误列表（空表示校验通过）。
+pub fn validate_runtime(cfg: &RuntimeConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    // admin_users 必须非空（否则所有系统指令无法执行）。
+    if cfg
+        .admin_users
+        .as_ref()
+        .map_or(true, |list| list.is_empty())
+    {
+        errors.push("admin_users 未配置或为空！系统指令将无法执行。请在 runtime.toml 中添加 admin_users 字段。".to_string());
+    }
+
+    // log_level 必须是合法值。
+    let valid_levels = ["trace", "debug", "info", "warn", "error"];
+    if !valid_levels.contains(&cfg.log_level.as_str()) {
+        errors.push(format!(
+            "无效的 log_level：{}，有效值：{:?}",
+            cfg.log_level, valid_levels
+        ));
+    }
+
+    // shutdown_timeout_secs 必须为正数。
+    if cfg.shutdown_timeout_secs == 0 {
+        errors.push("shutdown_timeout_secs 必须大于 0".to_string());
+    }
+
+    // broadcast_capacity 如果设置了必须为正数。
+    if let Some(cap) = cfg.broadcast_capacity {
+        if cap == 0 {
+            errors.push("broadcast_capacity 必须大于 0".to_string());
+        }
+    }
+
+    errors
 }
 
 /// 从路径读取一个 TOML 文件，并在文件缺失或解析失败时提供清晰的错误。

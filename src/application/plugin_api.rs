@@ -3,6 +3,15 @@
 //! 本模块实现方法权限校验（`plugin_data.*` 免权限但强制插件命名空间）、
 //! 参数解析与各 API 方法的处理逻辑。错误统一返回中文 `String`，wire 直传。
 
+// TODO(AUDIT-006): PluginApi 直接持有 repos、cognition、dispatcher 的 Arc<dyn Trait> 指针，
+//   插件通过 PluginApi 可间接调用 Core 内部任意能力（如直接调用 ActionDispatcher）。
+//   建议 Phase 9 重构为窄接口：只暴露插件真正需要的最小方法集（如 SendMessage、QueryMemory 等），
+//   将 repos/cognition/dispatcher 替换为具体的能力抽象，防止插件越权访问核心结构。
+
+// TODO(AUDIT-036): 当前权限模型依赖简单的 `require_permission` 函数，按方法名匹配权限枚举。
+//   建议 Phase 9 实现细粒度权限检查：按资源类型（character、memory、relationship 等）+ 操作类型（read、write）
+//   拆分为独立权限节点，允许插件声明具体需要的权限子集，而非"能调用某方法即拥有全部相关权限"。
+
 use std::sync::Arc;
 
 use crate::application::action::ActionDispatcher;
@@ -11,8 +20,8 @@ use crate::domain::behavior::Action;
 use crate::domain::memory::{Memory, MemoryType};
 use crate::domain::relationship::Relationship;
 use crate::domain::repository::{
-    CharacterRepository, CharacterStateRepository, MemoryRepository, PluginDataRepository,
-    RelationshipRepository,
+    CharacterBindingRepository, CharacterRepository, CharacterStateRepository, MemoryRepository,
+    MessageRepository, PluginDataRepository, RelationshipRepository,
 };
 use crate::infrastructure::llm::{LlmMessage, LlmRole};
 use crate::infrastructure::plugin::permissions::check_permission;
@@ -22,6 +31,8 @@ use crate::infrastructure::plugin::registry::PluginRegistry;
 pub struct PluginApi {
     character_repo: Arc<dyn CharacterRepository>,
     state_repo: Arc<dyn CharacterStateRepository>,
+    binding_repo: Arc<dyn CharacterBindingRepository>,
+    message_repo: Arc<dyn MessageRepository>,
     memory_repo: Arc<dyn MemoryRepository>,
     relationship_repo: Arc<dyn RelationshipRepository>,
     plugin_data_repo: Arc<dyn PluginDataRepository>,
@@ -33,11 +44,13 @@ pub struct PluginApi {
 impl PluginApi {
     /// 创建一个 Plugin API 分发器。
     ///
-    /// 依赖注入构造（8 个依赖均为必需），按设计签名展开，故允许该 lint。
+    /// 依赖注入构造（10 个依赖均为必需），按设计签名展开，故允许该 lint。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         character_repo: Arc<dyn CharacterRepository>,
         state_repo: Arc<dyn CharacterStateRepository>,
+        binding_repo: Arc<dyn CharacterBindingRepository>,
+        message_repo: Arc<dyn MessageRepository>,
         memory_repo: Arc<dyn MemoryRepository>,
         relationship_repo: Arc<dyn RelationshipRepository>,
         plugin_data_repo: Arc<dyn PluginDataRepository>,
@@ -48,6 +61,8 @@ impl PluginApi {
         Self {
             character_repo,
             state_repo,
+            binding_repo,
+            message_repo,
             memory_repo,
             relationship_repo,
             plugin_data_repo,
@@ -81,9 +96,11 @@ impl PluginApi {
         // 3. 方法分发。
         match method {
             "message.send" => self.api_message_send(params).await,
+            "message.read" => self.api_message_read(params).await,
             "character.read" => self.api_character_read(params).await,
             "character.state.read" => self.api_character_state_read(params).await,
             "character.state.write" => self.api_character_state_write(params).await,
+            "binding.read" => self.api_binding_read(params).await,
             "memory.read" => self.api_memory_read(params).await,
             "memory.write" => self.api_memory_write(params).await,
             "relationship.read" => self.api_relationship_read(params).await,
@@ -93,7 +110,6 @@ impl PluginApi {
             "plugin_data.delete" => self.api_plugin_data_delete(plugin_name, params).await,
             "plugin_data.list" => self.api_plugin_data_list(plugin_name, params).await,
             "llm.call" => self.api_llm_call(params).await,
-            "message.read" => Err("message.read 暂未实现".to_string()),
             // 权限层已拦；此处兜底，防止绕过权限判定直入分发。
             "scheduler.create" => Err("scheduler.create 本期不开放".to_string()),
             other => Err(format!("未知方法：{other}")),
@@ -118,6 +134,24 @@ impl PluginApi {
             .await
             .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({}))
+    }
+
+    // -----------------------------------------------------------------------
+    // message.read
+    // -----------------------------------------------------------------------
+
+    async fn api_message_read(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let conversation_id = require_i64(&params, "conversation_id")?;
+        let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+        let messages = self
+            .message_repo
+            .find_recent(conversation_id, limit)
+            .await
+            .map_err(|e| e.to_string())?;
+        to_json(&messages)
     }
 
     // -----------------------------------------------------------------------
@@ -237,6 +271,22 @@ impl PluginApi {
             .await
             .map_err(|e| e.to_string())?;
         to_json(&state)
+    }
+
+    // -----------------------------------------------------------------------
+    // binding.read
+    // -----------------------------------------------------------------------
+
+    async fn api_binding_read(
+        &self,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let bindings = self
+            .binding_repo
+            .find_all()
+            .await
+            .map_err(|e| e.to_string())?;
+        to_json(&bindings)
     }
 
     // -----------------------------------------------------------------------
@@ -1107,6 +1157,8 @@ mod tests {
     struct Harness {
         api: PluginApi,
         character_repo: Arc<MemCharacterRepo>,
+        binding_repo: Arc<MemBindingRepo>,
+        message_repo: Arc<MemMessageRepo>,
         memory_repo: Arc<MemMemoryRepo>,
         relationship_repo: Arc<MemRelationshipRepo>,
         conv_repo: Arc<MemConvRepo>,
@@ -1117,6 +1169,8 @@ mod tests {
     async fn build_harness(llm_enabled: bool) -> Harness {
         let character_repo = Arc::new(MemCharacterRepo::default());
         let state_repo = Arc::new(MemStateRepo::default());
+        let binding_repo = Arc::new(MemBindingRepo);
+        let message_repo = Arc::new(MemMessageRepo);
         let memory_repo = Arc::new(MemMemoryRepo::default());
         let relationship_repo = Arc::new(MemRelationshipRepo::default());
         let plugin_data_repo = Arc::new(MemPluginDataRepo::default());
@@ -1132,12 +1186,12 @@ mod tests {
         ));
 
         let context_builder = Arc::new(ContextBuilder::new(
-            Arc::new(MemMessageRepo),
+            message_repo.clone(),
             conv_repo.clone() as Arc<dyn ConversationRepository>,
             memory_repo.clone() as Arc<dyn MemoryRepository>,
             relationship_repo.clone() as Arc<dyn RelationshipRepository>,
             Arc::new(MemEmotionRepo),
-            Arc::new(MemBindingRepo),
+            binding_repo.clone(),
         ));
         let cognition = Arc::new(CognitionLayer::new(
             if llm_enabled {
@@ -1151,6 +1205,8 @@ mod tests {
         let api = PluginApi::new(
             character_repo.clone() as Arc<dyn CharacterRepository>,
             state_repo.clone() as Arc<dyn CharacterStateRepository>,
+            binding_repo.clone() as Arc<dyn CharacterBindingRepository>,
+            message_repo.clone() as Arc<dyn MessageRepository>,
             memory_repo.clone() as Arc<dyn MemoryRepository>,
             relationship_repo.clone() as Arc<dyn RelationshipRepository>,
             plugin_data_repo.clone() as Arc<dyn PluginDataRepository>,
@@ -1162,6 +1218,8 @@ mod tests {
         Harness {
             api,
             character_repo,
+            binding_repo,
+            message_repo,
             memory_repo,
             relationship_repo,
             conv_repo,
@@ -1319,14 +1377,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_read_not_implemented_even_with_permission() {
+    async fn message_read_requires_conversation_id() {
         let h = build_harness(true).await;
         let err = h
             .api
             .dispatch("alpha", "message.read", serde_json::json!({}))
             .await
             .unwrap_err();
-        assert_eq!(err, "message.read 暂未实现");
+        assert_eq!(err, "缺少参数：conversation_id");
     }
 
     #[tokio::test]

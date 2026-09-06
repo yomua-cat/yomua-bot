@@ -271,10 +271,13 @@ impl ReplyProcessor {
                 })
                 .await
             {
-                tracing::warn!(
+                // 消息发送失败是严重问题：用户看不到回复，且无重试机制。
+                // 使用 error 级别以便运维及时发现。
+                tracing::error!(
                     target: "runtime",
                     binding_id = pending.binding_id,
-                    "发送回复失败: {e}"
+                    error = %e,
+                    "发送回复失败"
                 );
             }
         }
@@ -563,6 +566,15 @@ mod tests {
             _t: Option<crate::domain::memory::MemoryType>,
             _limit: i64,
         ) -> Result<Vec<Memory>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn search_by_keywords(
+            &self,
+            _character_id: i64,
+            _keywords: &[String],
+            _limit: i64,
+        ) -> Result<Vec<Memory>, RepositoryError> {
+            // 桩实现无持久存储，返回空结果。
             Ok(vec![])
         }
         async fn insert(&self, _m: &Memory) -> Result<i64, RepositoryError> {

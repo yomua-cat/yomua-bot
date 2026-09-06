@@ -55,6 +55,10 @@ pub enum PluginPermission {
     #[serde(rename = "character.state.write")]
     CharacterStateWrite,
 
+    /// 读取绑定关系。
+    #[serde(rename = "binding.read")]
+    BindingRead,
+
     /// 读取记忆。
     #[serde(rename = "memory.read")]
     MemoryRead,

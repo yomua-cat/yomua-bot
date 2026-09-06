@@ -52,7 +52,7 @@ pub struct SupervisorConfig {
     pub restart_max_backoff: Duration,
     /// 稳定运行窗口：插件保持 `Running` 且持续存活超过该时长后，重启预算
     /// 重新计数（`restart_count` 清零）。预算 = 连续崩溃重启上限；attach
-    /// 成功本身不再清零，避免“连上即崩”的插件被无限重启。
+    /// 成功本身不再清零，避免"连上即崩"的插件被无限重启。
     pub stable_window: Duration,
 }
 
@@ -160,6 +160,11 @@ impl PluginSupervisor {
             spawn_one(&self.core, &plugin);
         }
         Ok(())
+    }
+
+    /// 返回当前已注册的插件数量。
+    pub fn plugin_count(&self) -> usize {
+        self.core.registry.all().len()
     }
 
     /// 主动停止一个插件。

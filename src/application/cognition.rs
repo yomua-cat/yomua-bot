@@ -370,6 +370,15 @@ mod tests {
         ) -> Result<Vec<crate::domain::memory::Memory>, RepositoryError> {
             Ok(vec![])
         }
+        async fn search_by_keywords(
+            &self,
+            _character_id: i64,
+            _keywords: &[String],
+            _limit: i64,
+        ) -> Result<Vec<crate::domain::memory::Memory>, RepositoryError> {
+            // 桩实现无持久存储，返回空结果。
+            Ok(vec![])
+        }
         async fn insert(&self, _m: &crate::domain::memory::Memory) -> Result<i64, RepositoryError> {
             Ok(1)
         }

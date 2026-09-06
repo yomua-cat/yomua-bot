@@ -1,13 +1,20 @@
+[workspace]
+
 [package]
 name = "yomua-bot"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 description = "Character Runtime / Character Agent Framework"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "yomua-bot"
 path = "src/main.rs"
+
+[[bin]]
+name = "yomua-ctl"
+path = "src/bin/yomua-ctl.rs"
 
 [dependencies]
 # Async runtime

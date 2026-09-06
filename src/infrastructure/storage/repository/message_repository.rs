@@ -15,6 +15,11 @@ impl SqliteMessageRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
+    /// 获取底层连接池（用于在辅助函数中构造新的同类实例）。
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
 }
 
 #[async_trait]

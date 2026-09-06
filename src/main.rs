@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 use yomua_bot::adapters::onebot::{OneBotAdapter, OneBotAdapterImpl};
@@ -23,8 +24,12 @@ use yomua_bot::application::character_import::{
 use yomua_bot::application::cognition::CognitionLayer;
 use yomua_bot::application::cognition_driver::CognitionDriver;
 use yomua_bot::application::command::CommandHandler;
-use yomua_bot::application::config::{load_llm, load_onebot, load_runtime, LlmConfig};
+use yomua_bot::application::config::{
+    load_llm, load_onebot, load_runtime, validate_runtime, write_template_if_missing, LlmConfig,
+    LLM_TEMPLATE, ONEBOT_TEMPLATE, RUNTIME_TEMPLATE,
+};
 use yomua_bot::application::context::ContextBuilder;
+use yomua_bot::application::control::{start_control_service, CommandRegistry, RuntimeHandle};
 use yomua_bot::application::conversation::ConversationManager;
 use yomua_bot::application::emotion_service::EmotionService;
 use yomua_bot::application::event_bus::EventBus;
@@ -123,7 +128,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config_dir = PathBuf::from(args.first().map(String::as_str).unwrap_or_default());
-    run_runtime(&config_dir).await
+    let _handle = run_runtime(&config_dir).await?;
+    Ok(())
 }
 
 /// 启动常驻运行时。
@@ -131,11 +137,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// 加载配置 → 初始化日志 → 打开存储 → 建立仓库 → 装配应用层
 /// （Runtime / 行为 / 认知 / 情绪 / 关系）→ 启动订阅者 → 启动插件系统
 /// （可选）→ 启动 OneBot 适配器 → 等待关停信号。
-async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. 加载配置。
-    let runtime_cfg = load_runtime(&config_dir.join(RUNTIME_CONFIG).display().to_string())?;
-    let onebot_cfg = load_onebot(&config_dir.join(ONEBOT_CONFIG).display().to_string())?;
-    let llm_cfg = load_llm(&config_dir.join(LLM_CONFIG).display().to_string())?;
+async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
+    // 1. 配置初始化：文件不存在时生成模板并退出提示用户修改。
+    let runtime_path = config_dir.join(RUNTIME_CONFIG);
+    let onebot_path = config_dir.join(ONEBOT_CONFIG);
+    let llm_path = config_dir.join(LLM_CONFIG);
+
+    if !runtime_path.exists() {
+        write_template_if_missing(&runtime_path.display().to_string(), RUNTIME_TEMPLATE).map_err(
+            |e| RuntimeError::Config(format!("无法创建配置文件 {}: {e}", runtime_path.display())),
+        )?;
+        write_template_if_missing(&onebot_path.display().to_string(), ONEBOT_TEMPLATE).ok();
+        write_template_if_missing(&llm_path.display().to_string(), LLM_TEMPLATE).ok();
+        eprintln!(
+            "错误: 配置文件不存在，已在当前目录生成模板文件。\n\
+             请修改 runtime.toml 和 onebot.toml 后重新启动。\n\
+             文件路径：\n\
+             - ./runtime.toml\n\
+             - ./onebot.toml\n\
+             - ./llm.toml（可选）"
+        );
+        std::process::exit(1);
+    }
+
+    // 加载配置。
+    let runtime_cfg = load_runtime(&runtime_path.display().to_string())?;
+    let onebot_cfg = load_onebot(&onebot_path.display().to_string())?;
+    let llm_cfg = load_llm(&llm_path.display().to_string())?;
+
+    // 1.2 配置校验：所有错误同时报告，不静默忽略。
+    let validation_errors = validate_runtime(&runtime_cfg);
+    if !validation_errors.is_empty() {
+        for err in &validation_errors {
+            tracing::error!(target: "runtime", "{}", err);
+        }
+        return Err(RuntimeError::Config(format!(
+            "配置校验失败：{} 个错误（见上文）",
+            validation_errors.len()
+        )));
+    }
 
     // 2. 初始化日志。
     tracing_subscriber::fmt()
@@ -152,118 +192,39 @@ async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>
         RuntimeError::Config(format!("无法创建数据目录 {}: {e}", runtime_cfg.data_dir))
     })?;
     let db_path = format!("{}/runtime.db", runtime_cfg.data_dir);
-    let storage = SqliteStorage::open(&db_path).await?;
+    let storage = Arc::new(SqliteStorage::open(&db_path).await?);
     storage.migrate().await?;
     let pool = storage.pool().clone();
 
-    // 4. 建立仓库。角色仓库需要同时用于 Runtime 与 BindingManager，
-    //    因此保留具体类型，并在需要 trait 对象处 clone。
-    let character_repo = Arc::new(SqliteCharacterRepository::new(pool.clone()));
-    let state_repo: Arc<dyn CharacterStateRepository> =
-        Arc::new(SqliteCharacterStateRepository::new(pool.clone()));
-    let binding_repo: Arc<dyn CharacterBindingRepository> =
-        Arc::new(SqliteCharacterBindingRepository::new(pool.clone()));
-    let conversation_repo: Arc<dyn ConversationRepository> =
-        Arc::new(SqliteConversationRepository::new(pool.clone()));
-    let participant_repo: Arc<dyn ParticipantRepository> =
-        Arc::new(SqliteParticipantRepository::new(pool.clone()));
-    let message_repo: Arc<dyn MessageRepository> =
-        Arc::new(SqliteMessageRepository::new(pool.clone()));
-    let memory_repo: Arc<dyn MemoryRepository> =
-        Arc::new(SqliteMemoryRepository::new(pool.clone()));
-    let relationship_repo: Arc<dyn RelationshipRepository> =
-        Arc::new(SqliteRelationshipRepository::new(pool.clone()));
-    let emotion_repo: Arc<dyn EmotionStateRepository> =
-        Arc::new(SqliteEmotionStateRepository::new(pool.clone()));
-
-    // 插件数据仓储（plugin_data.* 免权限、按插件名命名空间隔离）。
-    let plugin_data_repo: Arc<dyn PluginDataRepository> =
-        Arc::new(SqlitePluginDataRepository::new(pool.clone()));
+    // 4. 建立仓库。
+    let repos = build_repos(pool);
 
     // G1 启动检测：同一会话存在多个角色绑定为脏数据（旧版模型遗留），
     // 仅 warn 不自动删除；行为层取第一个绑定。
-    let all_bindings = binding_repo.find_all().await?;
-    let mut conv_counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
-    for b in &all_bindings {
-        *conv_counts.entry(b.conversation_id).or_insert(0) += 1;
-    }
-    let mut dirty = 0;
-    for (conv, count) in conv_counts {
-        if count > 1 {
-            dirty += 1;
-            tracing::warn!(target: "runtime", conversation_id = conv, count, "会话存在多个角色绑定（脏数据），行为层将取第一个绑定");
-        }
-    }
-    if dirty == 0 {
-        tracing::info!(target: "runtime", "会话绑定检查通过：所有会话均为单角色绑定");
-    }
+    check_binding_dirtiness(&repos.binding_repo)
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("启动检测失败: {e}")))?;
 
-    // 5. 建立事件总线。
-    let bus = EventBus::new();
+    // 5. 建立事件总线（容量可配置，默认 256）。
+    let bus = if let Some(capacity) = runtime_cfg.broadcast_capacity {
+        EventBus::with_capacity(capacity)
+    } else {
+        EventBus::new()
+    };
 
     // 6. 装配应用层编排依赖。
-    //    repos → CharacterRuntime → BindingManager → ContextBuilder →
-    //    EmotionService → RelationshipService → RuleBehaviorEngine →
-    //    (enabled) Provider → Scheduler → CognitionLayer → ActionDispatcher →
-    //    ReplyProcessor → EventProcessor。
-    let runtime = Arc::new(CharacterRuntime::with_event_bus(
-        character_repo.clone() as Arc<dyn CharacterRepository>,
-        state_repo.clone(),
-        conversation_repo.clone(),
-        bus.clone(),
-    ));
-
-    let binding_manager = Arc::new(BindingManager::new(
-        binding_repo.clone(),
-        character_repo.clone() as Arc<dyn CharacterRepository>,
-        conversation_repo.clone(),
-    ));
-
-    let context_builder = Arc::new(ContextBuilder::new(
-        message_repo.clone(),
-        conversation_repo.clone(),
-        memory_repo.clone(),
-        relationship_repo.clone(),
-        emotion_repo.clone(),
-        binding_repo.clone(),
-    ));
-    let memory_service = Arc::new(MemoryService::new(memory_repo.clone()));
-
-    let emotion_service = Arc::new(EmotionService::new(emotion_repo.clone(), bus.clone()));
-    let relationship_service = Arc::new(RelationshipService::new(
-        relationship_repo.clone(),
-        bus.clone(),
-    ));
-
-    let behavior_engine = Arc::new(RuleBehaviorEngine::new(
-        binding_repo.clone(),
-        emotion_repo.clone(),
-        relationship_repo.clone(),
-        state_repo.clone(),
-        yomua_bot::application::clock::system_clock(),
-    ));
-
-    // LLM 是能力不是生命线：enabled=false 时 scheduler 为 None，走确定性回复。
-    let llm_scheduler: Option<Arc<DefaultLlmScheduler>> = if llm_cfg.enabled {
-        let provider: Arc<dyn LlmProvider> = Arc::new(build_openai_provider(&llm_cfg)?);
-        tracing::info!(target: "llm", model = %provider.name(), "LLM 已启用");
-        Some(Arc::new(DefaultLlmScheduler::new(provider)))
-    } else {
-        tracing::info!(target: "llm", "LLM 未启用，使用确定性回复");
-        None
-    };
-    let scheduler: Option<Arc<dyn LlmScheduler>> =
-        llm_scheduler.clone().map(|s| s as Arc<dyn LlmScheduler>);
-    let cognition = Arc::new(CognitionLayer::new(scheduler, context_builder.clone()));
+    let app = build_app_layer(&runtime_cfg, &llm_cfg, &repos, bus.clone());
 
     // 7. 建立会话管理器、动作执行器、OneBot 适配器。
-    let conversation_manager =
-        ConversationManager::new(conversation_repo.clone(), participant_repo.clone());
+    let conversation_manager = ConversationManager::new(
+        repos.conversation_repo.clone(),
+        repos.participant_repo.clone(),
+    );
     let adapter = OneBotAdapterImpl::new(onebot_cfg, bus.clone(), conversation_manager).await;
     let adapter = Arc::new(adapter);
 
     let action_dispatcher = Arc::new(ActionDispatcher::new(
-        conversation_repo.clone(),
+        repos.conversation_repo.clone(),
         adapter.clone(),
     ));
 
@@ -271,144 +232,134 @@ async fn run_runtime(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>
     // 不产生任何插件相关任务（保持既有部署行为不变）。
     let plugin_registry = Arc::new(PluginRegistry::new());
     let plugin_api = Arc::new(PluginApi::new(
-        character_repo.clone() as Arc<dyn CharacterRepository>,
-        state_repo.clone(),
-        memory_repo.clone(),
-        relationship_repo.clone(),
-        plugin_data_repo.clone(),
+        repos.character_repo.clone() as Arc<dyn CharacterRepository>,
+        repos.state_repo.clone(),
+        repos.binding_repo.clone(),
+        repos.message_repo.clone(),
+        repos.memory_repo.clone(),
+        repos.relationship_repo.clone(),
+        repos.plugin_data_repo.clone(),
         action_dispatcher.clone(),
-        cognition.clone(),
+        app.cognition.clone(),
         plugin_registry.clone(),
     ));
 
     let delay_executor: Arc<dyn DelayExecutor> = Arc::new(TokioDelayExecutor);
     let reply_processor = Arc::new(ReplyProcessor::new(
-        runtime,
-        binding_manager.clone(),
-        behavior_engine.clone(),
-        cognition,
-        relationship_service,
-        emotion_service,
-        memory_service,
+        app.runtime.clone(),
+        app.binding_manager.clone(),
+        app.behavior_engine.clone(),
+        app.cognition.clone(),
+        app.relationship_service.clone(),
+        app.emotion_service.clone(),
+        app.memory_service.clone(),
         action_dispatcher.clone(),
         bus.clone(),
         delay_executor,
-        participant_repo.clone(),
+        repos.participant_repo.clone(),
     ));
 
     // 系统指令处理器（硬性约束 B）：订阅 CommandReceived，执行换角色并中文回复。
     let command_handler = CommandHandler::new(
-        binding_manager.clone(),
-        character_repo.clone() as Arc<dyn CharacterRepository>,
+        app.binding_manager.clone(),
+        repos.character_repo.clone() as Arc<dyn CharacterRepository>,
         action_dispatcher.clone(),
         runtime_cfg.admin_users.clone(),
     );
 
-    // 8. 启动订阅者（消息持久化、事件路由）。
-    let persistence_bus = bus.clone();
-    let persistence_msg_repo: Arc<dyn MessageRepository> =
-        Arc::new(SqliteMessageRepository::new(pool.clone()));
-    tokio::spawn(async move {
-        MessagePersistence::new(persistence_msg_repo)
-            .run(&persistence_bus)
-            .await;
-    });
+    // 8. 启动订阅者和后台任务。
+    // MessagePersistence 的 JoinHandle 被跟踪，以便在异常退出时记录错误。
+    let message_persistence_handle =
+        spawn_background_tasks(&repos, &bus, reply_processor, command_handler, &app);
 
-    let processor_bus = bus.clone();
-    tokio::spawn(async move {
-        EventProcessor::new(reply_processor)
-            .run(&processor_bus)
-            .await;
-    });
+    // 9. 插件系统（条件启用）：plugins_dir 为 None 时不启动任何插件相关任务，
+    // 但 WebUI socket 始终创建。
+    let supervisor_cfg = SupervisorConfig {
+        plugins_dir: runtime_cfg
+            .plugins_dir
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("plugins")),
+        sockets_dir: PathBuf::from(&runtime_cfg.data_dir).join("plugin-sockets"),
+        ..Default::default()
+    };
+    let supervisor = Arc::new(PluginSupervisor::new(
+        supervisor_cfg,
+        plugin_registry.clone(),
+        plugin_api.clone(),
+    ));
 
-    let command_bus = bus.clone();
-    tokio::spawn(async move {
-        command_handler.run(&command_bus).await;
-    });
+    // 插件系统（仅在 plugins_dir 配置时加载插件）。
+    if let Some(plugins_dir) = &runtime_cfg.plugins_dir {
+        tracing::info!(plugins_dir = %plugins_dir, "插件系统已启用");
 
-    // 9. 启动主动行为驱动（后台 tick，无 LLM，仅状态维护）。
-    let proactive_driver = ProactiveDriver::new(
-        binding_repo.clone(),
-        state_repo.clone(),
-        behavior_engine.clone() as Arc<dyn BehaviorEngine>,
-        bus.clone(),
-        yomua_bot::application::clock::system_clock(),
-    );
-    tokio::spawn(async move {
-        proactive_driver.run().await;
-    });
+        // EventBridge 订阅：把 Core 事件总线上的事件转发给已订阅插件。
+        let bridge = EventBridge::new(plugin_registry.clone());
+        let subscription = bus.subscribe();
+        tokio::spawn(async move { bridge.run(subscription).await });
 
-    // 9.1. 启动后台认知驱动（LLM 启用时才有意义）。
-    if let Some(ref sched) = llm_scheduler {
-        let cognition_driver = Arc::new(CognitionDriver::new(
-            sched.clone() as Arc<dyn EmbeddingScheduler>,
-            sched.clone() as Arc<dyn LlmScheduler>,
-            memory_repo.clone(),
-            binding_repo.clone(),
-            message_repo.clone(),
-            character_repo.clone() as Arc<dyn CharacterRepository>,
-            yomua_bot::application::clock::system_clock(),
-        ));
-        tokio::spawn(async move {
-            cognition_driver.run().await;
-        });
+        // 启动全部插件；单个插件失败不致命（supervisor 内部已隔离），
+        // 插件目录不存在只 warn 记录，不中断 Core。
+        if let Err(e) = supervisor.start_all().await {
+            tracing::warn!(error = %e, "插件启动异常（插件系统保持启用，Core 继续运行）");
+        }
+    } else {
+        tracing::info!("插件系统未启用（runtime.toml 未配置 plugins_dir）");
     }
 
-    // 10. 插件系统（条件启用）：plugins_dir 为 None 时不启动任何插件相关任务。
-    let supervisor: Option<Arc<PluginSupervisor>> =
-        if let Some(plugins_dir) = &runtime_cfg.plugins_dir {
-            let cfg = SupervisorConfig {
-                plugins_dir: PathBuf::from(plugins_dir),
-                sockets_dir: PathBuf::from(&runtime_cfg.data_dir).join("plugin-sockets"),
-                ..SupervisorConfig::default()
-            };
-            let sup = Arc::new(PluginSupervisor::new(
-                cfg,
-                plugin_registry.clone(),
-                plugin_api.clone(),
-            ));
-            tracing::info!(plugins_dir = %plugins_dir, "插件系统已启用");
+    // 10. 创建关停通道和控制句柄。
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let handle = RuntimeHandle {
+        config_dir: config_dir.to_path_buf(),
+        runtime_cfg: runtime_cfg.clone(),
+        data_dir: PathBuf::from(&runtime_cfg.data_dir),
+        supervisor: supervisor.clone(),
+        adapter: adapter.clone(),
+        storage: storage.clone(),
+        shutdown_tx,
+        commands: CommandRegistry::builtin(),
+    };
 
-            // EventBridge 订阅：把 Core 事件总线上的事件转发给已订阅插件。
-            let bridge = EventBridge::new(plugin_registry.clone());
-            let subscription = bus.subscribe();
-            tokio::spawn(async move { bridge.run(subscription).await });
-
-            // 启动全部插件；单个插件失败不致命（supervisor 内部已隔离），
-            // 插件目录不存在只 warn 记录，不中断 Core。
-            if let Err(e) = sup.start_all().await {
-                tracing::warn!(error = %e, "插件启动异常（插件系统保持启用，Core 继续运行）");
-            }
-            Some(sup)
-        } else {
-            tracing::info!("插件系统未启用（runtime.toml 未配置 plugins_dir）");
-            None
-        };
+    // 启动控制服务（后台任务，监听 data/control.sock）。
+    let control_handle = start_control_service(handle.clone(), shutdown_rx.clone());
+    tracing::info!(target: "runtime", socket_path = %handle.data_dir.join("control.sock").display(), "控制服务已启动（可用 yomua-ctl status/reload-config/shutdown）");
 
     // 11. 启动适配器并等待消息。
     adapter.start().await?;
     tracing::info!(target: "runtime", "字符运行时已就绪，等待消息...");
 
-    // 12. 等待关停信号（Ctrl+C）。Core 常驻，适配器断线自动重连。
-    tracing::info!(target: "runtime", "正在运行；按 Ctrl+C 退出。");
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("无法注册关停信号处理: {e}")))?;
+    // 12. 等待关停信号（Ctrl+C 或控制 socket）。Core 常驻，适配器断线自动重连。
+    tracing::info!(target: "runtime", "正在运行；按 Ctrl+C 或使用 yomua-ctl shutdown 退出。");
+    let _ = shutdown_rx.changed().await;
     tracing::info!(target: "runtime", "收到关停信号，正在优雅关闭...");
 
-    // 13. 优雅关停：先停插件（发 shutdown 通知 → 等超时 → 杀残余）→ 停适配器 → 关数据库。
-    if let Some(sup) = &supervisor {
-        if let Err(e) = sup.shutdown_all().await {
-            tracing::warn!(target: "runtime", error = %e, "停止插件失败");
+    // 检查 MessagePersistence 任务状态（如果在运行期间已经异常退出）。
+    // 注意：这里只检查而不等待，因为任务应该已经在 run() 返回时停止。
+    if message_persistence_handle.is_finished() {
+        match message_persistence_handle.await {
+            Ok(()) => {}
+            Err(panic_info) => {
+                tracing::error!(
+                    target: "runtime",
+                    panic = ?panic_info,
+                    "MessagePersistence 任务panic终止"
+                );
+            }
         }
+    }
+
+    // 13. 优雅关停：先停插件（发 shutdown 通知 → 等超时 → 杀残余）→ 停适配器 → 关数据库。
+    if let Err(e) = supervisor.shutdown_all().await {
+        tracing::warn!(target: "runtime", error = %e, "停止插件失败");
     }
     if let Err(e) = adapter.stop().await {
         tracing::warn!(target: "runtime", error = %e, "停止适配器失败");
     }
     storage.close().await;
+    let _ = control_handle.await;
 
     tracing::info!(target: "runtime", "yomua-bot 已退出。");
-    Ok(())
+    Ok(handle)
 }
 
 /// 运行 `import-card` 子命令：把一张角色卡 JSON/PNG 导入 SQLite，
@@ -742,4 +693,236 @@ fn parse_reply_mode(s: &str) -> Result<ReplyMode, RuntimeError> {
         "occasional" => Ok(ReplyMode::Occasionally),
         other => Err(RuntimeError::Config(format!("未知的回复模式：{other}"))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 辅助函数（AUDIT-049：run_runtime 过长，拆分为私有辅助方法）
+// ---------------------------------------------------------------------------
+
+use sqlx::SqlitePool;
+
+/// 所有仓库的集合。
+struct Repos {
+    _pool: SqlitePool,
+    character_repo: Arc<SqliteCharacterRepository>,
+    state_repo: Arc<dyn CharacterStateRepository>,
+    binding_repo: Arc<dyn CharacterBindingRepository>,
+    conversation_repo: Arc<dyn ConversationRepository>,
+    participant_repo: Arc<dyn ParticipantRepository>,
+    message_repo: Arc<dyn MessageRepository>,
+    memory_repo: Arc<dyn MemoryRepository>,
+    relationship_repo: Arc<dyn RelationshipRepository>,
+    emotion_repo: Arc<dyn EmotionStateRepository>,
+    plugin_data_repo: Arc<dyn PluginDataRepository>,
+}
+
+/// 从 SQLite 连接池构建所有仓库。
+fn build_repos(pool: SqlitePool) -> Repos {
+    let character_repo = Arc::new(SqliteCharacterRepository::new(pool.clone()));
+    let state_repo: Arc<dyn CharacterStateRepository> =
+        Arc::new(SqliteCharacterStateRepository::new(pool.clone()));
+    let binding_repo: Arc<dyn CharacterBindingRepository> =
+        Arc::new(SqliteCharacterBindingRepository::new(pool.clone()));
+    let conversation_repo: Arc<dyn ConversationRepository> =
+        Arc::new(SqliteConversationRepository::new(pool.clone()));
+    let participant_repo: Arc<dyn ParticipantRepository> =
+        Arc::new(SqliteParticipantRepository::new(pool.clone()));
+    let message_repo: Arc<dyn MessageRepository> =
+        Arc::new(SqliteMessageRepository::new(pool.clone()));
+    let memory_repo: Arc<dyn MemoryRepository> =
+        Arc::new(SqliteMemoryRepository::new(pool.clone()));
+    let relationship_repo: Arc<dyn RelationshipRepository> =
+        Arc::new(SqliteRelationshipRepository::new(pool.clone()));
+    let emotion_repo: Arc<dyn EmotionStateRepository> =
+        Arc::new(SqliteEmotionStateRepository::new(pool.clone()));
+    let plugin_data_repo: Arc<dyn PluginDataRepository> =
+        Arc::new(SqlitePluginDataRepository::new(pool.clone()));
+
+    Repos {
+        _pool: pool,
+        character_repo,
+        state_repo,
+        binding_repo,
+        conversation_repo,
+        participant_repo,
+        message_repo,
+        memory_repo,
+        relationship_repo,
+        emotion_repo,
+        plugin_data_repo,
+    }
+}
+
+/// G1 启动检测：同一会话存在多个角色绑定为脏数据（旧版模型遗留），
+/// 仅 warn 不自动删除；行为层取第一个绑定。
+async fn check_binding_dirtiness(
+    binding_repo: &Arc<dyn CharacterBindingRepository>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let all_bindings = binding_repo.find_all().await?;
+    let mut conv_counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for b in &all_bindings {
+        *conv_counts.entry(b.conversation_id).or_insert(0) += 1;
+    }
+    let mut dirty = 0;
+    for (conv, count) in conv_counts {
+        if count > 1 {
+            dirty += 1;
+            tracing::warn!(target: "runtime", conversation_id = conv, count, "会话存在多个角色绑定（脏数据），行为层将取第一个绑定");
+        }
+    }
+    if dirty == 0 {
+        tracing::info!(target: "runtime", "会话绑定检查通过：所有会话均为单角色绑定");
+    }
+    Ok(())
+}
+
+/// 应用层编排依赖的集合。
+struct AppLayer {
+    runtime: Arc<CharacterRuntime>,
+    binding_manager: Arc<BindingManager>,
+    behavior_engine: Arc<RuleBehaviorEngine>,
+    cognition: Arc<CognitionLayer>,
+    relationship_service: Arc<RelationshipService>,
+    emotion_service: Arc<EmotionService>,
+    memory_service: Arc<MemoryService>,
+    llm_scheduler: Option<Arc<DefaultLlmScheduler>>,
+}
+
+/// 装配应用层编排依赖。
+fn build_app_layer(
+    _runtime_cfg: &yomua_bot::application::config::RuntimeConfig,
+    llm_cfg: &LlmConfig,
+    repos: &Repos,
+    bus: EventBus,
+) -> AppLayer {
+    let runtime = Arc::new(CharacterRuntime::with_event_bus(
+        repos.character_repo.clone() as Arc<dyn CharacterRepository>,
+        repos.state_repo.clone(),
+        repos.conversation_repo.clone(),
+        bus.clone(),
+    ));
+
+    let binding_manager = Arc::new(BindingManager::new(
+        repos.binding_repo.clone(),
+        repos.character_repo.clone() as Arc<dyn CharacterRepository>,
+        repos.conversation_repo.clone(),
+    ));
+
+    let context_builder = Arc::new(ContextBuilder::new(
+        repos.message_repo.clone(),
+        repos.conversation_repo.clone(),
+        repos.memory_repo.clone(),
+        repos.relationship_repo.clone(),
+        repos.emotion_repo.clone(),
+        repos.binding_repo.clone(),
+    ));
+    let memory_service = Arc::new(MemoryService::new(repos.memory_repo.clone()));
+
+    let emotion_service = Arc::new(EmotionService::new(repos.emotion_repo.clone(), bus.clone()));
+    let relationship_service = Arc::new(RelationshipService::new(
+        repos.relationship_repo.clone(),
+        bus.clone(),
+    ));
+
+    let behavior_engine = Arc::new(RuleBehaviorEngine::new(
+        repos.binding_repo.clone(),
+        repos.emotion_repo.clone(),
+        repos.relationship_repo.clone(),
+        repos.state_repo.clone(),
+        yomua_bot::application::clock::system_clock(),
+    ));
+
+    // LLM 是能力不是生命线：enabled=false 时 scheduler 为 None，走确定性回复。
+    let llm_scheduler: Option<Arc<DefaultLlmScheduler>> = if llm_cfg.enabled {
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(build_openai_provider(llm_cfg).expect("LLM 配置错误"));
+        tracing::info!(target: "llm", model = %provider.name(), "LLM 已启用");
+        Some(Arc::new(DefaultLlmScheduler::new(provider)))
+    } else {
+        tracing::info!(target: "llm", "LLM 未启用，使用确定性回复");
+        None
+    };
+    let scheduler: Option<Arc<dyn LlmScheduler>> =
+        llm_scheduler.clone().map(|s| s as Arc<dyn LlmScheduler>);
+    let cognition = Arc::new(CognitionLayer::new(scheduler, context_builder.clone()));
+
+    AppLayer {
+        runtime,
+        binding_manager,
+        behavior_engine,
+        cognition,
+        relationship_service,
+        emotion_service,
+        memory_service,
+        llm_scheduler,
+    }
+}
+
+/// 启动后台订阅者和任务。
+///
+/// 返回 MessagePersistence 任务的 JoinHandle，用于监控任务状态。
+fn spawn_background_tasks(
+    repos: &Repos,
+    bus: &EventBus,
+    reply_processor: Arc<ReplyProcessor>,
+    command_handler: CommandHandler,
+    app: &AppLayer,
+) -> tokio::task::JoinHandle<()> {
+    let persistence_bus = bus.clone();
+    let persistence_msg_repo: Arc<dyn MessageRepository> =
+        Arc::new(SqliteMessageRepository::new(repos._pool.clone()));
+    let persistence_handle = tokio::spawn(async move {
+        if let Err(e) = MessagePersistence::new(persistence_msg_repo)
+            .run(&persistence_bus)
+            .await
+        {
+            tracing::error!(
+                target: "runtime",
+                error = %e,
+                "MessagePersistence 任务异常退出"
+            );
+        }
+    });
+
+    let processor_bus = bus.clone();
+    tokio::spawn(async move {
+        EventProcessor::new(reply_processor)
+            .run(&processor_bus)
+            .await;
+    });
+
+    let command_bus = bus.clone();
+    tokio::spawn(async move {
+        command_handler.run(&command_bus).await;
+    });
+
+    // 启动主动行为驱动（后台 tick，无 LLM，仅状态维护）。
+    let proactive_driver = ProactiveDriver::new(
+        repos.binding_repo.clone(),
+        repos.state_repo.clone(),
+        app.behavior_engine.clone() as Arc<dyn BehaviorEngine>,
+        bus.clone(),
+        yomua_bot::application::clock::system_clock(),
+    );
+    tokio::spawn(async move {
+        proactive_driver.run().await;
+    });
+
+    // 启动后台认知驱动（LLM 启用时才有意义）。
+    if let Some(ref sched) = app.llm_scheduler {
+        let cognition_driver = Arc::new(CognitionDriver::new(
+            sched.clone() as Arc<dyn EmbeddingScheduler>,
+            sched.clone() as Arc<dyn LlmScheduler>,
+            repos.memory_repo.clone(),
+            repos.binding_repo.clone(),
+            repos.message_repo.clone(),
+            repos.character_repo.clone() as Arc<dyn CharacterRepository>,
+            yomua_bot::application::clock::system_clock(),
+        ));
+        tokio::spawn(async move {
+            cognition_driver.run().await;
+        });
+    }
+
+    persistence_handle
 }

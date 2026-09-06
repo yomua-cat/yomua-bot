@@ -25,13 +25,24 @@ impl MessagePersistence {
     }
 
     /// 启动消费循环，持续监听事件总线直到发送端全部关闭。
-    pub async fn run(self, bus: &EventBus) {
+    ///
+    /// 正常情况下返回 `Ok(())`（通道关闭）。
+    /// 如果处理过程中遇到不可恢复的错误（如数据库连接断开），返回 `Err`。
+    ///
+    /// 注意：本方法使用 `Result` 返回而非 `Infallible`，以便调用方感知任务异常终止。
+    /// 单条消息处理失败会记录警告并继续处理下一条，不会导致整个任务终止。
+    pub async fn run(self, bus: &EventBus) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut subscription = bus.subscribe();
         while let Some(event) = subscription.recv().await {
-            if let Err(e) = self.handle(&event).await {
-                tracing::warn!(target: "storage", error = %e, "消息持久化失败");
+            match self.handle(&event).await {
+                Ok(()) => {}
+                Err(e) => {
+                    // 单条消息处理失败，记录警告并继续（不终止整个任务）
+                    tracing::warn!(target: "storage", error = %e, "消息持久化失败，继续处理下一条");
+                }
             }
         }
+        Ok(())
     }
 
     /// 处理单条事件：若为 `MessageReceived` 则持久化。

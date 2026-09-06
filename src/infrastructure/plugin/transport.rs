@@ -765,6 +765,8 @@ pub(crate) mod test_support {
         PluginApi::new(
             Arc::new(EmptyCharacterRepo) as Arc<dyn CharacterRepository>,
             Arc::new(EmptyStateRepo) as Arc<dyn CharacterStateRepository>,
+            Arc::new(EmptyBindingRepo) as Arc<dyn CharacterBindingRepository>,
+            Arc::new(EmptyMessageRepo) as Arc<dyn MessageRepository>,
             Arc::new(EmptyMemoryRepo) as Arc<dyn MemoryRepository>,
             Arc::new(EmptyRelationshipRepo) as Arc<dyn RelationshipRepository>,
             plugin_data,

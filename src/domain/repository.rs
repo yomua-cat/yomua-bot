@@ -3,6 +3,11 @@
 //! 领域代码仅依赖这些 trait。
 //! 基础设施层提供 SQLite 实现。
 
+// TODO(AUDIT-061): 所有 ID 字段（character_id、message_id 等）直接使用 i64，
+//   没有 newtype 封装，存在类型安全风险（如 character_id 和 message_id 混用）。
+//   建议 Phase 9 为每个 ID 类型创建独立 newtype（如 `CharacterId(i64)`），在 trait 签名中
+//   使用这些类型替代裸 i64，防止传错 ID 类型导致的隐性 bug。
+
 use async_trait::async_trait;
 
 use crate::domain::character::{Character, CharacterBinding, CharacterState};

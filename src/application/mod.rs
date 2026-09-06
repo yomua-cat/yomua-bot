@@ -13,6 +13,7 @@ pub mod cognition_driver;
 pub mod command;
 pub mod config;
 pub mod context;
+pub mod control;
 pub mod conversation;
 pub mod emotion_service;
 pub mod event_bus;

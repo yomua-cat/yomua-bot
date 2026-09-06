@@ -243,6 +243,7 @@ impl ContextBuilder {
                 self.match_lorebook_by_keywords(character, &prompt_text)
                     .into_iter()
                     .map(|(e, _)| e)
+                    .take(limits.lorebook_limit)
                     .collect()
             }
         };
@@ -298,6 +299,8 @@ impl ContextBuilder {
     ) -> Vec<(LorebookEntry, String)> {
         let haystack = prompt.to_lowercase();
 
+        // TODO: 当前对 lorebook 中每个条目每个关键词做 contains，时间复杂度 O(关键词数 * 条目数)。
+        // 未来可考虑构建 inverted index（关键词 → 条目列表）以降低匹配成本（AUDIT-042）。
         let mut matched: Vec<(LorebookEntry, String)> = character
             .definition
             .lorebook
@@ -480,15 +483,35 @@ fn extract_keywords(text: &str) -> Vec<String> {
 }
 
 /// 合并「按重要度」与「按关键词」两组记忆：去重、按重要度降序、截断。
+/// 合并「按重要度」与「按关键词」两组记忆：去重、按重要度降序、截断。
+///
+/// 去重逻辑：
+/// - 已持久化的记忆（id != 0）按 id 去重；
+/// - 同时按内容 hash 去重，避免两条已持久化但内容相同的记忆都被保留（AUDIT-016）；
+/// - id 为 0（未持久化）时始终追加，但也会与已有内容去重。
 fn merge_memories(
     by_importance: Vec<Memory>,
     by_keyword: Vec<Memory>,
     limit: usize,
 ) -> Vec<Memory> {
     let mut merged: Vec<Memory> = Vec::with_capacity(by_importance.len() + by_keyword.len());
+    let mut seen_ids: HashSet<i64> = HashSet::new();
+    let mut seen_content_hashes: HashSet<u64> = HashSet::new();
+
     for m in by_importance.into_iter().chain(by_keyword) {
-        // 去重：已持久化的记忆按 id 去重；id 为 0（未持久化）时始终追加。
-        if m.id == 0 || !merged.iter().any(|x| x.id == m.id) {
+        // 计算内容 hash（用于检测内容重复的记忆）。
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        m.content.hash(&mut hasher);
+        let content_hash = hasher.finish();
+
+        // 去重：id 为 0 时按内容 hash 去重；id != 0 时按 id 去重（同时检查内容 hash 避免重复内容）。
+        let id_ok = m.id == 0 || !seen_ids.contains(&m.id);
+        let content_ok = !seen_content_hashes.contains(&content_hash);
+
+        if id_ok && content_ok {
+            seen_ids.insert(m.id);
+            seen_content_hashes.insert(content_hash);
             merged.push(m);
         }
     }
@@ -497,6 +520,7 @@ fn merge_memories(
             .partial_cmp(&a.importance)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    // TODO: 未来可考虑在存储层预先排序或缓存，避免每次构建 context 都执行 O(n log n) 排序（AUDIT-040）。
     merged.truncate(limit);
     merged
 }

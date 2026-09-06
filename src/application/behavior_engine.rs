@@ -357,6 +357,10 @@ impl BehaviorEngine for RuleBehaviorEngine {
 }
 
 /// 依据 reply_mode 与 mentioned 返回基础回复阈值与延迟（毫秒）。
+///
+/// TODO(AUDIT-064): threshold 和 delay 的具体数值目前硬编码在 match 分支中。
+/// 未来应将这些值提取到 runtime.toml 配置文件，使运营人员可以在不修改代码的情况下
+/// 调整不同 reply_mode 下的回复行为参数。
 fn base_params(reply_mode: &ReplyMode, is_mentioned: bool) -> (f64, u64) {
     let (threshold, delay) = match reply_mode {
         ReplyMode::MentionOnly => {

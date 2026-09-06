@@ -143,11 +143,10 @@ impl BindingManager {
     /// 把会话切换到另一个角色（换角色）。
     ///
     /// - 校验目标角色存在；
-    /// - 取该会话当前绑定（多绑定脏数据时取第一个）；
+    /// - 取该会话当前绑定（多绑定脏数据时保留第一个，删除其余）；
     /// - 更新 character_id 并把 switched_at 置为当前时间；
     /// - 会话配置字段（reply_mode / proactive_enabled / mute_schedule /
-    ///   behavior_overrides / context_policy）随绑定保留，不随角色迁移；
-    /// - 使用仓储的单行原子 UPDATE，最小化与回复链路/主动 tick 的竞态窗口。
+    ///   behavior_overrides / context_policy）随绑定保留，不随角色迁移。
     pub async fn switch_character(
         &self,
         conversation_id: i64,
@@ -161,16 +160,46 @@ impl BindingManager {
                 new_character_id,
             )))?;
 
-        // 取该会话当前绑定（脏数据时取第一个）。
-        let bindings = self
+        // 取该会话当前绑定（可能有多条，脏数据场景）。
+        let mut bindings = self
             .binding_repo
             .find_by_conversation_id(conversation_id)
             .await?;
-        let Some(current) = bindings.into_iter().next() else {
+
+        // 如果没有绑定，返回错误（无法切换不存在的绑定）。
+        let Some(current) = bindings.pop() else {
             return Err(RuntimeError::Domain(DomainError::InvalidState(format!(
                 "会话 {conversation_id} 未绑定角色，无法换角色"
             ))));
         };
+
+        // P1-3 修复：如果存在多绑定脏数据，删除多余的绑定（保留一个），
+        // 维护"一会话一绑定"不变量。删除时按 switched_at 倒序，保留最新的。
+        if bindings.len() > 1 {
+            // 按 switched_at 降序排序（最新的在前）
+            bindings.sort_by_key(|a| std::cmp::Reverse(a.switched_at));
+            // 保留第一个（switched_at 最新的），删除其余的
+            for old in bindings.into_iter().skip(1) {
+                self.binding_repo.delete(old.id).await?;
+                tracing::warn!(
+                    target: "runtime",
+                    binding_id = old.id,
+                    conversation_id,
+                    "检测到多绑定脏数据，已清理多余绑定"
+                );
+            }
+        } else if bindings.len() == 1 {
+            // 有一条多余的绑定，删除它
+            for old in bindings {
+                self.binding_repo.delete(old.id).await?;
+                tracing::warn!(
+                    target: "runtime",
+                    binding_id = old.id,
+                    conversation_id,
+                    "检测到多绑定脏数据，已清理多余绑定"
+                );
+            }
+        }
 
         // 构造更新后的绑定：保留会话配置字段，仅换角色并记录生效时间。
         let mut updated = current.clone();

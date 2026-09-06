@@ -222,6 +222,26 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn search_by_keywords(
+            &self,
+            character_id: i64,
+            keywords: &[String],
+            _limit: i64,
+        ) -> Result<Vec<Memory>, RepositoryError> {
+            Ok(self
+                .items
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| {
+                    m.character_id == character_id
+                        && keywords
+                            .iter()
+                            .any(|kw| m.content.to_lowercase().contains(&kw.to_lowercase()))
+                })
+                .cloned()
+                .collect())
+        }
         async fn insert(&self, m: &Memory) -> Result<i64, RepositoryError> {
             let mut items = self.items.lock().unwrap();
             let id = items.len() as i64 + 1;

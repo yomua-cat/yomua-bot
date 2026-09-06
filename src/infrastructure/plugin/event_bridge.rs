@@ -51,8 +51,10 @@ impl EventBridge {
                         event: event_type.name().to_string(),
                         data: data.clone(),
                     }) {
-                        tracing::warn!(
-                            "事件 {} 通知插件 {name} 失败（通道满或已关闭）：{e}，丢弃",
+                        // 事件丢弃是严重问题：说明插件消费速度低于 Core 发送速度，
+                        // 或插件已卡死/断开连接。需要 error 级别告警以便运维发现。
+                        tracing::error!(
+                            "事件 {} 通知插件 {name} 失败（通道满或已关闭）：{e}，事件已丢弃",
                             event_type.name()
                         );
                     }

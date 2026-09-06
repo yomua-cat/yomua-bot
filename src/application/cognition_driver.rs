@@ -396,7 +396,7 @@ mod tests {
         fn add_message(&self, conv_id: i64, sender_id: i64, content: &str, days_ago: i64) {
             let mut msgs = self.messages.lock().unwrap();
             let msg = Message {
-                id: msgs.entry(conv_id).or_insert_with(Vec::new).len() as i64 + 1,
+                id: msgs.entry(conv_id).or_default().len() as i64 + 1,
                 conversation_id: conv_id,
                 sender_id,
                 content: MessageContent::Text(content.to_string()),
@@ -406,7 +406,7 @@ mod tests {
                 attachments: vec![],
                 metadata: serde_json::json!({}),
             };
-            msgs.entry(conv_id).or_insert_with(Vec::new).push(msg);
+            msgs.entry(conv_id).or_default().push(msg);
         }
     }
 
