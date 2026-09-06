@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use crate::adapters::onebot::ActionResponse;
 use crate::application::action::ActionDispatcher;
 use crate::application::cognition::CognitionLayer;
 use crate::domain::behavior::Action;
@@ -955,23 +956,37 @@ mod tests {
             &self,
             group_id: &str,
             content: &str,
-        ) -> Result<(), RuntimeError> {
+        ) -> Result<ActionResponse, RuntimeError> {
             self.sent_group
                 .lock()
                 .unwrap()
                 .push((group_id.to_string(), content.to_string()));
-            Ok(())
+            Ok(ActionResponse {
+                id: 0,
+                action: "send_group_msg".to_string(),
+                status: "ok".to_string(),
+                retcode: Some(0),
+                data: None,
+                error: None,
+            })
         }
         async fn send_private_message(
             &self,
             user_id: &str,
             content: &str,
-        ) -> Result<(), RuntimeError> {
+        ) -> Result<ActionResponse, RuntimeError> {
             self.sent_private
                 .lock()
                 .unwrap()
                 .push((user_id.to_string(), content.to_string()));
-            Ok(())
+            Ok(ActionResponse {
+                id: 0,
+                action: "send_private_msg".to_string(),
+                status: "ok".to_string(),
+                retcode: Some(0),
+                data: None,
+                error: None,
+            })
         }
     }
 

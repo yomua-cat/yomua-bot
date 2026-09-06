@@ -213,7 +213,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     };
 
     // 6. 装配应用层编排依赖。
-    let app = build_app_layer(&runtime_cfg, &llm_cfg, &repos, bus.clone());
+    let app = build_app_layer(&runtime_cfg, &llm_cfg, &repos, bus.clone())?;
 
     // 7. 建立会话管理器、动作执行器、OneBot 适配器。
     let conversation_manager = ConversationManager::new(
@@ -794,7 +794,7 @@ fn build_app_layer(
     llm_cfg: &LlmConfig,
     repos: &Repos,
     bus: EventBus,
-) -> AppLayer {
+) -> Result<AppLayer, RuntimeError> {
     let runtime = Arc::new(CharacterRuntime::with_event_bus(
         repos.character_repo.clone() as Arc<dyn CharacterRepository>,
         repos.state_repo.clone(),
@@ -834,8 +834,10 @@ fn build_app_layer(
 
     // LLM 是能力不是生命线：enabled=false 时 scheduler 为 None，走确定性回复。
     let llm_scheduler: Option<Arc<DefaultLlmScheduler>> = if llm_cfg.enabled {
-        let provider: Arc<dyn LlmProvider> =
-            Arc::new(build_openai_provider(llm_cfg).expect("LLM 配置错误"));
+        let provider: Arc<dyn LlmProvider> = Arc::new(
+            build_openai_provider(llm_cfg)
+                .map_err(|e| RuntimeError::Config(format!("LLM 配置错误: {e}")))?,
+        );
         tracing::info!(target: "llm", model = %provider.name(), "LLM 已启用");
         Some(Arc::new(DefaultLlmScheduler::new(provider)))
     } else {
@@ -846,7 +848,7 @@ fn build_app_layer(
         llm_scheduler.clone().map(|s| s as Arc<dyn LlmScheduler>);
     let cognition = Arc::new(CognitionLayer::new(scheduler, context_builder.clone()));
 
-    AppLayer {
+    Ok(AppLayer {
         runtime,
         binding_manager,
         behavior_engine,
@@ -855,7 +857,7 @@ fn build_app_layer(
         emotion_service,
         memory_service,
         llm_scheduler,
-    }
+    })
 }
 
 /// 启动后台订阅者和任务。

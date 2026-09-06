@@ -17,27 +17,28 @@
 //! ```
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::time::timeout;
 
-#[derive(Debug, serde::Serialize)]
-#[serde(tag = "cmd")]
-enum Command {
-    Status {},
-    #[serde(rename = "reload-config")]
-    ReloadConfig {},
-    Shutdown {},
-    Help {},
+/// 控制协议错误详情。
+#[derive(Debug, serde::Deserialize)]
+struct ControlErrorDetail {
+    code: String,
+    #[allow(dead_code)]
+    message: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct Response {
+    id: u64,
     ok: bool,
     #[serde(default)]
     data: Option<serde_json::Value>,
     #[serde(default)]
-    error: Option<String>,
+    error: Option<ControlErrorDetail>,
 }
 
 impl Response {
@@ -49,10 +50,11 @@ impl Response {
                     serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string())
                 );
             } else {
-                println!("{{\"ok\": true}}");
+                println!("{{\"id\": {}, \"ok\": true}}", self.id);
             }
         } else {
-            eprintln!("错误: {}", self.error.as_deref().unwrap_or("未知错误"));
+            let err = self.error.as_ref().map(|e| e.message.as_str()).unwrap_or("未知错误");
+            eprintln!("错误[{}]: {}", self.id, err);
             std::process::exit(1);
         }
     }
@@ -128,18 +130,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 确定 socket 路径。
     let socket = socket_path.unwrap_or_else(|| data_dir.join("control.sock"));
 
-    // 构建命令。
-    let cmd: Command = match cmd_arg.as_str() {
-        "status" => Command::Status {},
-        "reload-config" => Command::ReloadConfig {},
-        "shutdown" => Command::Shutdown {},
-        "help" => Command::Help {},
+    // 生成请求 ID（使用时间戳 + 随机数）。
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (rand_u32() as u64);
+
+    // 构建命令（JSON 格式：{id, cmd}）。
+    let request_cmd = match cmd_arg.as_str() {
+        "status" => "status",
+        "reload-config" => "reload-config",
+        "shutdown" => "shutdown",
+        "help" => "help",
         _ => {
             eprintln!("错误: 未知命令: {}", cmd_arg);
             eprintln!("可用命令: status, reload-config, shutdown, help");
             std::process::exit(1);
         }
     };
+
+    let request = serde_json::json!({
+        "id": id,
+        "cmd": request_cmd
+    });
 
     // 连接 socket。
     let mut stream = UnixStream::connect(&socket).await.map_err(|e| {
@@ -153,12 +167,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // 发送命令。
-    let json = serde_json::to_string(&cmd).expect("命令序列化失败");
+    let json = serde_json::to_string(&request).expect("请求序列化失败");
     stream.write_all(json.as_bytes()).await?;
 
-    // 读取响应。
+    // 读取响应（5 秒超时）。
     let mut buf = Vec::with_capacity(8192);
-    let n = stream.read_buf(&mut buf).await?;
+    let read_result = timeout(Duration::from_secs(5), stream.read_buf(&mut buf)).await;
+
+    let n = match read_result {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
+            eprintln!("错误: 读取响应失败: {}", e);
+            std::process::exit(1);
+        }
+        Err(_) => {
+            // 超时
+            eprintln!("错误: 服务器响应超时（5 秒）");
+            eprintln!("提示: 确认 yomua-bot 正在正常运行");
+            std::process::exit(1);
+        }
+    };
 
     if n == 0 {
         eprintln!("错误: 服务器关闭了连接");
@@ -172,6 +200,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         e
     })?;
 
+    // 验证响应 ID 匹配。
+    if resp.id != id {
+        eprintln!("错误: 响应 ID 不匹配（请求: {}, 响应: {}）", id, resp.id);
+        std::process::exit(1);
+    }
+
     resp.print();
     Ok(())
+}
+
+/// 生成一个随机 u32。
+fn rand_u32() -> u32 {
+    use std::time::Instant;
+    let instant = Instant::now();
+    (instant.elapsed().as_nanos() as u32).wrapping_add(instant.elapsed().subsec_nanos())
 }

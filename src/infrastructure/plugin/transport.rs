@@ -712,15 +712,29 @@ pub(crate) mod test_support {
             &self,
             _group_id: &str,
             _content: &str,
-        ) -> Result<(), RuntimeError> {
-            Ok(())
+        ) -> Result<crate::adapters::onebot::ActionResponse, RuntimeError> {
+            Ok(crate::adapters::onebot::ActionResponse {
+                id: 0,
+                action: "send_group_msg".to_string(),
+                status: "ok".to_string(),
+                retcode: Some(0),
+                data: None,
+                error: None,
+            })
         }
         async fn send_private_message(
             &self,
             _user_id: &str,
             _content: &str,
-        ) -> Result<(), RuntimeError> {
-            Ok(())
+        ) -> Result<crate::adapters::onebot::ActionResponse, RuntimeError> {
+            Ok(crate::adapters::onebot::ActionResponse {
+                id: 0,
+                action: "send_private_msg".to_string(),
+                status: "ok".to_string(),
+                retcode: Some(0),
+                data: None,
+                error: None,
+            })
         }
     }
 

@@ -66,11 +66,13 @@ impl ActionDispatcher {
                 self.adapter
                     .send_group_message(&conversation.external_id, content)
                     .await
+                    .map(|_| ())
             }
             ConversationType::Private => {
                 self.adapter
                     .send_private_message(&conversation.external_id, content)
                     .await
+                    .map(|_| ())
             }
         }
     }

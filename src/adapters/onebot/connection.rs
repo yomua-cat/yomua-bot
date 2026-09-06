@@ -6,17 +6,79 @@
 //! 连接循环保证：即使 NapCat 崩溃或断线，该循环也会按指数退避不断重连，
 //! 永远不会让 Core 进程退出。
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex, oneshot};
+
+use serde_json;
 
 use crate::error::RuntimeError;
 
 use super::{OneBotConfig, OneBotConnectionState};
 use crate::application::event_bus::EventBus;
 use crate::domain::event::{AdapterConnectedEvent, AdapterDisconnectedEvent, CoreEvent};
+
+/// Action 请求的完整信息，包含唯一 ID 和响应接收端。
+#[derive(Debug)]
+pub struct PendingRequest {
+    /// 请求 ID（用作 OneBot echo 字段）。
+    pub id: u64,
+    /// 请求的动作名称（用于日志）。
+    pub action: String,
+    /// 响应接收端（由调用方持有）。
+    pub response_tx: oneshot::Sender<ActionResponse>,
+}
+
+/// 待处理的 API 响应（来自 NapCat）。
+#[derive(Debug, Clone)]
+pub struct ActionResponse {
+    /// 请求 ID（echo）。
+    pub id: u64,
+    /// 响应的动作名称。
+    pub action: String,
+    /// 状态（ok / failed）。
+    pub status: String,
+    /// OneBot 错误码（0 = 成功）。
+    pub retcode: Option<i32>,
+    /// 成功时返回的数据。
+    pub data: Option<serde_json::Value>,
+    /// 错误信息。
+    pub error: Option<String>,
+}
+
+impl ActionResponse {
+    /// 是否表示成功。
+    pub fn is_ok(&self) -> bool {
+        self.retcode == Some(0)
+    }
+
+    /// 将错误信息格式化为字符串。
+    pub fn error_message(&self) -> String {
+        if let Some(msg) = &self.error {
+            return msg.clone();
+        }
+        if let Some(code) = self.retcode {
+            if code != 0 {
+                return format!("OneBot API 错误码: {code}");
+            }
+        }
+        String::new()
+    }
+}
+
+/// 入站消息分类：事件或 Action 响应。
+#[derive(Debug)]
+pub enum IncomingMessage {
+    /// OneBot 事件（如 message、notice、request）。
+    Event(String),
+    /// Action 响应（带 echo/retcode）。
+    Response(ActionResponse),
+}
 
 /// 一次 WebSocket 文本帧读取结果。
 ///
@@ -60,6 +122,14 @@ pub struct ConnectionShared {
     pub bus: EventBus,
     /// 出站通道（适配器写入动作 JSON，连接循环读取后发送）。
     pub outbound_tx: mpsc::Sender<String>,
+    /// Action 响应通道（连接循环读取响应并路由，ResponseRouter 接收）。
+    pub response_tx: mpsc::Sender<ActionResponse>,
+    /// 待处理请求注册表（request_id → PendingRequest）。
+    pub pending: Arc<StdMutex<HashMap<u64, PendingRequest>>>,
+    /// 唯一请求 ID 计数器。
+    pub request_id_counter: Arc<AtomicU64>,
+    /// 请求超时（秒），超时后清理 pending 请求。
+    pub request_timeout_secs: u64,
 }
 
 impl ConnectionShared {
@@ -71,6 +141,64 @@ impl ConnectionShared {
     /// 读取当前状态。
     pub async fn state(&self) -> OneBotConnectionState {
         *self.state.lock().await
+    }
+
+    /// 注册一个待处理请求。
+    ///
+    /// 生成唯一 request_id，写入注册表，返回 request_id 和对应的响应接收端。
+    pub fn insert_pending(&self, action: String) -> (u64, oneshot::Receiver<ActionResponse>) {
+        let id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
+        let (response_tx, response_rx) = oneshot::channel();
+        let request = PendingRequest {
+            id,
+            action: action.clone(),
+            response_tx,
+        };
+        self.pending.lock().unwrap().insert(id, request);
+        tracing::debug!(target: "adapter", id, action, "pending request registered");
+        (id, response_rx)
+    }
+
+    /// 根据 request_id 完成一个 pending 请求。
+    ///
+    /// 如果请求已超时被清理，返回 false。
+    pub fn complete_request(&self, id: u64, response: ActionResponse) -> bool {
+        if let Some(req) = self.pending.lock().unwrap().remove(&id) {
+            // 通知已等待的调用方。
+            // 如果接收端已被 drop（调用方超时），send 会失败但这是正常现象。
+            let _ = req.response_tx.send(response);
+            tracing::debug!(target: "adapter", id, "pending request completed");
+            true
+        } else {
+            tracing::warn!(target: "adapter", id, "response received for unknown or timed-out request");
+            false
+        }
+    }
+
+    /// 清理所有超时的 pending 请求。
+    ///
+    /// 返回被清理的数量。
+    pub fn cleanup_timed_out_requests(&self) -> usize {
+        // 当前实现中，超时由调用方的 oneshot 超时处理。
+        // 此方法用于在连接断开时清空所有 pending 请求。
+        let mut pending = self.pending.lock().unwrap();
+        let count = pending.len();
+        // Draining the HashMap to take ownership of the values.
+        let requests: Vec<_> = pending.drain().map(|(_, v)| v).collect();
+        drop(pending);
+        for req in requests {
+            // Send error response through the oneshot channel.
+            // If the receiver has been dropped (caller timed out), this will fail silently.
+            let _ = req.response_tx.send(ActionResponse {
+                id: req.id,
+                action: req.action,
+                status: "failed".to_string(),
+                retcode: None,
+                data: None,
+                error: Some("连接已断开".to_string()),
+            });
+        }
+        count
     }
 }
 
@@ -195,13 +323,19 @@ pub async fn run_connection_loop(
         // 在连接存续期间处理读写。返回时表示连接已断开。
         handle_connected_io(
             transport,
-            shared.clone(),
+            Arc::new(shared.clone()),
             &mut outbound_rx,
             &event_tx,
             config.heartbeat_interval_secs,
             &mut shutdown,
         )
         .await;
+
+        // 连接断开时，清理所有 pending 请求。
+        let cleared = shared.cleanup_timed_out_requests();
+        if cleared > 0 {
+            tracing::warn!(target: "adapter", count = cleared, "连接断开，清理 pending 请求");
+        }
 
         shared.set_state(OneBotConnectionState::Reconnecting).await;
         tracing::warn!(
@@ -214,12 +348,53 @@ pub async fn run_connection_loop(
     }
 }
 
+/// 根据 JSON 文本的 `echo` 字段对入站消息进行分类。
+///
+/// - 有 `echo` 字段 → Action 响应（`IncomingMessage::Response`）
+/// - 无 `echo` 字段 → OneBot 事件（`IncomingMessage::Event`）
+fn classify_incoming_message(text: &str) -> IncomingMessage {
+    // 尝试解析 JSON 并查找 `echo` 字段。
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+        if json.get("echo").is_some() {
+            // 有 echo 字段：解析为 Action 响应。
+            let id = json
+                .get("echo")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let action = json
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let status = json
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("failed")
+                .to_string();
+            let retcode = json.get("retcode").and_then(|v| v.as_i64()).map(|v| v as i32);
+            let data = json.get("data").cloned();
+            let error = json.get("error").and_then(|v| v.as_str()).map(|s| s.to_string());
+            return IncomingMessage::Response(ActionResponse {
+                id,
+                action,
+                status,
+                retcode,
+                data,
+                error,
+            });
+        }
+    }
+    // 无 echo 或解析失败：视为普通事件。
+    IncomingMessage::Event(text.to_string())
+}
+
 /// 处理已建立连接期间的读写循环，直到连接关闭或收到关停信号。
 ///
-/// 使用 `tokio::select!` 同时等待：出站发送、入站读取、心跳、关停信号。
+/// 使用 `tokio::select!` 同时等待：出站发送，入站读取，心跳，关停信号。
 async fn handle_connected_io(
     mut transport: Box<dyn WsTransport>,
-    _shared: ConnectionShared,
+    shared: Arc<ConnectionShared>,
     outbound_rx: &mut mpsc::Receiver<String>,
     event_tx: &mpsc::Sender<String>,
     heartbeat_interval_secs: u64,
@@ -256,13 +431,24 @@ async fn handle_connected_io(
                 }
             }
 
-            // 入站：读取 WebSocket 帧并转发给处理器。
+            // 入站：读取 WebSocket 帧并路由到对应处理器。
             read = transport.read_text() => {
                 match read {
                     Ok(Some(text)) => {
-                        if event_tx.send(text).await.is_err() {
-                            tracing::warn!(target: "adapter", "事件处理通道已关闭");
-                            break;
+                        match classify_incoming_message(&text) {
+                            IncomingMessage::Event(raw) => {
+                                if event_tx.send(raw).await.is_err() {
+                                    tracing::warn!(target: "adapter", "事件处理通道已关闭");
+                                    break;
+                                }
+                            }
+                            IncomingMessage::Response(resp) => {
+                                // 找到 pending 请求并完成它。
+                                shared.complete_request(resp.id, resp.clone());
+                                if shared.response_tx.send(resp).await.is_err() {
+                                    tracing::warn!(target: "adapter", "响应处理通道已关闭");
+                                }
+                            }
                         }
                     }
                     Ok(None) => {
@@ -491,6 +677,7 @@ mod tests {
             reconnect_interval_secs: 1,
             max_reconnect_interval_secs: 4,
             heartbeat_interval_secs: 30,
+            action_timeout_secs: 10,
         }
     }
 
@@ -551,11 +738,16 @@ mod tests {
         let (outbound_tx_unused, outbound_rx) = mpsc::channel(1);
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (response_tx, _response_rx) = mpsc::channel(8);
 
         let shared = ConnectionShared {
             state: Arc::new(Mutex::new(OneBotConnectionState::Disconnected)),
             bus: bus.clone(),
             outbound_tx: outbound_tx_unused,
+            response_tx,
+            pending: Arc::new(StdMutex::new(HashMap::new())),
+            request_id_counter: Arc::new(AtomicU64::new(0)),
+            request_timeout_secs: 30,
         };
 
         tokio::spawn(run_connection_loop(
@@ -610,11 +802,16 @@ mod tests {
         let (outbound_tx, outbound_rx) = mpsc::channel(1);
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (response_tx, _response_rx) = mpsc::channel(8);
 
         let shared = ConnectionShared {
             state: Arc::new(Mutex::new(OneBotConnectionState::Disconnected)),
             bus: bus.clone(),
             outbound_tx,
+            response_tx,
+            pending: Arc::new(StdMutex::new(HashMap::new())),
+            request_id_counter: Arc::new(AtomicU64::new(0)),
+            request_timeout_secs: 30,
         };
 
         tokio::spawn(run_connection_loop(

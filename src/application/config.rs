@@ -320,7 +320,7 @@ mod tests {
         let path = dir.path().join("onebot.toml");
         fs::write(
             &path,
-            "websocket_url = \"ws://127.0.0.1:3001\"\naccess_token = \"token123\"\nreconnect_interval_secs = 2\nmax_reconnect_interval_secs = 30\nheartbeat_interval_secs = 20\n",
+            "websocket_url = \"ws://127.0.0.1:3001\"\naccess_token = \"token123\"\nreconnect_interval_secs = 2\nmax_reconnect_interval_secs = 30\nheartbeat_interval_secs = 20\naction_timeout_secs = 10\n",
         )
         .unwrap();
         let cfg = load_onebot(path.to_str().unwrap()).unwrap();
@@ -329,6 +329,7 @@ mod tests {
         assert_eq!(cfg.reconnect_interval_secs, 2);
         assert_eq!(cfg.max_reconnect_interval_secs, 30);
         assert_eq!(cfg.heartbeat_interval_secs, 20);
+        assert_eq!(cfg.action_timeout_secs, 10);
     }
 
     #[test]

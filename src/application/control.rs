@@ -4,10 +4,16 @@
 //!
 //! 支持的命令（JSON over UDS）：
 //! ```json
-//! {"cmd": "reload-config"}
-//! {"cmd": "status"}
-//! {"cmd": "shutdown"}
-//! {"cmd": "help"}
+//! {"id": 123, "cmd": "reload-config"}
+//! {"id": 456, "cmd": "status"}
+//! {"id": 789, "cmd": "shutdown"}
+//! {"id": 111, "cmd": "help"}
+//! ```
+//!
+//! 响应格式：
+//! ```json
+//! {"id": 123, "ok": true, "data": {...}}
+//! {"id": 456, "ok": false, "error": {"code": "...", "message": "..."}}
 //! ```
 //!
 //! 扩展方式：实现 `CommandHandler` 并调用 `CommandRegistry::register`。
@@ -37,12 +43,9 @@ pub struct CommandDesc {
     pub description: &'static str,
 }
 
-/// 命令处理函数签名（异步）。
-type CommandHandler = fn(
-    &RuntimeHandle,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<ControlResponse, RuntimeError>> + Send>,
->;
+/// 命令处理函数签名（异步）。接受 RuntimeHandle 和请求 ID。
+type CommandHandler =
+    fn(&RuntimeHandle, id: u64) -> CommandFuture;
 
 /// 命令处理结果 Future 的类型别名。
 type CommandFuture = std::pin::Pin<
@@ -70,8 +73,8 @@ impl CommandRegistry {
     }
 
     /// 分派命令。返回 None 表示命令不存在。
-    pub fn dispatch(&self, cmd: &str, handle: &RuntimeHandle) -> Option<CommandFuture> {
-        self.handlers.get(cmd).map(|(handler, _)| handler(handle))
+    pub fn dispatch(&self, cmd: &str, handle: &RuntimeHandle, id: u64) -> Option<CommandFuture> {
+        self.handlers.get(cmd).map(|(handler, _)| handler(handle, id))
     }
 
     /// 返回所有已注册命令的描述。
@@ -101,29 +104,30 @@ impl CommandRegistry {
 // 命令处理函数
 // ---------------------------------------------------------------------------
 
-fn handle_status(handle: &RuntimeHandle) -> CommandFuture {
+fn handle_status(handle: &RuntimeHandle, id: u64) -> CommandFuture {
     let handle = handle.clone();
-    Box::pin(async move { Ok(ControlResponse::ok(handle.status().await)) })
+    Box::pin(async move { Ok(ControlResponse::ok(id, handle.status().await)) })
 }
 
-fn handle_reload_config(handle: &RuntimeHandle) -> CommandFuture {
+fn handle_reload_config(handle: &RuntimeHandle, id: u64) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
         use crate::application::config::load_runtime;
 
         let runtime_path = handle.config_dir.join("runtime.toml");
-        let cfg = load_runtime(&runtime_path.display().to_string())?;
+        let cfg = load_runtime(&runtime_path.display().to_string())
+            .map_err(|e| RuntimeError::Config(e.to_string()))?;
 
         // 校验。
         let errors = validate_runtime(&cfg);
         if !errors.is_empty() {
             let msg = errors.join("; ");
             tracing::error!(target: "control", "{}", msg);
-            return Ok(ControlResponse::err(msg));
+            return Ok(ControlResponse::err(id, ControlErrorDetail::new("VALIDATION_ERROR", msg)));
         }
 
         tracing::info!(target: "control", "配置文件重载成功");
-        Ok(ControlResponse::ok(serde_json::json!({
+        Ok(ControlResponse::ok(id, serde_json::json!({
             "log_level": cfg.log_level,
             "data_dir": cfg.data_dir,
             "admin_users": cfg.admin_users,
@@ -131,21 +135,19 @@ fn handle_reload_config(handle: &RuntimeHandle) -> CommandFuture {
     })
 }
 
-fn handle_shutdown(handle: &RuntimeHandle) -> CommandFuture {
+fn handle_shutdown(handle: &RuntimeHandle, id: u64) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
         handle.shutdown();
-        Ok(ControlResponse::ok(
-            serde_json::json!({"message": "关停信号已发送"}),
-        ))
+        Ok(ControlResponse::ok(id, serde_json::json!({"message": "关停信号已发送"})))
     })
 }
 
-fn handle_help(handle: &RuntimeHandle) -> CommandFuture {
+fn handle_help(handle: &RuntimeHandle, id: u64) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
         let commands = handle.commands.descriptions();
-        Ok(ControlResponse::ok(serde_json::json!({
+        Ok(ControlResponse::ok(id, serde_json::json!({
             "commands": commands,
         })))
     })
@@ -155,29 +157,69 @@ fn handle_help(handle: &RuntimeHandle) -> CommandFuture {
 // 响应类型
 // ---------------------------------------------------------------------------
 
+/// 控制协议错误码。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ControlErrorDetail {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl ControlErrorDetail {
+    pub fn new(code: &'static str, message: impl std::fmt::Display) -> Self {
+        Self {
+            code,
+            message: message.to_string(),
+        }
+    }
+
+    /// 未知命令。
+    pub fn unknown_command(cmd: &str) -> Self {
+        Self::new("UNKNOWN_COMMAND", format!("未知命令: {cmd}，使用 help 查看可用命令"))
+    }
+
+    /// 缺少 cmd 字段。
+    pub fn missing_cmd() -> Self {
+        Self::new("MISSING_CMD", "请求缺少 cmd 字段")
+    }
+
+    /// 无效的 JSON。
+    pub fn invalid_json(e: &str) -> Self {
+        Self::new("INVALID_JSON", format!("无效的 JSON: {e}"))
+    }
+
+    /// 内部错误。
+    pub fn internal(msg: &str) -> Self {
+        Self::new("INTERNAL_ERROR", msg)
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct ControlResponse {
+    /// 请求 ID，用于关联请求与响应。
+    pub id: u64,
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<ControlErrorDetail>,
 }
 
 impl ControlResponse {
-    fn ok(data: impl serde::Serialize) -> Self {
+    fn ok(id: u64, data: impl serde::Serialize) -> Self {
         Self {
+            id,
             ok: true,
             data: Some(serde_json::to_value(data).unwrap_or_default()),
             error: None,
         }
     }
 
-    fn err(msg: impl std::fmt::Display) -> Self {
+    fn err(id: u64, detail: ControlErrorDetail) -> Self {
         Self {
+            id,
             ok: false,
             data: None,
-            error: Some(msg.to_string()),
+            error: Some(detail),
         }
     }
 }
@@ -320,28 +362,37 @@ async fn handle_connection(
 
     buf.truncate(n);
 
-    // 解析命令名称。
-    let cmd: String = match serde_json::from_slice::<serde_json::Value>(&buf) {
-        Ok(val) => match val.get("cmd").and_then(|v| v.as_str().map(String::from)) {
-            Some(cmd) => cmd,
-            None => {
-                let resp = ControlResponse::err("缺少 cmd 字段");
-                write_response(stream, resp).await?;
-                return Ok(());
-            }
-        },
+    // 解析请求。
+    let val: serde_json::Value = match serde_json::from_slice(&buf) {
+        Ok(v) => v,
         Err(e) => {
-            let resp = ControlResponse::err(format!("无效的 JSON: {e}"));
+            let resp = ControlResponse::err(0, ControlErrorDetail::invalid_json(&e.to_string()));
+            write_response(stream, resp).await?;
+            return Ok(());
+        }
+    };
+
+    // 提取请求 ID（可选，默认为 0）。
+    let id = val
+        .get("id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    // 解析命令名称。
+    let cmd = match val.get("cmd").and_then(|v| v.as_str().map(String::from)) {
+        Some(cmd) => cmd,
+        None => {
+            let resp = ControlResponse::err(id, ControlErrorDetail::missing_cmd());
             write_response(stream, resp).await?;
             return Ok(());
         }
     };
 
     // 分派命令。
-    let resp = match handle.commands.dispatch(&cmd, handle) {
+    let resp = match handle.commands.dispatch(&cmd, handle, id) {
         Some(future) => future.await,
         None => {
-            let resp = ControlResponse::err(format!("未知命令: {cmd}，使用 help 查看可用命令"));
+            let resp = ControlResponse::err(id, ControlErrorDetail::unknown_command(&cmd));
             write_response(stream, resp).await?;
             return Ok(());
         }

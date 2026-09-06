@@ -196,6 +196,7 @@ mod tests {
                 reconnect_interval_secs: 1,
                 max_reconnect_interval_secs: 4,
                 heartbeat_interval_secs: 30,
+                action_timeout_secs: 10,
             },
             bus.clone(),
             conversation_manager,

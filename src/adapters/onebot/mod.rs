@@ -8,8 +8,12 @@
 //! - [`conversion`] —— OneBot JSON ↔ 平台无关消息的纯函数转换
 //! - [`connection`] —— WebSocket 传输、断线重连与指数退避
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::time::Duration;
+use tokio::time::timeout as tokio_timeout;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -27,6 +31,7 @@ use connection::{ConnectionShared, TungsteniteConnector, WsConnector};
 pub use conversion::{
     build_group_send_request, build_private_send_request, OneBotEvent, OutgoingRequest,
 };
+pub use connection::ActionResponse;
 
 /// OneBot 适配器配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +50,9 @@ pub struct OneBotConfig {
 
     /// 心跳间隔（秒）。
     pub heartbeat_interval_secs: u64,
+
+    /// Action 请求超时秒数。超时后 pending 请求被清理，调用方收到超时错误。
+    pub action_timeout_secs: u64,
 }
 
 impl Default for OneBotConfig {
@@ -55,6 +63,7 @@ impl Default for OneBotConfig {
             reconnect_interval_secs: 1,
             max_reconnect_interval_secs: 60,
             heartbeat_interval_secs: 30,
+            action_timeout_secs: 10,
         }
     }
 }
@@ -83,11 +92,23 @@ pub trait OneBotAdapter: Send + Sync {
     /// 获取当前连接状态。
     async fn state(&self) -> OneBotConnectionState;
 
-    /// 发送一条群消息。
-    async fn send_group_message(&self, group_id: &str, content: &str) -> Result<(), RuntimeError>;
+    /// 发送一条群消息，等待 NapCat Action Response。
+    ///
+    /// 返回值语义：
+    /// - `Ok(response)` = NapCat 返回了响应（需检查 `response.is_ok()` 确认 retcode == 0）
+    /// - `Err(...)` = 连接层错误（未连接 / 超时 / 连接断开）
+    async fn send_group_message(
+        &self,
+        group_id: &str,
+        content: &str,
+    ) -> Result<ActionResponse, RuntimeError>;
 
-    /// 发送一条私聊消息。
-    async fn send_private_message(&self, user_id: &str, content: &str) -> Result<(), RuntimeError>;
+    /// 发送一条私聊消息，等待 NapCat Action Response。
+    async fn send_private_message(
+        &self,
+        user_id: &str,
+        content: &str,
+    ) -> Result<ActionResponse, RuntimeError>;
 }
 
 /// OneBot 适配器的具体实现。
@@ -138,12 +159,17 @@ impl OneBotAdapterImpl {
     ) -> Self {
         let (outbound_tx, outbound_rx) = mpsc::channel(128);
         let (event_tx, event_rx) = mpsc::channel(256);
+        let (response_tx, _) = mpsc::channel(64);
         let (shutdown_tx, _) = watch::channel(false);
 
         let shared = ConnectionShared {
             state: Arc::new(Mutex::new(OneBotConnectionState::Disconnected)),
             bus: bus.clone(),
             outbound_tx,
+            response_tx,
+            pending: Arc::new(StdMutex::new(HashMap::new())),
+            request_id_counter: Arc::new(AtomicU64::new(0)),
+            request_timeout_secs: config.action_timeout_secs.max(1),
         };
 
         Self {
@@ -221,41 +247,87 @@ impl OneBotAdapter for OneBotAdapterImpl {
         self.shared.state().await
     }
 
-    async fn send_group_message(&self, group_id: &str, content: &str) -> Result<(), RuntimeError> {
+    async fn send_group_message(
+        &self,
+        group_id: &str,
+        content: &str,
+    ) -> Result<ActionResponse, RuntimeError> {
         let request = build_group_send_request(group_id, content);
-        self.enqueue_outgoing(&request).await
+        self.send_action(request).await
     }
 
-    async fn send_private_message(&self, user_id: &str, content: &str) -> Result<(), RuntimeError> {
+    async fn send_private_message(
+        &self,
+        user_id: &str,
+        content: &str,
+    ) -> Result<ActionResponse, RuntimeError> {
         let request = build_private_send_request(user_id, content);
-        self.enqueue_outgoing(&request).await
+        self.send_action(request).await
     }
 }
 
 impl OneBotAdapterImpl {
-    /// 将一个 OneBot 出站请求序列化并通过出站通道发送给连接循环。
-    async fn enqueue_outgoing(&self, request: &OutgoingRequest) -> Result<(), RuntimeError> {
-        // 仅允许在已连接状态下发送。
+    /// 发送一个 Action 请求，等待 NapCat 响应。
+    ///
+    /// 流程：注册 pending 请求 → 发送 WebSocket 帧 → 等待响应或超时 → 清理 pending。
+    async fn send_action(
+        &self,
+        request: OutgoingRequest,
+    ) -> Result<ActionResponse, RuntimeError> {
+        // 仅在已连接状态下才能发送。
         if self.shared.state().await != OneBotConnectionState::Connected {
             return Err(RuntimeError::Adapter(
                 "OneBot 未连接，暂时无法发送消息".to_string(),
             ));
         }
 
+        // 注册 pending 请求，获取唯一 request_id。
+        let (id, response_rx) = self.shared.insert_pending(request.action.clone());
+
+        // 构建帧，使用 request_id 作为 echo。
         let frame = serde_json::json!({
             "action": request.action,
             "params": request.params,
-            "echo": "send",
+            "echo": id.to_string(),
         });
         let text = serde_json::to_string(&frame)
-            .map_err(|e| RuntimeError::Adapter(format!("序列化出站请求失败: {e}")))?;
+            .map_err(|_e| RuntimeError::Adapter("serialization failed".to_string()))?;
 
-        self.shared
+        // 发送到出站 channel。
+        let _ = self
+            .shared
             .outbound_tx
             .send(text)
             .await
-            .map_err(|e| RuntimeError::Adapter(format!("出站通道已关闭: {e}")))?;
-        Ok(())
+            .map_err(|_e| RuntimeError::Adapter(format!("outbound closed")));
+
+        // 等待 NapCat 响应或超时。
+        let timeout = Duration::from_secs(self.shared.request_timeout_secs);
+        match tokio_timeout(timeout, response_rx).await {
+            Ok(Ok(response)) => {
+                tracing::debug!(
+                    target: "adapter",
+                    id,
+                    status = %response.status,
+                    "action response received"
+                );
+                Ok(response)
+            }
+            Ok(Err(_)) => {
+                // oneshot 被 drop（请求被清理，如连接断开时 cleanup_timed_out_requests）
+                Err(RuntimeError::Adapter("请求被清理（连接已断开）".to_string()))
+            }
+            Err(_) => {
+                // 超时：从 pending 中移除（complete_request 已被超时前的 insert_pending 覆盖？不，
+                // 超时后响应仍可能到达，但调用方已不再等待，所以安全清理。
+                self.shared.pending.lock().unwrap().remove(&id);
+                tracing::warn!(target: "adapter", id, "action request timeout");
+                Err(RuntimeError::Adapter(format!(
+                    "等待 NapCat 响应超时（{} 秒）",
+                    timeout.as_secs()
+                )))
+            }
+        }
     }
 }
 
