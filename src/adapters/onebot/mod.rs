@@ -27,11 +27,11 @@ use crate::error::RuntimeError;
 pub mod connection;
 pub mod conversion;
 
+pub use connection::ActionResponse;
 use connection::{ConnectionShared, TungsteniteConnector, WsConnector};
 pub use conversion::{
     build_group_send_request, build_private_send_request, OneBotEvent, OutgoingRequest,
 };
-pub use connection::ActionResponse;
 
 /// OneBot 适配器配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,10 +270,7 @@ impl OneBotAdapterImpl {
     /// 发送一个 Action 请求，等待 NapCat 响应。
     ///
     /// 流程：注册 pending 请求 → 发送 WebSocket 帧 → 等待响应或超时 → 清理 pending。
-    async fn send_action(
-        &self,
-        request: OutgoingRequest,
-    ) -> Result<ActionResponse, RuntimeError> {
+    async fn send_action(&self, request: OutgoingRequest) -> Result<ActionResponse, RuntimeError> {
         // 仅在已连接状态下才能发送。
         if self.shared.state().await != OneBotConnectionState::Connected {
             return Err(RuntimeError::Adapter(
@@ -299,7 +296,7 @@ impl OneBotAdapterImpl {
             .outbound_tx
             .send(text)
             .await
-            .map_err(|_e| RuntimeError::Adapter(format!("outbound closed")));
+            .map_err(|_e| RuntimeError::Adapter("outbound closed".to_string()));
 
         // 等待 NapCat 响应或超时。
         let timeout = Duration::from_secs(self.shared.request_timeout_secs);
@@ -315,7 +312,9 @@ impl OneBotAdapterImpl {
             }
             Ok(Err(_)) => {
                 // oneshot 被 drop（请求被清理，如连接断开时 cleanup_timed_out_requests）
-                Err(RuntimeError::Adapter("请求被清理（连接已断开）".to_string()))
+                Err(RuntimeError::Adapter(
+                    "请求被清理（连接已断开）".to_string(),
+                ))
             }
             Err(_) => {
                 // 超时：从 pending 中移除（complete_request 已被超时前的 insert_pending 覆盖？不，

@@ -31,7 +31,6 @@ use yomua_bot::application::config::{
 use yomua_bot::application::context::ContextBuilder;
 use yomua_bot::application::control::{start_control_service, CommandRegistry, RuntimeHandle};
 use yomua_bot::application::conversation::ConversationManager;
-use yomua_bot::application::emotion_service::EmotionService;
 use yomua_bot::application::event_bus::EventBus;
 use yomua_bot::application::event_processor::EventProcessor;
 use yomua_bot::application::llm_scheduler::{
@@ -39,6 +38,7 @@ use yomua_bot::application::llm_scheduler::{
 };
 use yomua_bot::application::memory_service::MemoryService;
 use yomua_bot::application::message_persistence::MessagePersistence;
+use yomua_bot::application::mood_service::MoodService;
 use yomua_bot::application::plugin_api::PluginApi;
 use yomua_bot::application::proactive::ProactiveDriver;
 use yomua_bot::application::relationship_service::RelationshipService;
@@ -48,9 +48,10 @@ use yomua_bot::domain::behavior::BehaviorEngine;
 use yomua_bot::domain::character::ReplyMode;
 use yomua_bot::domain::conversation::ConversationType;
 use yomua_bot::domain::repository::{
-    CharacterBindingRepository, CharacterRepository, CharacterStateRepository,
-    ConversationRepository, EmotionStateRepository, MemoryRepository, MessageRepository,
-    ParticipantRepository, PluginDataRepository, RelationshipRepository,
+    BehaviorStateRepository, CharacterBindingRepository, CharacterRepository,
+    CharacterStateRepository, ConversationRepository, ConversationStateRepository,
+    MemoryRepository, MessageRepository, MoodRepository, ParticipantRepository,
+    PluginDataRepository, RelationshipRepository,
 };
 use yomua_bot::error::RuntimeError;
 use yomua_bot::infrastructure::llm::openai_compatible::{
@@ -61,9 +62,10 @@ use yomua_bot::infrastructure::plugin::event_bridge::EventBridge;
 use yomua_bot::infrastructure::plugin::registry::PluginRegistry;
 use yomua_bot::infrastructure::plugin::supervisor::{PluginSupervisor, SupervisorConfig};
 use yomua_bot::infrastructure::storage::repository::{
-    SqliteCharacterBindingRepository, SqliteCharacterRepository, SqliteCharacterStateRepository,
-    SqliteConversationRepository, SqliteEmotionStateRepository, SqliteMemoryRepository,
-    SqliteMessageRepository, SqliteParticipantRepository, SqlitePluginDataRepository,
+    SqliteBehaviorStateRepository, SqliteCharacterBindingRepository, SqliteCharacterRepository,
+    SqliteCharacterStateRepository, SqliteConversationRepository,
+    SqliteConversationStateRepository, SqliteMemoryRepository, SqliteMessageRepository,
+    SqliteMoodRepository, SqliteParticipantRepository, SqlitePluginDataRepository,
     SqliteRelationshipRepository,
 };
 use yomua_bot::infrastructure::storage::SqliteStorage;
@@ -166,10 +168,12 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     let llm_cfg = load_llm(&llm_path.display().to_string())?;
 
     // 1.2 配置校验：所有错误同时报告，不静默忽略。
+    // 注意：此时 tracing 尚未初始化，必须直接输出到 stderr，
+    // 否则用户只会看到“配置校验失败 N 个错误”而不知道改哪个配置项。
     let validation_errors = validate_runtime(&runtime_cfg);
     if !validation_errors.is_empty() {
         for err in &validation_errors {
-            tracing::error!(target: "runtime", "{}", err);
+            eprintln!("配置错误：{err}");
         }
         return Err(RuntimeError::Config(format!(
             "配置校验失败：{} 个错误（见上文）",
@@ -251,7 +255,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         app.behavior_engine.clone(),
         app.cognition.clone(),
         app.relationship_service.clone(),
-        app.emotion_service.clone(),
+        app.mood_service.clone(),
         app.memory_service.clone(),
         action_dispatcher.clone(),
         bus.clone(),
@@ -309,6 +313,8 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
 
     // 10. 创建关停通道和控制句柄。
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    // RuntimeHandle 暴露 State System 仓储：控制命令（state-set / state-get）
+    // 必须经由这些仓储读写，不得直接操作 SQL。
     let handle = RuntimeHandle {
         config_dir: config_dir.to_path_buf(),
         runtime_cfg: runtime_cfg.clone(),
@@ -318,6 +324,11 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         storage: storage.clone(),
         shutdown_tx,
         commands: CommandRegistry::builtin(),
+        character_repo: repos.character_repo.clone() as Arc<dyn CharacterRepository>,
+        state_repo: repos.state_repo.clone(),
+        conversation_state_repo: repos.conversation_state_repo.clone(),
+        mood_repo: repos.mood_repo.clone(),
+        conversation_repo: repos.conversation_repo.clone(),
     };
 
     // 启动控制服务（后台任务，监听 data/control.sock）。
@@ -712,7 +723,9 @@ struct Repos {
     message_repo: Arc<dyn MessageRepository>,
     memory_repo: Arc<dyn MemoryRepository>,
     relationship_repo: Arc<dyn RelationshipRepository>,
-    emotion_repo: Arc<dyn EmotionStateRepository>,
+    mood_repo: Arc<dyn MoodRepository>,
+    conversation_state_repo: Arc<dyn ConversationStateRepository>,
+    behavior_state_repo: Arc<dyn BehaviorStateRepository>,
     plugin_data_repo: Arc<dyn PluginDataRepository>,
 }
 
@@ -733,8 +746,11 @@ fn build_repos(pool: SqlitePool) -> Repos {
         Arc::new(SqliteMemoryRepository::new(pool.clone()));
     let relationship_repo: Arc<dyn RelationshipRepository> =
         Arc::new(SqliteRelationshipRepository::new(pool.clone()));
-    let emotion_repo: Arc<dyn EmotionStateRepository> =
-        Arc::new(SqliteEmotionStateRepository::new(pool.clone()));
+    let mood_repo: Arc<dyn MoodRepository> = Arc::new(SqliteMoodRepository::new(pool.clone()));
+    let conversation_state_repo: Arc<dyn ConversationStateRepository> =
+        Arc::new(SqliteConversationStateRepository::new(pool.clone()));
+    let behavior_state_repo: Arc<dyn BehaviorStateRepository> =
+        Arc::new(SqliteBehaviorStateRepository::new(pool.clone()));
     let plugin_data_repo: Arc<dyn PluginDataRepository> =
         Arc::new(SqlitePluginDataRepository::new(pool.clone()));
 
@@ -748,7 +764,9 @@ fn build_repos(pool: SqlitePool) -> Repos {
         message_repo,
         memory_repo,
         relationship_repo,
-        emotion_repo,
+        mood_repo,
+        conversation_state_repo,
+        behavior_state_repo,
         plugin_data_repo,
     }
 }
@@ -783,7 +801,7 @@ struct AppLayer {
     behavior_engine: Arc<RuleBehaviorEngine>,
     cognition: Arc<CognitionLayer>,
     relationship_service: Arc<RelationshipService>,
-    emotion_service: Arc<EmotionService>,
+    mood_service: Arc<MoodService>,
     memory_service: Arc<MemoryService>,
     llm_scheduler: Option<Arc<DefaultLlmScheduler>>,
 }
@@ -813,12 +831,12 @@ fn build_app_layer(
         repos.conversation_repo.clone(),
         repos.memory_repo.clone(),
         repos.relationship_repo.clone(),
-        repos.emotion_repo.clone(),
+        repos.mood_repo.clone(),
         repos.binding_repo.clone(),
     ));
     let memory_service = Arc::new(MemoryService::new(repos.memory_repo.clone()));
 
-    let emotion_service = Arc::new(EmotionService::new(repos.emotion_repo.clone(), bus.clone()));
+    let mood_service = Arc::new(MoodService::new(repos.mood_repo.clone()));
     let relationship_service = Arc::new(RelationshipService::new(
         repos.relationship_repo.clone(),
         bus.clone(),
@@ -826,9 +844,11 @@ fn build_app_layer(
 
     let behavior_engine = Arc::new(RuleBehaviorEngine::new(
         repos.binding_repo.clone(),
-        repos.emotion_repo.clone(),
+        repos.mood_repo.clone(),
         repos.relationship_repo.clone(),
         repos.state_repo.clone(),
+        repos.conversation_state_repo.clone(),
+        repos.behavior_state_repo.clone(),
         yomua_bot::application::clock::system_clock(),
     ));
 
@@ -854,7 +874,7 @@ fn build_app_layer(
         behavior_engine,
         cognition,
         relationship_service,
-        emotion_service,
+        mood_service,
         memory_service,
         llm_scheduler,
     })
@@ -902,6 +922,7 @@ fn spawn_background_tasks(
     let proactive_driver = ProactiveDriver::new(
         repos.binding_repo.clone(),
         repos.state_repo.clone(),
+        repos.behavior_state_repo.clone(),
         app.behavior_engine.clone() as Arc<dyn BehaviorEngine>,
         bus.clone(),
         yomua_bot::application::clock::system_clock(),

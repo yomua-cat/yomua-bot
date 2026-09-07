@@ -176,8 +176,8 @@ impl CharacterRuntime {
 
     /// 从行为层的状态补丁（`Action::UpdateState`）更新现有状态。
     ///
-    /// 补丁以 JSON 对象给出（例如 `{ "energy": 30, "social_mood": "开心" }`），
-    /// 只合并其中出现的字段；数值字段（energy / attention / stress）被 clamp 到 [0, 100]。
+    /// 补丁以 JSON 对象给出（例如 `{ "energy": 30, "stress": 20 }`），
+    /// 只合并其中出现的字段；数值字段（energy / stress）被 clamp 到 [0, 100]。
     /// 错误时返回 `RuntimeError::Domain(InvalidState)` 或 `RuntimeError::Internal`。
     pub async fn apply_state_patch(
         &self,
@@ -462,17 +462,14 @@ mod tests {
 
         let mut sub = bus.subscribe();
 
-        // 补丁只改 energy（超出上限会被 clamp）
+        // 补丁只改 energy 与 stress（energy 超出上限会被 clamp）
         let new_state = runtime
-            .apply_state_patch(
-                1,
-                &serde_json::json!({ "energy": 150.0, "social_mood": "开心" }),
-            )
+            .apply_state_patch(1, &serde_json::json!({ "energy": 150.0, "stress": 30.0 }))
             .await
             .expect("patch 应成功");
 
         assert_eq!(new_state.energy, 100.0);
-        assert_eq!(new_state.social_mood.as_deref(), Some("开心"));
+        assert_eq!(new_state.stress, 30.0);
 
         // 持久化后的值与 clamp 后一致
         let loaded = state_repo.find_by_character_id(1).await.unwrap().unwrap();

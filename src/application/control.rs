@@ -8,7 +8,17 @@
 //! {"id": 456, "cmd": "status"}
 //! {"id": 789, "cmd": "shutdown"}
 //! {"id": 111, "cmd": "help"}
+//! {"id": 112, "cmd": "state-set", "params": {"character_id": 1, "conversation_id": 10, "mood": 80, "energy": 90, "stress": 20}}
+//! {"id": 113, "cmd": "state-get", "params": {"character_id": 1, "conversation_id": 10}}
 //! ```
+//!
+//! `state-set` / `state-get` 通过领域仓储（State System）读写角色状态：
+//! - 不带 `conversation_id`：读写全局 Character State（energy / stress / activity）；
+//! - 带 `conversation_id`：读写 Character × Conversation 状态（energy / stress → ConversationState，mood → Mood）。
+//!
+//! `mood` 属于 Character × Conversation 范围，必须提供 `conversation_id`；
+//! `activity` 仅存在于全局 Character State；会话与角色都必须已存在
+//! （否则返回 `CONVERSATION_NOT_FOUND` / `CHARACTER_NOT_FOUND`，防止孤儿状态行）。
 //!
 //! 响应格式：
 //! ```json
@@ -28,6 +38,13 @@ use tokio::sync::watch;
 
 use crate::adapters::onebot::{OneBotAdapter, OneBotAdapterImpl};
 use crate::application::config::{validate_runtime, RuntimeConfig};
+use crate::domain::character::ConversationState;
+use crate::domain::emotion::Mood;
+
+use crate::domain::repository::{
+    CharacterRepository, CharacterStateRepository, ConversationRepository,
+    ConversationStateRepository, MoodRepository,
+};
 use crate::error::RuntimeError;
 use crate::infrastructure::plugin::supervisor::PluginSupervisor;
 use crate::infrastructure::storage::SqliteStorage;
@@ -43,9 +60,8 @@ pub struct CommandDesc {
     pub description: &'static str,
 }
 
-/// 命令处理函数签名（异步）。接受 RuntimeHandle 和请求 ID。
-type CommandHandler =
-    fn(&RuntimeHandle, id: u64) -> CommandFuture;
+/// 命令处理函数签名（异步）。接受 RuntimeHandle、请求 ID 与请求参数。
+type CommandHandler = fn(&RuntimeHandle, id: u64, params: serde_json::Value) -> CommandFuture;
 
 /// 命令处理结果 Future 的类型别名。
 type CommandFuture = std::pin::Pin<
@@ -73,8 +89,16 @@ impl CommandRegistry {
     }
 
     /// 分派命令。返回 None 表示命令不存在。
-    pub fn dispatch(&self, cmd: &str, handle: &RuntimeHandle, id: u64) -> Option<CommandFuture> {
-        self.handlers.get(cmd).map(|(handler, _)| handler(handle, id))
+    pub fn dispatch(
+        &self,
+        cmd: &str,
+        handle: &RuntimeHandle,
+        id: u64,
+        params: serde_json::Value,
+    ) -> Option<CommandFuture> {
+        self.handlers
+            .get(cmd)
+            .map(|(handler, _)| handler(handle, id, params))
     }
 
     /// 返回所有已注册命令的描述。
@@ -96,6 +120,16 @@ impl CommandRegistry {
         );
         registry.register("shutdown", "发送优雅关停信号", handle_shutdown);
         registry.register("help", "显示所有可用命令", handle_help);
+        registry.register(
+            "state-set",
+            "修改角色状态（全局 energy/stress/activity，或 Character×Conversation 的 energy/stress/mood）",
+            handle_state_set,
+        );
+        registry.register(
+            "state-get",
+            "查询角色状态（全局与 Character×Conversation 范围）",
+            handle_state_get,
+        );
         registry
     }
 }
@@ -104,12 +138,16 @@ impl CommandRegistry {
 // 命令处理函数
 // ---------------------------------------------------------------------------
 
-fn handle_status(handle: &RuntimeHandle, id: u64) -> CommandFuture {
+fn handle_status(handle: &RuntimeHandle, id: u64, _params: serde_json::Value) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move { Ok(ControlResponse::ok(id, handle.status().await)) })
 }
 
-fn handle_reload_config(handle: &RuntimeHandle, id: u64) -> CommandFuture {
+fn handle_reload_config(
+    handle: &RuntimeHandle,
+    id: u64,
+    _params: serde_json::Value,
+) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
         use crate::application::config::load_runtime;
@@ -123,33 +161,347 @@ fn handle_reload_config(handle: &RuntimeHandle, id: u64) -> CommandFuture {
         if !errors.is_empty() {
             let msg = errors.join("; ");
             tracing::error!(target: "control", "{}", msg);
-            return Ok(ControlResponse::err(id, ControlErrorDetail::new("VALIDATION_ERROR", msg)));
+            return Ok(ControlResponse::err(
+                id,
+                ControlErrorDetail::new("VALIDATION_ERROR", msg),
+            ));
         }
 
         tracing::info!(target: "control", "配置文件重载成功");
-        Ok(ControlResponse::ok(id, serde_json::json!({
-            "log_level": cfg.log_level,
-            "data_dir": cfg.data_dir,
-            "admin_users": cfg.admin_users,
-        })))
+        Ok(ControlResponse::ok(
+            id,
+            serde_json::json!({
+                "log_level": cfg.log_level,
+                "data_dir": cfg.data_dir,
+                "admin_users": cfg.admin_users,
+            }),
+        ))
     })
 }
 
-fn handle_shutdown(handle: &RuntimeHandle, id: u64) -> CommandFuture {
+fn handle_shutdown(handle: &RuntimeHandle, id: u64, _params: serde_json::Value) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
         handle.shutdown();
-        Ok(ControlResponse::ok(id, serde_json::json!({"message": "关停信号已发送"})))
+        Ok(ControlResponse::ok(
+            id,
+            serde_json::json!({"message": "关停信号已发送"}),
+        ))
     })
 }
 
-fn handle_help(handle: &RuntimeHandle, id: u64) -> CommandFuture {
+fn handle_help(handle: &RuntimeHandle, id: u64, _params: serde_json::Value) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
         let commands = handle.commands.descriptions();
-        Ok(ControlResponse::ok(id, serde_json::json!({
-            "commands": commands,
-        })))
+        Ok(ControlResponse::ok(
+            id,
+            serde_json::json!({
+                "commands": commands,
+            }),
+        ))
+    })
+}
+
+fn handle_state_set(handle: &RuntimeHandle, id: u64, params: serde_json::Value) -> CommandFuture {
+    let handle = handle.clone();
+    Box::pin(async move {
+        let obj = match params.as_object() {
+            Some(o) => o,
+            None => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "params 必须是 JSON 对象"),
+                ))
+            }
+        };
+
+        // character_id 必填。
+        let character_id = match obj.get("character_id").and_then(|v| v.as_i64()) {
+            Some(cid) if cid > 0 => cid,
+            _ => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "缺少或非法参数 character_id"),
+                ))
+            }
+        };
+
+        // 至少提供一个目标字段。
+        let has_field = ["mood", "energy", "stress", "activity"]
+            .iter()
+            .any(|k| obj.contains_key(*k));
+        if !has_field {
+            return Ok(ControlResponse::err(
+                id,
+                ControlErrorDetail::new(
+                    "INVALID_PARAMS",
+                    "至少提供一个字段：mood / energy / stress / activity",
+                ),
+            ));
+        }
+
+        // 角色必须存在（与 plugin_api.character.state.write 一致，防止孤儿状态行）。
+        let exists = handle
+            .character_repo
+            .find_by_id(character_id)
+            .await
+            .map_err(|e| RuntimeError::Internal(e.to_string()))?
+            .is_some();
+        if !exists {
+            return Ok(ControlResponse::err(
+                id,
+                ControlErrorDetail::new(
+                    "CHARACTER_NOT_FOUND",
+                    format!("角色不存在：{character_id}"),
+                ),
+            ));
+        }
+
+        // conversation_id 可选（缺省表示全局 Character State）。
+        let conversation_id = match obj.get("conversation_id").and_then(|v| v.as_i64()) {
+            None => None,
+            Some(0) => None,
+            Some(cid) if cid > 0 => Some(cid),
+            _ => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "非法参数 conversation_id"),
+                ))
+            }
+        };
+
+        // mood 属于 Character × Conversation 范围：必须提供 conversation_id。
+        if obj.contains_key("mood") && conversation_id.is_none() {
+            return Ok(ControlResponse::err(
+                id,
+                ControlErrorDetail::new(
+                    "MOOD_REQUIRES_CONVERSATION",
+                    "mood 属于 Character × Conversation 范围，必须提供 conversation_id",
+                ),
+            ));
+        }
+
+        // 会话级 activity 在当前状态模型中未定义（仅全局 Character State 有 current_activity）。
+        if obj.contains_key("activity") && conversation_id.is_some() {
+            return Ok(ControlResponse::err(
+                id,
+                ControlErrorDetail::new(
+                    "SCOPED_ACTIVITY_UNSUPPORTED",
+                    "activity 当前仅存在于全局 Character State；会话级 activity 模型未定义",
+                ),
+            ));
+        }
+
+        // 会话必须存在（与角色存在校验一致，防止孤儿状态行）。
+        if let Some(cid) = conversation_id {
+            let exists = handle
+                .conversation_repo
+                .find_by_id(cid)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?
+                .is_some();
+            if !exists {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("CONVERSATION_NOT_FOUND", format!("会话不存在：{cid}")),
+                ));
+            }
+        }
+
+        let mut result = serde_json::json!({ "character_id": character_id });
+
+        match conversation_id {
+            // 全局 Character State：energy / stress / activity。
+            None => {
+                let mut state = handle
+                    .state_repo
+                    .find_by_character_id(character_id)
+                    .await
+                    .map_err(|e| RuntimeError::Internal(e.to_string()))?
+                    .unwrap_or_default();
+
+                if let Some(v) = obj.get("energy") {
+                    state.energy = v
+                        .as_f64()
+                        .ok_or_else(|| RuntimeError::Internal("energy 必须是数字".to_string()))?;
+                }
+                if let Some(v) = obj.get("stress") {
+                    state.stress = v
+                        .as_f64()
+                        .ok_or_else(|| RuntimeError::Internal("stress 必须是数字".to_string()))?;
+                }
+                if let Some(v) = obj.get("activity") {
+                    state.current_activity = match v {
+                        serde_json::Value::Null => None,
+                        v => Some(
+                            v.as_str()
+                                .ok_or_else(|| {
+                                    RuntimeError::Internal("activity 必须是字符串".to_string())
+                                })?
+                                .to_string(),
+                        ),
+                    };
+                }
+
+                let state = state.clamped();
+                handle
+                    .state_repo
+                    .upsert(character_id, &state)
+                    .await
+                    .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+                result["character_state"] = serde_json::to_value(&state)
+                    .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            }
+
+            // Character × Conversation：energy / stress → ConversationState，mood → Mood。
+            Some(cid) => {
+                result["conversation_id"] = serde_json::json!(cid);
+
+                let patch_conv = obj.contains_key("energy") || obj.contains_key("stress");
+                if patch_conv {
+                    let mut state: ConversationState = handle
+                        .conversation_state_repo
+                        .find_by_character_and_conversation(character_id, cid)
+                        .await
+                        .map_err(|e| RuntimeError::Internal(e.to_string()))?
+                        .unwrap_or_default();
+
+                    if let Some(v) = obj.get("energy") {
+                        state.energy = v.as_f64().ok_or_else(|| {
+                            RuntimeError::Internal("energy 必须是数字".to_string())
+                        })?;
+                    }
+                    if let Some(v) = obj.get("stress") {
+                        state.stress = v.as_f64().ok_or_else(|| {
+                            RuntimeError::Internal("stress 必须是数字".to_string())
+                        })?;
+                    }
+
+                    let state = state.clamped();
+                    handle
+                        .conversation_state_repo
+                        .upsert(character_id, cid, &state)
+                        .await
+                        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+                    result["conversation_state"] = serde_json::to_value(&state)
+                        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+                }
+
+                if obj.contains_key("mood") {
+                    let mood_value = obj
+                        .get("mood")
+                        .and_then(|v| v.as_f64())
+                        .ok_or_else(|| RuntimeError::Internal("mood 必须是数字".to_string()))?;
+                    let mut mood: Mood = handle
+                        .mood_repo
+                        .find_by_character_and_conversation(character_id, cid)
+                        .await
+                        .map_err(|e| RuntimeError::Internal(e.to_string()))?
+                        .unwrap_or_default();
+                    mood.value = mood_value;
+                    let mood = mood.clamped();
+                    handle
+                        .mood_repo
+                        .upsert(character_id, cid, &mood)
+                        .await
+                        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+                    result["mood"] = serde_json::to_value(&mood)
+                        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+                }
+            }
+        }
+
+        Ok(ControlResponse::ok(id, result))
+    })
+}
+
+fn handle_state_get(handle: &RuntimeHandle, id: u64, params: serde_json::Value) -> CommandFuture {
+    let handle = handle.clone();
+    Box::pin(async move {
+        let obj = match params.as_object() {
+            Some(o) => o,
+            None => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "params 必须是 JSON 对象"),
+                ))
+            }
+        };
+
+        let character_id = match obj.get("character_id").and_then(|v| v.as_i64()) {
+            Some(cid) if cid > 0 => cid,
+            _ => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "缺少或非法参数 character_id"),
+                ))
+            }
+        };
+        let conversation_id = match obj.get("conversation_id").and_then(|v| v.as_i64()) {
+            None => None,
+            Some(0) => None,
+            Some(cid) if cid > 0 => Some(cid),
+            _ => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "非法参数 conversation_id"),
+                ))
+            }
+        };
+
+        let mut result = serde_json::json!({ "character_id": character_id });
+
+        // 全局 Character State（无记录返回 null，不做副作用写入）。
+        match handle
+            .state_repo
+            .find_by_character_id(character_id)
+            .await
+            .map_err(|e| RuntimeError::Internal(e.to_string()))?
+        {
+            Some(state) => {
+                result["character_state"] = serde_json::to_value(&state)
+                    .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            }
+            None => {
+                result["character_state"] = serde_json::Value::Null;
+            }
+        }
+
+        // Character × Conversation State。
+        if let Some(cid) = conversation_id {
+            result["conversation_id"] = serde_json::json!(cid);
+            match handle
+                .conversation_state_repo
+                .find_by_character_and_conversation(character_id, cid)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?
+            {
+                Some(state) => {
+                    result["conversation_state"] = serde_json::to_value(&state)
+                        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+                }
+                None => {
+                    result["conversation_state"] = serde_json::Value::Null;
+                }
+            }
+            match handle
+                .mood_repo
+                .find_by_character_and_conversation(character_id, cid)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?
+            {
+                Some(mood) => {
+                    result["mood"] = serde_json::to_value(&mood)
+                        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+                }
+                None => {
+                    result["mood"] = serde_json::Value::Null;
+                }
+            }
+        }
+
+        Ok(ControlResponse::ok(id, result))
     })
 }
 
@@ -174,7 +526,10 @@ impl ControlErrorDetail {
 
     /// 未知命令。
     pub fn unknown_command(cmd: &str) -> Self {
-        Self::new("UNKNOWN_COMMAND", format!("未知命令: {cmd}，使用 help 查看可用命令"))
+        Self::new(
+            "UNKNOWN_COMMAND",
+            format!("未知命令: {cmd}，使用 help 查看可用命令"),
+        )
     }
 
     /// 缺少 cmd 字段。
@@ -247,6 +602,16 @@ pub struct RuntimeHandle {
     pub shutdown_tx: watch::Sender<bool>,
     /// 命令注册表（可外部扩展）。
     pub commands: CommandRegistry,
+    /// 角色仓储（State System：校验角色存在）。
+    pub character_repo: Arc<dyn CharacterRepository>,
+    /// 全局角色状态仓储（State System：Character State）。
+    pub state_repo: Arc<dyn CharacterStateRepository>,
+    /// 会话级状态仓储（State System：Character × Conversation State）。
+    pub conversation_state_repo: Arc<dyn ConversationStateRepository>,
+    /// Mood 仓储（State System：Character × Conversation Mood）。
+    pub mood_repo: Arc<dyn MoodRepository>,
+    /// 会话仓储（State System：会话作用域校验，防止孤儿状态行）。
+    pub conversation_repo: Arc<dyn ConversationRepository>,
 }
 
 impl RuntimeHandle {
@@ -373,10 +738,7 @@ async fn handle_connection(
     };
 
     // 提取请求 ID（可选，默认为 0）。
-    let id = val
-        .get("id")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let id = val.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
 
     // 解析命令名称。
     let cmd = match val.get("cmd").and_then(|v| v.as_str().map(String::from)) {
@@ -388,8 +750,14 @@ async fn handle_connection(
         }
     };
 
+    // 提取参数（可选；无 params 视为 Null）。
+    let params = val
+        .get("params")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
     // 分派命令。
-    let resp = match handle.commands.dispatch(&cmd, handle, id) {
+    let resp = match handle.commands.dispatch(&cmd, handle, id, params) {
         Some(future) => future.await,
         None => {
             let resp = ControlResponse::err(id, ControlErrorDetail::unknown_command(&cmd));

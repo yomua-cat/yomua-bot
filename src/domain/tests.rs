@@ -9,9 +9,8 @@ mod character_tests {
     fn character_state_default() {
         let state = CharacterState::default();
         assert_eq!(state.energy, 72.0);
-        assert_eq!(state.attention, 50.0);
         assert_eq!(state.stress, 10.0);
-        assert_eq!(state.social_mood.as_deref(), Some("calm"));
+        assert_eq!(state.current_activity, None);
     }
 
     #[test]
@@ -97,25 +96,21 @@ mod character_tests {
     fn character_state_clamped_bounds_numeric_fields() {
         let state = CharacterState {
             energy: 150.0,
-            attention: -20.0,
             stress: 999.0,
             ..Default::default()
         };
         let clamped = state.clamped();
         assert_eq!(clamped.energy, 100.0);
-        assert_eq!(clamped.attention, 0.0);
         assert_eq!(clamped.stress, 100.0);
 
         // 已在 [0,100] 内的值保持不变
         let in_range = CharacterState {
             energy: 50.0,
-            attention: 60.0,
             stress: 30.0,
             ..Default::default()
         }
         .clamped();
         assert_eq!(in_range.energy, 50.0);
-        assert_eq!(in_range.attention, 60.0);
         assert_eq!(in_range.stress, 30.0);
     }
 }

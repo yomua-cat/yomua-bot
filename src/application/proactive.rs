@@ -2,7 +2,7 @@
 //!
 //! 每个 tick 枚举所有绑定上的角色，仅在满足以下全部条件时询问行为引擎
 //! `decide_proactive`：启用主动、与上次主动间隔超过冷却、不处于静默时段。
-//! MVP 阶段主动动作仅更新内部状态（写回 `last_proactive_at`），
+//! MVP 阶段主动动作仅更新内部状态（写回 `BehaviorState.last_proactive_at`），
 //! 不发送消息、不调用 LLM。
 
 use std::sync::Arc;
@@ -15,7 +15,9 @@ use crate::domain::behavior::{BehaviorAction, BehaviorEngine};
 use crate::domain::character::CharacterBinding;
 use crate::domain::event::{BehaviorDecidedEvent, CoreEvent};
 use crate::domain::mute::{is_within_window, parse_mute_schedule};
-use crate::domain::repository::{CharacterBindingRepository, CharacterStateRepository};
+use crate::domain::repository::{
+    BehaviorStateRepository, CharacterBindingRepository, CharacterStateRepository,
+};
 use crate::error::DomainError;
 
 /// 主动行为驱动的固定 TICK 间隔（60 秒）。
@@ -27,9 +29,11 @@ pub const PROACTIVE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 /// 主动行为驱动。
 ///
 /// 在后台以固定间隔运行；每次 `tick` 独立评估所有启用主动的绑定。
+/// 冷却状态以 `BehaviorState`（Character × Conversation 范围）记录。
 pub struct ProactiveDriver {
     binding_repo: Arc<dyn CharacterBindingRepository>,
     state_repo: Arc<dyn CharacterStateRepository>,
+    behavior_state_repo: Arc<dyn BehaviorStateRepository>,
     behavior_engine: Arc<dyn BehaviorEngine>,
     event_bus: EventBus,
     clock: Arc<dyn Clock>,
@@ -39,9 +43,11 @@ pub struct ProactiveDriver {
 
 impl ProactiveDriver {
     /// 创建一个主动行为驱动。tick 间隔与冷却使用固定常量。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         binding_repo: Arc<dyn CharacterBindingRepository>,
         state_repo: Arc<dyn CharacterStateRepository>,
+        behavior_state_repo: Arc<dyn BehaviorStateRepository>,
         behavior_engine: Arc<dyn BehaviorEngine>,
         event_bus: EventBus,
         clock: Arc<dyn Clock>,
@@ -49,6 +55,7 @@ impl ProactiveDriver {
         Self {
             binding_repo,
             state_repo,
+            behavior_state_repo,
             behavior_engine,
             event_bus,
             clock,
@@ -108,13 +115,13 @@ impl ProactiveDriver {
             return Ok(());
         }
 
-        // 冷却判断：距上次主动不足冷却时长则跳过。
-        let existing = self
-            .state_repo
-            .find_by_character_id(binding.character_id)
+        // 冷却判断：距上次主动不足冷却时长则跳过（按 Character × Conversation 范围）。
+        let behavior_state = self
+            .behavior_state_repo
+            .find_by_character_and_conversation(binding.character_id, binding.conversation_id)
             .await
-            .map_err(|e| DomainError::Internal(format!("读取角色状态失败: {e}")))?;
-        if let Some(state) = &existing {
+            .map_err(|e| DomainError::Internal(format!("读取行为状态失败: {e}")))?;
+        if let Some(state) = &behavior_state {
             if let Some(last) = state.last_proactive_at {
                 let cooldown = chrono::Duration::from_std(self.cooldown)
                     .map_err(|e| DomainError::Internal(format!("冷却时长无效: {e}")))?;
@@ -135,15 +142,31 @@ impl ProactiveDriver {
             return Ok(());
         }
 
-        // 写回维护后的状态：更新主动时间戳。
-        let mut new_state =
-            existing.unwrap_or_else(crate::domain::character::CharacterState::default);
-        new_state.last_proactive_at = Some(now);
+        // 写回维护后的行为状态：更新主动时间戳（Character × Conversation 范围）。
+        let mut new_behavior_state = behavior_state.unwrap_or_default();
+        new_behavior_state.last_proactive_at = Some(now);
+        new_behavior_state.last_updated = now;
+        self.behavior_state_repo
+            .upsert(
+                binding.character_id,
+                binding.conversation_id,
+                &new_behavior_state,
+            )
+            .await
+            .map_err(|e| DomainError::Internal(format!("主动状态落库失败: {e}")))?;
+
+        // 同时维护全局角色状态（刷新最后更新时间）。
+        let mut new_state = self
+            .state_repo
+            .find_by_character_id(binding.character_id)
+            .await
+            .map_err(|e| DomainError::Internal(format!("读取角色状态失败: {e}")))?
+            .unwrap_or_default();
         new_state.last_updated = now;
         self.state_repo
             .upsert(binding.character_id, &new_state)
             .await
-            .map_err(|e| DomainError::Internal(format!("主动状态落库失败: {e}")))?;
+            .map_err(|e| DomainError::Internal(format!("角色状态落库失败: {e}")))?;
 
         self.event_bus
             .publish(&CoreEvent::BehaviorDecided(BehaviorDecidedEvent {
@@ -169,12 +192,12 @@ impl ProactiveDriver {
 mod tests {
     use super::*;
     use crate::application::behavior_engine::RuleBehaviorEngine;
-    use crate::domain::character::{CharacterBinding, CharacterState, ReplyMode};
-    use crate::domain::emotion::EmotionState;
+    use crate::domain::character::{BehaviorState, CharacterBinding, ConversationState, ReplyMode};
+    use crate::domain::emotion::Mood;
     use crate::domain::relationship::Relationship;
     use crate::domain::repository::{
-        CharacterBindingRepository, CharacterStateRepository, EmotionStateRepository,
-        RelationshipRepository,
+        BehaviorStateRepository, CharacterBindingRepository, CharacterStateRepository,
+        ConversationStateRepository, MoodRepository, RelationshipRepository,
     };
     use crate::error::RepositoryError;
     use async_trait::async_trait;
@@ -275,20 +298,20 @@ mod tests {
     }
 
     struct MemStateRepo {
-        states: Mutex<HashMap<i64, CharacterState>>,
+        states: Mutex<HashMap<i64, crate::domain::character::CharacterState>>,
     }
     #[async_trait]
     impl CharacterStateRepository for MemStateRepo {
         async fn find_by_character_id(
             &self,
             character_id: i64,
-        ) -> Result<Option<CharacterState>, RepositoryError> {
+        ) -> Result<Option<crate::domain::character::CharacterState>, RepositoryError> {
             Ok(self.states.lock().unwrap().get(&character_id).cloned())
         }
         async fn upsert(
             &self,
             character_id: i64,
-            state: &CharacterState,
+            state: &crate::domain::character::CharacterState,
         ) -> Result<(), RepositoryError> {
             self.states
                 .lock()
@@ -298,23 +321,47 @@ mod tests {
         }
     }
 
-    struct MemEmotionRepo {
-        states: Mutex<HashMap<(i64, i64), EmotionState>>,
+    struct MemMoodRepo {
+        moods: Mutex<HashMap<(i64, i64), Mood>>,
     }
     #[async_trait]
-    impl EmotionStateRepository for MemEmotionRepo {
-        #[allow(deprecated)]
-        async fn find_by_character_id(
-            &self,
-            _character_id: i64,
-        ) -> Result<Option<EmotionState>, RepositoryError> {
-            Ok(self.states.lock().unwrap().values().next().cloned())
-        }
+    impl MoodRepository for MemMoodRepo {
         async fn find_by_character_and_conversation(
             &self,
             character_id: i64,
             conversation_id: i64,
-        ) -> Result<Option<EmotionState>, RepositoryError> {
+        ) -> Result<Option<Mood>, RepositoryError> {
+            Ok(self
+                .moods
+                .lock()
+                .unwrap()
+                .get(&(character_id, conversation_id))
+                .cloned())
+        }
+        async fn upsert(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+            state: &Mood,
+        ) -> Result<(), RepositoryError> {
+            self.moods
+                .lock()
+                .unwrap()
+                .insert((character_id, conversation_id), state.clone());
+            Ok(())
+        }
+    }
+
+    struct MemConversationStateRepo {
+        states: Mutex<HashMap<(i64, i64), ConversationState>>,
+    }
+    #[async_trait]
+    impl ConversationStateRepository for MemConversationStateRepo {
+        async fn find_by_character_and_conversation(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+        ) -> Result<Option<ConversationState>, RepositoryError> {
             Ok(self
                 .states
                 .lock()
@@ -322,23 +369,42 @@ mod tests {
                 .get(&(character_id, conversation_id))
                 .cloned())
         }
-        #[allow(deprecated)]
         async fn upsert(
             &self,
             character_id: i64,
-            state: &EmotionState,
+            conversation_id: i64,
+            state: &ConversationState,
         ) -> Result<(), RepositoryError> {
             self.states
                 .lock()
                 .unwrap()
-                .insert((character_id, 0), state.clone());
+                .insert((character_id, conversation_id), state.clone());
             Ok(())
         }
-        async fn upsert_scoped(
+    }
+
+    struct MemBehaviorStateRepo {
+        states: Mutex<HashMap<(i64, i64), BehaviorState>>,
+    }
+    #[async_trait]
+    impl BehaviorStateRepository for MemBehaviorStateRepo {
+        async fn find_by_character_and_conversation(
             &self,
             character_id: i64,
             conversation_id: i64,
-            state: &EmotionState,
+        ) -> Result<Option<BehaviorState>, RepositoryError> {
+            Ok(self
+                .states
+                .lock()
+                .unwrap()
+                .get(&(character_id, conversation_id))
+                .cloned())
+        }
+        async fn upsert(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+            state: &BehaviorState,
         ) -> Result<(), RepositoryError> {
             self.states
                 .lock()
@@ -436,6 +502,7 @@ mod tests {
     struct Harness {
         driver: ProactiveDriver,
         state_repo: Arc<MemStateRepo>,
+        behavior_state_repo: Arc<MemBehaviorStateRepo>,
         binding_repo: Arc<MemBindingRepo>,
         clock: FakeClock,
     }
@@ -449,7 +516,13 @@ mod tests {
         let state_repo = Arc::new(MemStateRepo {
             states: Mutex::new(HashMap::new()),
         });
-        let emotion_repo = Arc::new(MemEmotionRepo {
+        let mood_repo = Arc::new(MemMoodRepo {
+            moods: Mutex::new(HashMap::new()),
+        });
+        let conversation_state_repo = Arc::new(MemConversationStateRepo {
+            states: Mutex::new(HashMap::new()),
+        });
+        let behavior_state_repo = Arc::new(MemBehaviorStateRepo {
             states: Mutex::new(HashMap::new()),
         });
         let rel_repo = Arc::new(MemRelationshipRepo {
@@ -462,15 +535,18 @@ mod tests {
 
         let behavior_engine = Arc::new(RuleBehaviorEngine::new(
             binding_repo.clone(),
-            emotion_repo,
+            mood_repo,
             rel_repo,
             state_repo.clone(),
+            conversation_state_repo,
+            behavior_state_repo.clone(),
             Arc::new(clock.clone()),
         ));
 
         let driver = ProactiveDriver::new(
             binding_repo.clone(),
             state_repo.clone(),
+            behavior_state_repo.clone(),
             behavior_engine,
             EventBus::new(),
             Arc::new(clock.clone()),
@@ -478,6 +554,7 @@ mod tests {
         Harness {
             driver,
             state_repo,
+            behavior_state_repo,
             binding_repo,
             clock,
         }
@@ -499,31 +576,35 @@ mod tests {
             h.state_repo.states.lock().unwrap().is_empty(),
             "未启用主动不应落库任何状态"
         );
+        assert!(
+            h.behavior_state_repo.states.lock().unwrap().is_empty(),
+            "未启用主动不应落库任何行为状态"
+        );
     }
 
     #[tokio::test]
     async fn cooldown_blocks_trigger_within_window() {
         let h = harness(true, None, true);
-        // 首个 tick（10:00）触发并写入 last_proactive_at。
+        // 首个 tick（10:00）触发并写入 last_proactive_at（BehaviorState）。
         h.driver.tick().await;
         let after_first = h
-            .state_repo
+            .behavior_state_repo
             .states
             .lock()
             .unwrap()
-            .get(&2)
+            .get(&(2, 20))
             .cloned()
-            .expect("首轮应落库状态");
+            .expect("首轮应落库行为状态");
 
         // 5 分钟后仍在冷却内：last_proactive_at 不变。
         h.clock.advance_minutes(5);
         h.driver.tick().await;
         let after_second = h
-            .state_repo
+            .behavior_state_repo
             .states
             .lock()
             .unwrap()
-            .get(&2)
+            .get(&(2, 20))
             .cloned()
             .unwrap();
         assert_eq!(
@@ -538,11 +619,11 @@ mod tests {
         // 首轮触发写入初始时间。
         h.driver.tick().await;
         let first = h
-            .state_repo
+            .behavior_state_repo
             .states
             .lock()
             .unwrap()
-            .get(&2)
+            .get(&(2, 20))
             .cloned()
             .unwrap();
         let first_time = first.last_proactive_at.expect("首轮应写入主动时间");
@@ -551,11 +632,11 @@ mod tests {
         h.clock.advance_minutes(31);
         h.driver.tick().await;
         let second = h
-            .state_repo
+            .behavior_state_repo
             .states
             .lock()
             .unwrap()
-            .get(&2)
+            .get(&(2, 20))
             .cloned()
             .unwrap();
         let second_time = second.last_proactive_at.expect("过冷却后应再次写入");
@@ -573,6 +654,10 @@ mod tests {
         assert!(
             h.state_repo.states.lock().unwrap().is_empty(),
             "静默时段应跳过主动，不落库"
+        );
+        assert!(
+            h.behavior_state_repo.states.lock().unwrap().is_empty(),
+            "静默时段应跳过主动，不落库行为状态"
         );
     }
 }

@@ -18,9 +18,9 @@ use crate::application::behavior_engine::RuleBehaviorEngine;
 use crate::application::binding::BindingManager;
 use crate::application::cognition::CognitionLayer;
 use crate::application::context::ContextLimits;
-use crate::application::emotion_service::EmotionService;
 use crate::application::event_bus::EventBus;
 use crate::application::memory_service::MemoryService;
+use crate::application::mood_service::MoodService;
 use crate::application::relationship_service::RelationshipService;
 use crate::application::runtime::CharacterRuntime;
 use crate::domain::behavior::{Action, BehaviorAction};
@@ -81,7 +81,7 @@ pub struct ReplyProcessor {
     behavior_engine: Arc<dyn crate::domain::behavior::BehaviorEngine>,
     cognition: Arc<CognitionLayer>,
     relationship_service: Arc<RelationshipService>,
-    emotion_service: Arc<EmotionService>,
+    mood_service: Arc<MoodService>,
     memory_service: Arc<MemoryService>,
     action_dispatcher: Arc<ActionDispatcher>,
     event_bus: EventBus,
@@ -99,7 +99,7 @@ impl ReplyProcessor {
         behavior_engine: Arc<RuleBehaviorEngine>,
         cognition: Arc<CognitionLayer>,
         relationship_service: Arc<RelationshipService>,
-        emotion_service: Arc<EmotionService>,
+        mood_service: Arc<MoodService>,
         memory_service: Arc<MemoryService>,
         action_dispatcher: Arc<ActionDispatcher>,
         event_bus: EventBus,
@@ -112,7 +112,7 @@ impl ReplyProcessor {
             behavior_engine,
             cognition,
             relationship_service,
-            emotion_service,
+            mood_service,
             memory_service,
             action_dispatcher,
             event_bus,
@@ -201,7 +201,7 @@ impl ReplyProcessor {
                 tracing::warn!(target: "runtime", binding_id = binding.id, "关系更新失败: {e}");
             }
             if let Err(e) = self
-                .emotion_service
+                .mood_service
                 .apply_message_event(character_id, event.conversation_id, &event.content)
                 .await
             {
@@ -381,13 +381,13 @@ mod tests {
         Character, CharacterBinding, CharacterDefinition, CharacterState,
     };
     use crate::domain::conversation::{Conversation, ConversationType};
-    use crate::domain::emotion::EmotionState;
+    use crate::domain::emotion::Mood;
     use crate::domain::memory::Memory;
     use crate::domain::message::Message;
     use crate::domain::relationship::Relationship;
     use crate::domain::repository::{
         CharacterBindingRepository, CharacterRepository, CharacterStateRepository,
-        ConversationRepository, EmotionStateRepository, MemoryRepository, MessageRepository,
+        ConversationRepository, MemoryRepository, MessageRepository, MoodRepository,
         ParticipantRepository, RelationshipRepository,
     };
     use crate::error::RepositoryError;
@@ -423,6 +423,68 @@ mod tests {
             Ok(())
         }
         async fn delete(&self, _id: i64) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    struct MemConversationStateRepo {
+        states: Mutex<HashMap<(i64, i64), crate::domain::character::ConversationState>>,
+    }
+    #[async_trait]
+    impl crate::domain::repository::ConversationStateRepository for MemConversationStateRepo {
+        async fn find_by_character_and_conversation(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+        ) -> Result<Option<crate::domain::character::ConversationState>, RepositoryError> {
+            Ok(self
+                .states
+                .lock()
+                .unwrap()
+                .get(&(character_id, conversation_id))
+                .cloned())
+        }
+        async fn upsert(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+            state: &crate::domain::character::ConversationState,
+        ) -> Result<(), RepositoryError> {
+            self.states
+                .lock()
+                .unwrap()
+                .insert((character_id, conversation_id), state.clone());
+            Ok(())
+        }
+    }
+
+    struct MemBehaviorStateRepo {
+        states: Mutex<HashMap<(i64, i64), crate::domain::character::BehaviorState>>,
+    }
+    #[async_trait]
+    impl crate::domain::repository::BehaviorStateRepository for MemBehaviorStateRepo {
+        async fn find_by_character_and_conversation(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+        ) -> Result<Option<crate::domain::character::BehaviorState>, RepositoryError> {
+            Ok(self
+                .states
+                .lock()
+                .unwrap()
+                .get(&(character_id, conversation_id))
+                .cloned())
+        }
+        async fn upsert(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+            state: &crate::domain::character::BehaviorState,
+        ) -> Result<(), RepositoryError> {
+            self.states
+                .lock()
+                .unwrap()
+                .insert((character_id, conversation_id), state.clone());
             Ok(())
         }
     }
@@ -628,42 +690,30 @@ mod tests {
         }
     }
 
-    struct MemEmotionRepo {
-        states: Mutex<HashMap<(i64, i64), EmotionState>>,
+    struct MemMoodRepo {
+        moods: Mutex<HashMap<(i64, i64), Mood>>,
     }
     #[async_trait]
-    impl EmotionStateRepository for MemEmotionRepo {
-        #[allow(deprecated)]
-        async fn find_by_character_id(
-            &self,
-            _id: i64,
-        ) -> Result<Option<EmotionState>, RepositoryError> {
-            Ok(self.states.lock().unwrap().values().next().cloned())
-        }
+    impl MoodRepository for MemMoodRepo {
         async fn find_by_character_and_conversation(
             &self,
             character_id: i64,
             conversation_id: i64,
-        ) -> Result<Option<EmotionState>, RepositoryError> {
+        ) -> Result<Option<Mood>, RepositoryError> {
             Ok(self
-                .states
+                .moods
                 .lock()
                 .unwrap()
                 .get(&(character_id, conversation_id))
                 .cloned())
         }
-        #[allow(deprecated)]
-        async fn upsert(&self, id: i64, state: &EmotionState) -> Result<(), RepositoryError> {
-            self.states.lock().unwrap().insert((id, 0), state.clone());
-            Ok(())
-        }
-        async fn upsert_scoped(
+        async fn upsert(
             &self,
             character_id: i64,
             conversation_id: i64,
-            state: &EmotionState,
+            state: &Mood,
         ) -> Result<(), RepositoryError> {
-            self.states
+            self.moods
                 .lock()
                 .unwrap()
                 .insert((character_id, conversation_id), state.clone());
@@ -859,11 +909,13 @@ mod tests {
         Arc<ReplyProcessor>,
         Arc<FakeAdapter>,
         Arc<FakeProvider>,
-        Arc<MemEmotionRepo>,
+        Arc<MemMoodRepo>,
         Arc<MemRelationshipRepo>,
         Arc<MemStateRepo>,
         Arc<MemBindingRepo>,
         Arc<MemParticipantRepo>,
+        Arc<MemConversationStateRepo>,
+        Arc<MemBehaviorStateRepo>,
     );
 
     async fn wire(onbot_conv: bool, use_llm: bool) -> Wiring {
@@ -926,7 +978,13 @@ mod tests {
         let relationship_repo = Arc::new(MemRelationshipRepo {
             rels: Mutex::new(vec![]),
         });
-        let emotion_repo = Arc::new(MemEmotionRepo {
+        let mood_repo = Arc::new(MemMoodRepo {
+            moods: Mutex::new(HashMap::new()),
+        });
+        let conversation_state_repo = Arc::new(MemConversationStateRepo {
+            states: Mutex::new(HashMap::new()),
+        });
+        let behavior_state_repo = Arc::new(MemBehaviorStateRepo {
             states: Mutex::new(HashMap::new()),
         });
         // 预设 Bot 参与者（sender_id=55 对应 id=55，role='character'）。
@@ -959,13 +1017,12 @@ mod tests {
             conv_repo.clone(),
             memory_repo.clone(),
             relationship_repo.clone(),
-            emotion_repo.clone(),
+            mood_repo.clone(),
             binding_repo.clone(),
         ));
         let memory_service = Arc::new(MemoryService::new(memory_repo));
-        let emotion_service = Arc::new(crate::application::emotion_service::EmotionService::new(
-            emotion_repo.clone(),
-            bus.clone(),
+        let mood_service = Arc::new(crate::application::mood_service::MoodService::new(
+            mood_repo.clone(),
         ));
         let relationship_service = Arc::new(
             crate::application::relationship_service::RelationshipService::new(
@@ -976,9 +1033,11 @@ mod tests {
         let behavior_engine = Arc::new(
             crate::application::behavior_engine::RuleBehaviorEngine::new(
                 binding_repo.clone(),
-                emotion_repo.clone(),
+                mood_repo.clone(),
                 relationship_repo.clone(),
                 state_repo.clone(),
+                conversation_state_repo.clone(),
+                behavior_state_repo.clone(),
                 crate::application::clock::system_clock(),
             ),
         );
@@ -1011,7 +1070,7 @@ mod tests {
             behavior_engine,
             cognition,
             relationship_service,
-            emotion_service,
+            mood_service,
             memory_service,
             action_dispatcher,
             bus,
@@ -1023,11 +1082,13 @@ mod tests {
             processor,
             adapter,
             provider,
-            emotion_repo,
+            mood_repo,
             relationship_repo,
             state_repo,
             binding_repo,
             participant_repo,
+            conversation_state_repo,
+            behavior_state_repo,
         )
     }
 
@@ -1045,7 +1106,7 @@ mod tests {
     #[tokio::test]
     async fn no_binding_ignores_message() {
         // 覆盖空绑定场景：清空 bindings，process 应正常返回且不发送。
-        let (processor, adapter, _, _, _, _, binding_repo, _) = wire(false, false).await;
+        let (processor, adapter, _, _, _, _, binding_repo, _, _, _) = wire(false, false).await;
         binding_repo.bindings.lock().unwrap().clear();
         processor
             .process(&received_event(true))
@@ -1056,7 +1117,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_llm_uses_deterministic_reply() {
-        let (processor, adapter, provider, emotion_repo, rel_repo, state_repo, _, _) =
+        let (processor, adapter, provider, mood_repo, rel_repo, state_repo, _, _, _, _) =
             wire(false, false).await;
         processor
             .process(&received_event(true))
@@ -1073,7 +1134,7 @@ mod tests {
 
         // 情绪与关系应更新且持久化。
         // 情绪按 Character × Conversation 存储：character_id=1, conversation_id=100
-        assert!(emotion_repo.states.lock().unwrap().contains_key(&(1, 100)));
+        assert!(mood_repo.moods.lock().unwrap().contains_key(&(1, 100)));
         assert!(!rel_repo.rels.lock().unwrap().is_empty());
         // 状态应被初始化。
         assert!(state_repo.states.lock().unwrap().contains_key(&1));
@@ -1081,7 +1142,7 @@ mod tests {
 
     #[tokio::test]
     async fn enabled_llm_uses_provider_reply() {
-        let (processor, adapter, provider, _, _, _, _, _) = wire(false, true).await;
+        let (processor, adapter, provider, _, _, _, _, _, _, _) = wire(false, true).await;
         processor
             .process(&received_event(true))
             .await
@@ -1098,7 +1159,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_conversation_routes_to_group_adapter() {
-        let (processor, adapter, _, _, _, _, _, _) = wire(true, false).await;
+        let (processor, adapter, _, _, _, _, _, _, _, _) = wire(true, false).await;
         processor
             .process(&received_event(true))
             .await
@@ -1141,7 +1202,7 @@ mod tests {
             release: Arc::new(Mutex::new(Some(release_rx))),
         });
 
-        let (processor, adapter, _, _, _, _, _, _) =
+        let (processor, adapter, _, _, _, _, _, _, _, _) =
             wire_with_delay(false, false, controlled).await;
 
         // 在任务中处理消息（MentionOnly + mentioned → delay 1600 > 0）。
@@ -1178,7 +1239,8 @@ mod tests {
         let recording: Arc<dyn DelayExecutor> = Arc::new(RecordingDelay {
             delays: recorded.clone(),
         });
-        let (processor, adapter, _, _, _, _, _, _) = wire_with_delay(false, false, recording).await;
+        let (processor, adapter, _, _, _, _, _, _, _, _) =
+            wire_with_delay(false, false, recording).await;
 
         processor
             .process(&received_event(true))

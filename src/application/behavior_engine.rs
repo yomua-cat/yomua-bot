@@ -1,40 +1,35 @@
-//! 确定性行为引擎 —— `BehaviorEngine` trait 的具体实现。
+//! 规则行为引擎 —— 确定性决策，无 LLM。
 //!
-//! 基于规则（reply_mode × is_mentioned × 情绪/关系/状态调制）做出
-//! 确定性决策，不依赖 LLM。拟人化的"随机感"由消息内容的确定性哈希
-//! 提供，保证同一条消息在相同状态下得到相同结论（可测试、可复现）。
+//! 依据绑定 / 关系 / 状态（全局 + 会话级）调制回复意愿与延迟。
+//! 状态领域模型重构后：情绪为标量 `Mood`（与 Stress 独立），
+//! 压力同时存在于 `CharacterState`（全局）与 `ConversationState`（会话级）。
 
 use std::sync::Arc;
 
 use crate::application::clock::Clock;
-use crate::domain::behavior::{
-    BehaviorAction, BehaviorDecision, BehaviorEngine, CognitionLevel, Priority,
-};
-use crate::domain::character::{CharacterBinding, CharacterState, ReplyMode};
-use crate::domain::emotion::EmotionState;
+use crate::domain::behavior::{BehaviorAction, BehaviorDecision, BehaviorEngine};
+use crate::domain::character::{CharacterBinding, ReplyMode};
 use crate::domain::mute::{is_within_window, parse_mute_schedule, TimeOfDay};
 use crate::domain::relationship::Relationship;
 use crate::domain::repository::{
-    CharacterBindingRepository, CharacterStateRepository, EmotionStateRepository,
-    RelationshipRepository,
+    CharacterBindingRepository, CharacterStateRepository, ConversationStateRepository,
+    MoodRepository, RelationshipRepository,
 };
-use crate::error::{DomainError, RepositoryError};
+use crate::error::DomainError;
 
-/// 将仓储错误映射为领域错误（内部错误）。
-fn repo_err(e: RepositoryError) -> DomainError {
-    DomainError::Internal(format!("读取决策上下文失败: {e}"))
-}
+use crate::domain::behavior::{CognitionLevel, Priority};
+use crate::domain::character::{BehaviorState, CharacterState, ConversationState};
+use crate::domain::emotion::Mood;
 
-/// 主动行为的基准意愿阈值。
-///
-/// 主动触发 = 确定性哈希的 roll < 阈值。阈值由关系亲密度与状态调制，
-/// 表示"角色此时有多想主动发起接触"。
-const PROACTIVE_BASE_THRESHOLD: f64 = 0.5;
+/// 主动行为的基础阈值。
+pub const PROACTIVE_BASE_THRESHOLD: f64 = 0.5;
 
-/// `BehaviorEngine` 的规则实现。
+/// 规则行为引擎：根据绑定、状态与关系做出确定性行为决策。
 pub struct RuleBehaviorEngine {
     binding_repo: Arc<dyn CharacterBindingRepository>,
-    emotion_repo: Arc<dyn EmotionStateRepository>,
+    mood_repo: Arc<dyn MoodRepository>,
+    conversation_state_repo: Arc<dyn ConversationStateRepository>,
+    behavior_state_repo: Arc<dyn crate::domain::repository::BehaviorStateRepository>,
     relationship_repo: Arc<dyn RelationshipRepository>,
     state_repo: Arc<dyn CharacterStateRepository>,
     clock: Arc<dyn Clock>,
@@ -43,7 +38,11 @@ pub struct RuleBehaviorEngine {
 /// 加载到的、用于决策的上下文。
 struct DecisionContext {
     binding: Option<CharacterBinding>,
-    emotion: Option<EmotionState>,
+    #[allow(dead_code)]
+    mood: Option<Mood>,
+    conversation_state: Option<ConversationState>,
+    #[allow(dead_code)]
+    behavior_state: Option<BehaviorState>,
     relationship: Option<Relationship>,
     state: Option<CharacterState>,
 }
@@ -52,21 +51,25 @@ impl RuleBehaviorEngine {
     /// 创建一个规则行为引擎。
     pub fn new(
         binding_repo: Arc<dyn CharacterBindingRepository>,
-        emotion_repo: Arc<dyn EmotionStateRepository>,
+        mood_repo: Arc<dyn MoodRepository>,
         relationship_repo: Arc<dyn RelationshipRepository>,
         state_repo: Arc<dyn CharacterStateRepository>,
+        conversation_state_repo: Arc<dyn ConversationStateRepository>,
+        behavior_state_repo: Arc<dyn crate::domain::repository::BehaviorStateRepository>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             binding_repo,
-            emotion_repo,
+            mood_repo,
             relationship_repo,
             state_repo,
+            conversation_state_repo,
+            behavior_state_repo,
             clock,
         }
     }
 
-    /// 加载决策所需的上下文（绑定 / 情绪 / 关系 / 状态）。
+    /// 加载决策所需的上下文（绑定 / 情绪 / 关系 / 全局状态 / 会话状态 / 行为状态）。
     async fn load_context(
         &self,
         character_id: i64,
@@ -82,8 +85,8 @@ impl RuleBehaviorEngine {
             .into_iter()
             .find(|b| b.character_id == character_id);
 
-        let emotion = self
-            .emotion_repo
+        let mood = self
+            .mood_repo
             .find_by_character_and_conversation(character_id, conversation_id)
             .await
             .map_err(repo_err)?;
@@ -103,11 +106,25 @@ impl RuleBehaviorEngine {
             .await
             .map_err(repo_err)?;
 
+        let conversation_state = self
+            .conversation_state_repo
+            .find_by_character_and_conversation(character_id, conversation_id)
+            .await
+            .map_err(repo_err)?;
+
+        let behavior_state = self
+            .behavior_state_repo
+            .find_by_character_and_conversation(character_id, conversation_id)
+            .await
+            .map_err(repo_err)?;
+
         Ok(DecisionContext {
             binding,
-            emotion,
+            mood,
             relationship,
             state,
+            conversation_state,
+            behavior_state,
         })
     }
 }
@@ -146,12 +163,9 @@ impl BehaviorEngine for RuleBehaviorEngine {
         let mut threshold = if is_mentioned { 1.0 } else { base_threshold };
         let mut delay_ms = base_delay;
 
-        // ---- 情绪 / 关系 / 状态调制（区别对待 + 状态驱动）----
+        // ---- 关系 / 状态调制（区别对待 + 状态驱动）----
 
         // 关系深浅：综合熟悉度 / 好感 / 信任 / 亲密得出一个亲密度。
-        // 高亲密度 → 更愿意参与、回复更及时；陌生 / 低好感 → 更疏离。
-        // 亲密度综合熟悉度 / 好感 / 信任 / 亲密；仅在确有这段关系时参与区别对待，
-        // 避免"无关参与者"被误判为疏离。
         let closeness = ctx
             .relationship
             .as_ref()
@@ -170,21 +184,37 @@ impl BehaviorEngine for RuleBehaviorEngine {
             .map(|r| r.affection > 0.7)
             .unwrap_or(false);
 
-        // 情绪层面的压力（0-1 尺度）。
-        let stressed_emotion = ctx
-            .emotion
+        // 压力来自全局状态与会话级状态二者中的较高者（均 0-100 尺度）。
+        // 未持久化的状态行按领域默认值处理（全局 energy 72 / stress 10，
+        // 会话级 energy 50 / stress 10），避免「从未落库」被误判为 0 值。
+        let global_stress = ctx
+            .state
             .as_ref()
-            .map(|e| e.stress > 0.6)
-            .unwrap_or(false);
+            .map(|s| s.stress)
+            .unwrap_or(crate::domain::character::CharacterState::default().stress);
+        let scoped_stress = ctx
+            .conversation_state
+            .as_ref()
+            .map(|s| s.stress)
+            .unwrap_or(crate::domain::character::ConversationState::default().stress);
+        let stress_level = global_stress.max(scoped_stress);
+        let stressed = stress_level > 60.0;
 
-        // 状态驱动：角色的精力 / 注意力 / 压力（均 0-100 尺度）。
-        let state = ctx.state.as_ref();
-        let low_energy = state.map(|s| s.energy < 30.0).unwrap_or(false);
-        let low_attention = state.map(|s| s.attention < 40.0).unwrap_or(false);
-        let stressed_state = state.map(|s| s.stress > 60.0).unwrap_or(false);
+        // 状态驱动：精力（全局）与会话级精力中的较低者决定参与意愿。
+        let global_energy = ctx
+            .state
+            .as_ref()
+            .map(|s| s.energy)
+            .unwrap_or(crate::domain::character::CharacterState::default().energy);
+        let scoped_energy = ctx
+            .conversation_state
+            .as_ref()
+            .map(|s| s.energy)
+            .unwrap_or(crate::domain::character::ConversationState::default().energy);
+        let energy_level = global_energy.min(scoped_energy);
+        let low_energy = energy_level < 30.0;
 
-        // 静默时段：仅在命中且未被 @ 时压低未提及消息的回复意愿并拉长延迟；
-        // 被 @ 的实时消息不受影响。
+        // 静默时段：仅在命中且未被 @ 时压低未提及消息的回复意愿并拉长延迟。
         let in_mute = binding
             .mute_schedule
             .as_deref()
@@ -192,24 +222,16 @@ impl BehaviorEngine for RuleBehaviorEngine {
             .map(|w| is_within_window(&w, &time_of_day(decided_at)))
             .unwrap_or(false);
 
-        // 负向因素集合：厌烦、精力低、注意力涣散、压力高或关系疏离。
+        // 负向因素集合：厌烦、精力低、压力高或关系疏离。
         // 这些会降低参与意愿（未提及消息）并拉长延迟；被 @ 的实时消息始终回复，
         // 只受延迟调制（直接呼叫不应被忽略，符合 mute / 拟人语义）。
-        let withholds = annoyed
-            || low_energy
-            || low_attention
-            || stressed_state
-            || stressed_emotion
-            || distant_relation;
+        let withholds = annoyed || low_energy || stressed || distant_relation;
 
         // 阈值（回复概率）惩罚仅作用于未提及消息。
         if !is_mentioned && withholds {
             threshold -= 0.2;
         }
-        if !is_mentioned && low_attention {
-            threshold -= 0.05;
-        }
-        if !is_mentioned && stressed_state {
+        if !is_mentioned && stressed {
             threshold -= 0.05;
         }
 
@@ -217,10 +239,7 @@ impl BehaviorEngine for RuleBehaviorEngine {
         if withholds {
             delay_ms += 400;
         }
-        if low_attention {
-            delay_ms += 300;
-        }
-        if stressed_state {
+        if stressed {
             delay_ms += 300;
         }
 
@@ -253,8 +272,7 @@ impl BehaviorEngine for RuleBehaviorEngine {
                     muted: in_mute,
                     annoyed,
                     low_energy,
-                    low_attention,
-                    stressed: stressed_state || stressed_emotion,
+                    stressed,
                     high_affection,
                     close_relation,
                     distant_relation,
@@ -319,20 +337,31 @@ impl BehaviorEngine for RuleBehaviorEngine {
             threshold -= 0.15;
         }
 
-        // 完整状态调制：状态差 → 不愿主动；状态好 → 更想主动。
-        if let Some(s) = ctx.state.as_ref() {
-            if s.energy < 30.0 {
-                threshold -= 0.1;
-            }
-            if s.attention < 40.0 {
-                threshold -= 0.05;
-            }
-            if s.stress > 60.0 {
-                threshold -= 0.1;
-            }
-            if s.energy > 70.0 && s.attention > 60.0 && s.stress < 40.0 {
-                threshold += 0.1;
-            }
+        // 状态调制（全局 + 会话级取较不利者）：
+        // 状态差 → 不愿主动；状态好 → 更想主动。
+        let global_energy = ctx.state.as_ref().map(|s| s.energy).unwrap_or_default();
+        let global_stress = ctx.state.as_ref().map(|s| s.stress).unwrap_or_default();
+        let scoped_energy = ctx
+            .conversation_state
+            .as_ref()
+            .map(|s| s.energy)
+            .unwrap_or_default();
+        let scoped_stress = ctx
+            .conversation_state
+            .as_ref()
+            .map(|s| s.stress)
+            .unwrap_or_default();
+        let energy = global_energy.min(scoped_energy);
+        let stress = global_stress.max(scoped_stress);
+
+        if energy < 30.0 {
+            threshold -= 0.1;
+        }
+        if stress > 60.0 {
+            threshold -= 0.1;
+        }
+        if energy > 70.0 && stress < 40.0 {
+            threshold += 0.1;
         }
 
         // 确定性哈希：角色 + 会话 + 小时桶，让主动意愿随小时自然变化且可复现。
@@ -356,11 +385,12 @@ impl BehaviorEngine for RuleBehaviorEngine {
     }
 }
 
+/// 把仓储错误转换为领域错误。
+fn repo_err(e: crate::error::RepositoryError) -> DomainError {
+    DomainError::Internal(format!("仓储错误: {e}"))
+}
+
 /// 依据 reply_mode 与 mentioned 返回基础回复阈值与延迟（毫秒）。
-///
-/// TODO(AUDIT-064): threshold 和 delay 的具体数值目前硬编码在 match 分支中。
-/// 未来应将这些值提取到 runtime.toml 配置文件，使运营人员可以在不修改代码的情况下
-/// 调整不同 reply_mode 下的回复行为参数。
 fn base_params(reply_mode: &ReplyMode, is_mentioned: bool) -> (f64, u64) {
     let (threshold, delay) = match reply_mode {
         ReplyMode::MentionOnly => {
@@ -389,15 +419,12 @@ fn base_params(reply_mode: &ReplyMode, is_mentioned: bool) -> (f64, u64) {
 }
 
 /// 用一个简单的确定性哈希把消息内容映射到 [0, 1)。
-///
-/// 采用 FNV-1a 风格哈希，无外部依赖，保证同输入同输出。
 fn deterministic_roll(content: &str) -> f64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in content.as_bytes() {
         hash ^= *byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    // 取低 32 位映射到 [0, 1)。
     (hash & 0xFFFF_FFFF) as f64 / 4_294_967_296.0
 }
 
@@ -419,7 +446,6 @@ struct ReplyReasonFlags {
     muted: bool,
     annoyed: bool,
     low_energy: bool,
-    low_attention: bool,
     stressed: bool,
     high_affection: bool,
     close_relation: bool,
@@ -450,9 +476,6 @@ fn build_reply_reason(f: &ReplyReasonFlags) -> String {
     if f.low_energy {
         parts.push("精力较低".to_string());
     }
-    if f.low_attention {
-        parts.push("注意力涣散".to_string());
-    }
     if f.stressed {
         parts.push("压力较高".to_string());
     }
@@ -475,9 +498,10 @@ pub(crate) fn time_of_day(t: chrono::DateTime<chrono::Utc>) -> TimeOfDay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::clock::Clock;
-    use crate::domain::character::{CharacterBinding, CharacterState};
-    use crate::domain::emotion::EmotionState;
+    use crate::domain::character::{
+        BehaviorState, CharacterBinding, CharacterState, ConversationState,
+    };
+    use crate::domain::emotion::Mood;
     use crate::domain::relationship::Relationship;
     use crate::error::RepositoryError;
     use async_trait::async_trait;
@@ -498,7 +522,6 @@ mod tests {
             }
         }
 
-        // 后阶段（mute / proactive 冷却）测试会推进时钟，因此保留该辅助方法。
         #[allow(dead_code)]
         fn set(&self, t: DateTime<Utc>) {
             *self.time.lock().unwrap() = t;
@@ -573,52 +596,33 @@ mod tests {
         }
     }
 
-    struct MemEmotionRepo {
-        states: Mutex<HashMap<(i64, i64), EmotionState>>,
+    struct MemMoodRepo {
+        moods: Mutex<HashMap<(i64, i64), Mood>>,
     }
     #[async_trait]
-    impl EmotionStateRepository for MemEmotionRepo {
-        #[allow(deprecated)]
-        async fn find_by_character_id(
-            &self,
-            _character_id: i64,
-        ) -> Result<Option<EmotionState>, RepositoryError> {
-            Ok(self.states.lock().unwrap().values().next().cloned())
-        }
+    impl MoodRepository for MemMoodRepo {
         async fn find_by_character_and_conversation(
             &self,
             character_id: i64,
             conversation_id: i64,
-        ) -> Result<Option<EmotionState>, RepositoryError> {
+        ) -> Result<Option<Mood>, RepositoryError> {
             Ok(self
-                .states
+                .moods
                 .lock()
                 .unwrap()
                 .get(&(character_id, conversation_id))
                 .cloned())
         }
-        #[allow(deprecated)]
         async fn upsert(
             &self,
             character_id: i64,
-            state: &EmotionState,
-        ) -> Result<(), RepositoryError> {
-            self.states
-                .lock()
-                .unwrap()
-                .insert((character_id, 0), state.clone());
-            Ok(())
-        }
-        async fn upsert_scoped(
-            &self,
-            character_id: i64,
             conversation_id: i64,
-            state: &EmotionState,
+            mood: &Mood,
         ) -> Result<(), RepositoryError> {
-            self.states
+            self.moods
                 .lock()
                 .unwrap()
-                .insert((character_id, conversation_id), state.clone());
+                .insert((character_id, conversation_id), mood.clone());
             Ok(())
         }
     }
@@ -692,6 +696,68 @@ mod tests {
         }
     }
 
+    struct MemConversationStateRepo {
+        states: Mutex<HashMap<(i64, i64), ConversationState>>,
+    }
+    #[async_trait]
+    impl ConversationStateRepository for MemConversationStateRepo {
+        async fn find_by_character_and_conversation(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+        ) -> Result<Option<ConversationState>, RepositoryError> {
+            Ok(self
+                .states
+                .lock()
+                .unwrap()
+                .get(&(character_id, conversation_id))
+                .cloned())
+        }
+        async fn upsert(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+            state: &ConversationState,
+        ) -> Result<(), RepositoryError> {
+            self.states
+                .lock()
+                .unwrap()
+                .insert((character_id, conversation_id), state.clone());
+            Ok(())
+        }
+    }
+
+    struct MemBehaviorStateRepo {
+        states: Mutex<HashMap<(i64, i64), BehaviorState>>,
+    }
+    #[async_trait]
+    impl crate::domain::repository::BehaviorStateRepository for MemBehaviorStateRepo {
+        async fn find_by_character_and_conversation(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+        ) -> Result<Option<BehaviorState>, RepositoryError> {
+            Ok(self
+                .states
+                .lock()
+                .unwrap()
+                .get(&(character_id, conversation_id))
+                .cloned())
+        }
+        async fn upsert(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+            state: &BehaviorState,
+        ) -> Result<(), RepositoryError> {
+            self.states
+                .lock()
+                .unwrap()
+                .insert((character_id, conversation_id), state.clone());
+            Ok(())
+        }
+    }
+
     fn binding(conversation_id: i64, mode: ReplyMode) -> CharacterBinding {
         binding_mute(conversation_id, mode, None)
     }
@@ -716,7 +782,6 @@ mod tests {
         }
     }
 
-    /// 构造一个启用了主动行为的绑定（可带静默时段）。
     fn binding_proactive(
         conversation_id: i64,
         mode: ReplyMode,
@@ -755,29 +820,26 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn build_repos(
         bindings: Vec<CharacterBinding>,
-        emotion: Option<EmotionState>,
-        rel: Option<Relationship>,
         state: Option<CharacterState>,
+        conversation_state: Option<ConversationState>,
+        rel: Option<Relationship>,
     ) -> (
         Arc<MemBindingRepo>,
-        Arc<MemEmotionRepo>,
+        Arc<MemMoodRepo>,
         Arc<MemRelationshipRepo>,
         Arc<MemStateRepo>,
+        Arc<MemConversationStateRepo>,
+        Arc<MemBehaviorStateRepo>,
     ) {
-        // 从 bindings 中获取 conversation_id（默认 10 保持向后兼容）
         let conversation_id = bindings.first().map(|b| b.conversation_id).unwrap_or(10);
         let binding_repo = Arc::new(MemBindingRepo {
             bindings: Mutex::new(bindings),
         });
-        let emotion_repo = Arc::new(MemEmotionRepo {
-            states: Mutex::new(
-                emotion
-                    .into_iter()
-                    .map(|s| ((1, conversation_id), s))
-                    .collect(),
-            ),
+        let mood_repo = Arc::new(MemMoodRepo {
+            moods: Mutex::new(HashMap::new()),
         });
         let rel_repo = Arc::new(MemRelationshipRepo {
             relationships: Mutex::new(rel.into_iter().collect()),
@@ -785,24 +847,44 @@ mod tests {
         let state_repo = Arc::new(MemStateRepo {
             states: Mutex::new(state.into_iter().map(|s| (1, s)).collect()),
         });
-        (binding_repo, emotion_repo, rel_repo, state_repo)
+        let conv_state_repo = Arc::new(MemConversationStateRepo {
+            states: Mutex::new(
+                conversation_state
+                    .into_iter()
+                    .map(|s| ((1, conversation_id), s))
+                    .collect(),
+            ),
+        });
+        let behavior_state_repo = Arc::new(MemBehaviorStateRepo {
+            states: Mutex::new(HashMap::new()),
+        });
+        (
+            binding_repo,
+            mood_repo,
+            rel_repo,
+            state_repo,
+            conv_state_repo,
+            behavior_state_repo,
+        )
     }
 
     fn build_engine(
         bindings: Vec<CharacterBinding>,
-        emotion: Option<EmotionState>,
-        rel: Option<Relationship>,
         state: Option<CharacterState>,
+        conversation_state: Option<ConversationState>,
+        rel: Option<Relationship>,
         clock: Arc<dyn Clock>,
     ) -> (RuleBehaviorEngine, Arc<MemRelationshipRepo>) {
-        let (binding_repo, emotion_repo, rel_repo, state_repo) =
-            build_repos(bindings, emotion, rel, state);
+        let (binding_repo, mood_repo, rel_repo, state_repo, conv_state_repo, behavior_state_repo) =
+            build_repos(bindings, state, conversation_state, rel);
 
         let engine = RuleBehaviorEngine::new(
             binding_repo,
-            emotion_repo,
+            mood_repo,
             rel_repo.clone(),
             state_repo,
+            conv_state_repo,
+            behavior_state_repo,
             clock,
         );
         (engine, rel_repo)
@@ -811,7 +893,6 @@ mod tests {
     /// 用状态构造引擎；energy 兼容旧封装，其余字段使用默认值。
     fn build_engine_from_energy(
         bindings: Vec<CharacterBinding>,
-        emotion: Option<EmotionState>,
         rel: Option<Relationship>,
         energy: Option<f64>,
         clock: Arc<dyn Clock>,
@@ -820,21 +901,20 @@ mod tests {
             energy: e,
             ..Default::default()
         });
-        build_engine(bindings, emotion, rel, state, clock)
+        build_engine(bindings, state, None, rel, clock)
     }
 
     async fn engine_with(
         bindings: Vec<CharacterBinding>,
-        emotion: Option<EmotionState>,
         rel: Option<Relationship>,
         energy: Option<f64>,
     ) -> (RuleBehaviorEngine, Arc<MemRelationshipRepo>) {
-        build_engine_from_energy(bindings, emotion, rel, energy, Arc::new(FakeClock::new()))
+        build_engine_from_energy(bindings, rel, energy, Arc::new(FakeClock::new()))
     }
 
     #[tokio::test]
     async fn no_binding_ignores() {
-        let (engine, _) = engine_with(vec![], None, None, None).await;
+        let (engine, _) = engine_with(vec![], None, None).await;
         let d = engine
             .decide_response(1, 10, "你好", false, None)
             .await
@@ -846,7 +926,7 @@ mod tests {
     async fn mention_only_mentions_replies() {
         for mentioned in [true, false] {
             let (engine, _) =
-                engine_with(vec![binding(10, ReplyMode::MentionOnly)], None, None, None).await;
+                engine_with(vec![binding(10, ReplyMode::MentionOnly)], None, None).await;
             let d = engine
                 .decide_response(1, 10, "看看这个", mentioned, None)
                 .await
@@ -862,8 +942,7 @@ mod tests {
 
     #[tokio::test]
     async fn occasionally_mentions_always_replies() {
-        let (engine, _) =
-            engine_with(vec![binding(10, ReplyMode::Occasionally)], None, None, None).await;
+        let (engine, _) = engine_with(vec![binding(10, ReplyMode::Occasionally)], None, None).await;
         let d = engine
             .decide_response(1, 10, "你好呀", true, None)
             .await
@@ -873,9 +952,7 @@ mod tests {
 
     #[tokio::test]
     async fn occasional_unmentioned_deterministic() {
-        // 未提及 + occasionally：同一条消息两次应得到相同决策（确定性）。
-        let (engine, _) =
-            engine_with(vec![binding(10, ReplyMode::Occasionally)], None, None, None).await;
+        let (engine, _) = engine_with(vec![binding(10, ReplyMode::Occasionally)], None, None).await;
         let content = "随便聊点什么";
         let d1 = engine
             .decide_response(1, 10, content, false, None)
@@ -890,20 +967,16 @@ mod tests {
 
     #[tokio::test]
     async fn high_annoyance_raises_delay_and_can_suppress() {
-        // 高度厌烦 → 阈值降低 + 延迟增加。
         let (engine, _) = engine_with(
             vec![binding(10, ReplyMode::Natural)],
-            None,
             Some(relationship(0.9, 0.2)),
             Some(90.0),
         )
         .await;
-        // 参与者的关系（participant_id=1）用于调制。
         let d = engine
             .decide_response(1, 10, "喂", true, Some(1))
             .await
             .unwrap();
-        // mentioned → 恒回复，但高厌烦会加延迟。
         assert_eq!(d.action, BehaviorAction::Reply);
         assert!(d.delay_ms >= 1400, "高厌烦应增加延迟，实际 {}", d.delay_ms);
     }
@@ -912,7 +985,6 @@ mod tests {
     async fn high_affection_low_annoyance_reduces_delay() {
         let (engine, _) = engine_with(
             vec![binding(10, ReplyMode::Natural)],
-            None,
             Some(relationship(0.0, 0.9)),
             Some(90.0),
         )
@@ -928,8 +1000,7 @@ mod tests {
 
     #[tokio::test]
     async fn proactive_disabled_ignores() {
-        let (engine, _) =
-            engine_with(vec![binding(10, ReplyMode::Natural)], None, None, None).await;
+        let (engine, _) = engine_with(vec![binding(10, ReplyMode::Natural)], None, None).await;
         let d = engine.decide_proactive(1, 10).await.unwrap();
         assert_eq!(d.action, BehaviorAction::Ignore);
         assert!(d.reason.contains("未启用"));
@@ -937,7 +1008,6 @@ mod tests {
 
     #[tokio::test]
     async fn proactive_same_input_is_deterministic() {
-        // 相同角色 / 会话 / 小时桶 → 两次决策一致。
         let (engine, _) = build_engine(
             vec![binding_proactive(10, ReplyMode::Natural, None)],
             None,
@@ -953,7 +1023,6 @@ mod tests {
 
     #[tokio::test]
     async fn proactive_mute_overrides_to_ignore() {
-        // 静默时段覆盖主动行为 → Ignore。
         let (engine, _) = build_engine(
             vec![binding_proactive(
                 10,
@@ -978,7 +1047,6 @@ mod tests {
         }
     }
 
-    /// 构造一个固定在指定 UTC 时刻的假时钟。
     fn clock_at(hour: u32, minute: u32) -> Arc<dyn Clock> {
         let t = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
             .unwrap()
@@ -992,8 +1060,6 @@ mod tests {
 
     #[tokio::test]
     async fn mute_window_unmentioned_tends_to_ignore() {
-        // Natural + 静默 10:00-12:00。内容 "你好今天天气不错" roll≈0.485：
-        // 时段外阈值 0.7 → 回复；时段内阈值降到 0.35 → 忽略。
         let content = "你好今天天气不错";
         let mute = "10:00-12:00";
 
@@ -1034,7 +1100,6 @@ mod tests {
 
     #[tokio::test]
     async fn mute_window_mentioned_still_replies() {
-        // 静默时段内被 @ 的实时消息不受影响，仍回复。
         let (engine, _) = build_engine(
             vec![binding_mute(10, ReplyMode::Natural, Some("10:00-12:00"))],
             None,
@@ -1051,7 +1116,6 @@ mod tests {
 
     #[tokio::test]
     async fn mute_same_clock_is_deterministic() {
-        // 同一静默时刻、同一内容两次决策一致。
         let (engine, _) = build_engine(
             vec![binding_mute(10, ReplyMode::Natural, Some("10:00-12:00"))],
             None,
@@ -1071,63 +1135,31 @@ mod tests {
         assert_eq!(d1.action, d2.action);
     }
 
-    /// 构造一个仅覆盖部分数值字段的角色状态。
-    fn state_with(energy: f64, attention: f64, stress: f64) -> CharacterState {
+    fn state_with(energy: f64, stress: f64) -> CharacterState {
         CharacterState {
             energy,
-            attention,
+            stress,
+            ..Default::default()
+        }
+    }
+
+    fn conversation_state_with(energy: f64, stress: f64) -> ConversationState {
+        ConversationState {
+            energy,
             stress,
             ..Default::default()
         }
     }
 
     #[tokio::test]
-    async fn low_attention_raises_delay_over_high_attention() {
-        // 状态驱动：注意力涣散 → 延迟拉长（同一 @ 消息，注意力高时延迟更短）。
-        let content = "在吗";
-        let (low, _) = build_engine(
-            vec![binding(10, ReplyMode::Natural)],
-            None,
-            None,
-            Some(state_with(90.0, 20.0, 10.0)),
-            Arc::new(FakeClock::new()),
-        );
-        let low_d = low
-            .decide_response(1, 10, content, true, Some(1))
-            .await
-            .unwrap();
-
-        let (high, _) = build_engine(
-            vec![binding(10, ReplyMode::Natural)],
-            None,
-            None,
-            Some(state_with(90.0, 90.0, 10.0)),
-            Arc::new(FakeClock::new()),
-        );
-        let high_d = high
-            .decide_response(1, 10, content, true, Some(1))
-            .await
-            .unwrap();
-
-        assert_eq!(low_d.action, BehaviorAction::Reply);
-        assert_eq!(high_d.action, BehaviorAction::Reply);
-        assert!(
-            low_d.delay_ms > high_d.delay_ms,
-            "低注意力应比高注意力延迟更长（{} vs {}）",
-            low_d.delay_ms,
-            high_d.delay_ms
-        );
-    }
-
-    #[tokio::test]
-    async fn high_state_stress_raises_delay() {
-        // 状态驱动：高压力 → 延迟增加。
+    async fn high_conversation_stress_raises_delay() {
+        // 会话级压力高 → 延迟增加（压力从 ConversationState 取值）。
         let content = "在吗";
         let (stressed, _) = build_engine(
             vec![binding(10, ReplyMode::Natural)],
+            Some(state_with(90.0, 10.0)),
+            Some(conversation_state_with(50.0, 90.0)),
             None,
-            None,
-            Some(state_with(90.0, 50.0, 90.0)),
             Arc::new(FakeClock::new()),
         );
         let stressed_d = stressed
@@ -1137,9 +1169,44 @@ mod tests {
 
         let (calm, _) = build_engine(
             vec![binding(10, ReplyMode::Natural)],
+            Some(state_with(90.0, 10.0)),
+            Some(conversation_state_with(50.0, 10.0)),
+            None,
+            Arc::new(FakeClock::new()),
+        );
+        let calm_d = calm
+            .decide_response(1, 10, content, true, Some(1))
+            .await
+            .unwrap();
+
+        assert!(
+            stressed_d.delay_ms > calm_d.delay_ms,
+            "高压力应比低压力延迟更长（{} vs {}）",
+            stressed_d.delay_ms,
+            calm_d.delay_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn high_global_stress_raises_delay() {
+        let content = "在吗";
+        let (stressed, _) = build_engine(
+            vec![binding(10, ReplyMode::Natural)],
+            Some(state_with(90.0, 90.0)),
             None,
             None,
-            Some(state_with(90.0, 50.0, 10.0)),
+            Arc::new(FakeClock::new()),
+        );
+        let stressed_d = stressed
+            .decide_response(1, 10, content, true, Some(1))
+            .await
+            .unwrap();
+
+        let (calm, _) = build_engine(
+            vec![binding(10, ReplyMode::Natural)],
+            Some(state_with(90.0, 10.0)),
+            None,
+            None,
             Arc::new(FakeClock::new()),
         );
         let calm_d = calm
@@ -1157,14 +1224,12 @@ mod tests {
 
     #[tokio::test]
     async fn close_relation_lowers_delay_and_stranger_raises_it() {
-        // 区别对待：高亲密度 → 更及时；陌生 / 低好感 → 更疏离（延迟更长）。
         let content = "在吗";
-        // 亲密度高：familiarity/affection/trust/intimacy 都高 → closeness≈0.875。
         let (close, _) = build_engine(
             vec![binding(10, ReplyMode::Natural)],
             None,
-            Some(relationship_full(0.0, 0.8, 0.9, 0.9, 0.9)),
             None,
+            Some(relationship_full(0.0, 0.8, 0.9, 0.9, 0.9)),
             Arc::new(FakeClock::new()),
         );
         let close_d = close
@@ -1172,12 +1237,11 @@ mod tests {
             .await
             .unwrap();
 
-        // 陌生 / 低好感：closeness≈0.025。
         let (stranger, _) = build_engine(
             vec![binding(10, ReplyMode::Natural)],
             None,
-            Some(relationship_full(0.0, 0.1, 0.0, 0.0, 0.0)),
             None,
+            Some(relationship_full(0.0, 0.1, 0.0, 0.0, 0.0)),
             Arc::new(FakeClock::new()),
         );
         let stranger_d = stranger
@@ -1197,12 +1261,11 @@ mod tests {
 
     #[tokio::test]
     async fn same_state_same_content_is_deterministic() {
-        // 相同状态、相同内容两次决策一致（确定性）。
         let (engine, _) = build_engine(
             vec![binding(10, ReplyMode::Natural)],
+            Some(state_with(40.0, 40.0)),
             None,
             Some(relationship_full(0.5, 0.5, 0.5, 0.5, 0.5)),
-            Some(state_with(40.0, 40.0, 40.0)),
             Arc::new(FakeClock::new()),
         );
         let content = "随机聊天内容 abc";

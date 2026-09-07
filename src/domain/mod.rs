@@ -4,7 +4,7 @@
 //! - `character` — Character、CharacterDefinition、CharacterState、CharacterBinding
 //! - `conversation` — Conversation、Participant、ConversationType
 //! - `message` — Message、MessageContent
-//! - `emotion` — EmotionState、EmotionEvent、情绪计算
+//! - `emotion` — Mood 标量情绪（Character × Conversation 范围）
 //! - `relationship` — Character 与 Participant 之间的关系
 //! - `memory` — Memory、MemoryType
 //! - `behavior` — BehaviorDecision、Action、BehaviorEngine
@@ -22,8 +22,6 @@ pub mod repository;
 
 #[cfg(test)]
 mod behavior_tests;
-#[cfg(test)]
-mod emotion_tests;
 #[cfg(test)]
 mod event_tests;
 #[cfg(test)]

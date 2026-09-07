@@ -157,18 +157,9 @@ impl CognitionLayer {
             ));
         }
 
-        // 当前情绪。
-        if let Some(emotion) = &ctx.current_emotion {
-            parts.push(format!(
-                "当前情绪：开心 {:.2}、生气 {:.2}、悲伤 {:.2}、害怕 {:.2}、好感 {:.2}、压力 {:.2}、精力 {:.2}",
-                emotion.happiness,
-                emotion.anger,
-                emotion.sadness,
-                emotion.fear,
-                emotion.affection,
-                emotion.stress,
-                emotion.energy
-            ));
+        // 当前情绪（Mood 标量，0-100，越高越好）。
+        if let Some(mood) = &ctx.current_mood {
+            parts.push(format!("当前情绪（心情值 0-100）：{:.2}", mood.value));
         }
 
         // 相关记忆。
@@ -237,7 +228,7 @@ mod tests {
             binding: None,
             memory: vec![],
             relationship: None,
-            current_emotion: None,
+            current_mood: None,
             scenario: Some("清晨的咖啡馆".to_string()),
             post_history_instructions: Some("请以 Alice 的身份回答".to_string()),
         }
@@ -256,7 +247,7 @@ mod tests {
     #[test]
     fn render_system_prompt_includes_emotion_and_relationship() {
         let mut ctx = minimal_ctx();
-        ctx.current_emotion = Some(crate::domain::emotion::EmotionState::default());
+        ctx.current_mood = Some(crate::domain::emotion::Mood::default());
         ctx.relationship = Some(crate::domain::relationship::Relationship::new(1, 99));
         let prompt = CognitionLayer::render_system_prompt(&ctx);
         assert!(prompt.contains("当前情绪"));
@@ -270,8 +261,8 @@ mod tests {
     use crate::domain::conversation::Conversation;
     use crate::domain::message::Message;
     use crate::domain::repository::{
-        CharacterBindingRepository, ConversationRepository, EmotionStateRepository,
-        MemoryRepository, MessageRepository, RelationshipRepository,
+        CharacterBindingRepository, ConversationRepository, MemoryRepository, MessageRepository,
+        MoodRepository, RelationshipRepository,
     };
     use crate::error::RepositoryError;
     use crate::infrastructure::llm::{LlmResponse, TokenUsage};
@@ -414,36 +405,21 @@ mod tests {
         }
     }
 
-    struct MemEmotionRepo;
+    struct MemMoodRepo;
     #[async_trait]
-    impl EmotionStateRepository for MemEmotionRepo {
-        #[allow(deprecated)]
-        async fn find_by_character_id(
-            &self,
-            _character_id: i64,
-        ) -> Result<Option<crate::domain::emotion::EmotionState>, RepositoryError> {
-            Ok(None)
-        }
+    impl MoodRepository for MemMoodRepo {
         async fn find_by_character_and_conversation(
             &self,
             _character_id: i64,
             _conversation_id: i64,
-        ) -> Result<Option<crate::domain::emotion::EmotionState>, RepositoryError> {
+        ) -> Result<Option<crate::domain::emotion::Mood>, RepositoryError> {
             Ok(None)
         }
-        #[allow(deprecated)]
         async fn upsert(
             &self,
             _character_id: i64,
-            _state: &crate::domain::emotion::EmotionState,
-        ) -> Result<(), RepositoryError> {
-            Ok(())
-        }
-        async fn upsert_scoped(
-            &self,
-            _character_id: i64,
             _conversation_id: i64,
-            _state: &crate::domain::emotion::EmotionState,
+            _state: &crate::domain::emotion::Mood,
         ) -> Result<(), RepositoryError> {
             Ok(())
         }
@@ -498,7 +474,7 @@ mod tests {
             Arc::new(MemConvRepo),
             Arc::new(MemMemoryRepo),
             Arc::new(MemRelationshipRepo),
-            Arc::new(MemEmotionRepo),
+            Arc::new(MemMoodRepo),
             Arc::new(MemBindingRepo),
         ))
     }

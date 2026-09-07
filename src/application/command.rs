@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 
-use crate::adapters::onebot::ActionResponse;
 use crate::application::action::ActionDispatcher;
 use crate::application::binding::BindingManager;
 use crate::application::event_bus::EventBus;
@@ -157,7 +156,7 @@ impl CommandHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::onebot::{OneBotAdapter, OneBotConnectionState};
+    use crate::adapters::onebot::{ActionResponse, OneBotAdapter, OneBotConnectionState};
     use crate::domain::character::{
         Character, CharacterBinding, CharacterDefinition, CharacterState, ReplyMode,
     };

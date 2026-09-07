@@ -488,7 +488,7 @@ pub(crate) mod test_support {
     use crate::domain::relationship::Relationship;
     use crate::domain::repository::{
         CharacterBindingRepository, CharacterRepository, CharacterStateRepository,
-        ConversationRepository, EmotionStateRepository, MemoryRepository, MessageRepository,
+        ConversationRepository, MemoryRepository, MessageRepository, MoodRepository,
         PluginDataRepository, RelationshipRepository,
     };
     use crate::error::RepositoryError;
@@ -509,7 +509,7 @@ pub(crate) mod test_support {
     empty_repo!(EmptyMessageRepo);
     empty_repo!(EmptyMemoryRepo);
     empty_repo!(EmptyRelationshipRepo);
-    empty_repo!(EmptyEmotionRepo);
+    empty_repo!(EmptyMoodRepo);
 
     #[async_trait]
     impl CharacterRepository for EmptyCharacterRepo {
@@ -680,34 +680,19 @@ pub(crate) mod test_support {
     }
 
     #[async_trait]
-    impl EmotionStateRepository for EmptyEmotionRepo {
-        #[allow(deprecated)]
-        async fn find_by_character_id(
-            &self,
-            _id: i64,
-        ) -> Result<Option<crate::domain::emotion::EmotionState>, RepositoryError> {
-            Ok(None)
-        }
+    impl MoodRepository for EmptyMoodRepo {
         async fn find_by_character_and_conversation(
             &self,
             _character_id: i64,
             _conversation_id: i64,
-        ) -> Result<Option<crate::domain::emotion::EmotionState>, RepositoryError> {
+        ) -> Result<Option<crate::domain::emotion::Mood>, RepositoryError> {
             Ok(None)
         }
-        #[allow(deprecated)]
         async fn upsert(
-            &self,
-            _id: i64,
-            _s: &crate::domain::emotion::EmotionState,
-        ) -> Result<(), RepositoryError> {
-            Ok(())
-        }
-        async fn upsert_scoped(
             &self,
             _character_id: i64,
             _conversation_id: i64,
-            _s: &crate::domain::emotion::EmotionState,
+            _s: &crate::domain::emotion::Mood,
         ) -> Result<(), RepositoryError> {
             Ok(())
         }
@@ -781,7 +766,7 @@ pub(crate) mod test_support {
             Arc::new(EmptyConvRepo) as Arc<dyn ConversationRepository>,
             Arc::new(EmptyMemoryRepo) as Arc<dyn MemoryRepository>,
             Arc::new(EmptyRelationshipRepo) as Arc<dyn RelationshipRepository>,
-            Arc::new(EmptyEmotionRepo) as Arc<dyn EmotionStateRepository>,
+            Arc::new(EmptyMoodRepo) as Arc<dyn MoodRepository>,
             Arc::new(EmptyBindingRepo) as Arc<dyn CharacterBindingRepository>,
         ));
         let cognition = Arc::new(crate::application::cognition::CognitionLayer::new(

@@ -240,11 +240,6 @@ impl PluginApi {
                 .as_f64()
                 .ok_or_else(|| "参数 energy 必须是数字".to_string())?;
         }
-        if let Some(v) = patch.get("attention") {
-            state.attention = v
-                .as_f64()
-                .ok_or_else(|| "参数 attention 必须是数字".to_string())?;
-        }
         if let Some(v) = patch.get("stress") {
             state.stress = v
                 .as_f64()
@@ -254,13 +249,6 @@ impl PluginApi {
             state.current_activity = Some(
                 v.as_str()
                     .ok_or_else(|| "参数 current_activity 必须是字符串".to_string())?
-                    .to_string(),
-            );
-        }
-        if let Some(v) = patch.get("social_mood") {
-            state.social_mood = Some(
-                v.as_str()
-                    .ok_or_else(|| "参数 social_mood 必须是字符串".to_string())?
                     .to_string(),
             );
         }
@@ -666,8 +654,7 @@ mod tests {
     use crate::domain::conversation::{Conversation, ConversationType};
     use crate::domain::message::Message;
     use crate::domain::repository::{
-        CharacterBindingRepository, ConversationRepository, EmotionStateRepository,
-        MessageRepository,
+        CharacterBindingRepository, ConversationRepository, MessageRepository, MoodRepository,
     };
     use crate::error::{RepositoryError, RuntimeError};
     use crate::infrastructure::llm::{LlmRequest, LlmResponse, TokenUsage};
@@ -1046,36 +1033,21 @@ mod tests {
         }
     }
 
-    struct MemEmotionRepo;
+    struct MemMoodRepo;
     #[async_trait]
-    impl EmotionStateRepository for MemEmotionRepo {
-        #[allow(deprecated)]
-        async fn find_by_character_id(
-            &self,
-            _character_id: i64,
-        ) -> Result<Option<crate::domain::emotion::EmotionState>, RepositoryError> {
-            Ok(None)
-        }
+    impl MoodRepository for MemMoodRepo {
         async fn find_by_character_and_conversation(
             &self,
             _character_id: i64,
             _conversation_id: i64,
-        ) -> Result<Option<crate::domain::emotion::EmotionState>, RepositoryError> {
+        ) -> Result<Option<crate::domain::emotion::Mood>, RepositoryError> {
             Ok(None)
         }
-        #[allow(deprecated)]
         async fn upsert(
             &self,
             _character_id: i64,
-            _state: &crate::domain::emotion::EmotionState,
-        ) -> Result<(), RepositoryError> {
-            Ok(())
-        }
-        async fn upsert_scoped(
-            &self,
-            _character_id: i64,
             _conversation_id: i64,
-            _state: &crate::domain::emotion::EmotionState,
+            _state: &crate::domain::emotion::Mood,
         ) -> Result<(), RepositoryError> {
             Ok(())
         }
@@ -1224,7 +1196,7 @@ mod tests {
             conv_repo.clone() as Arc<dyn ConversationRepository>,
             memory_repo.clone() as Arc<dyn MemoryRepository>,
             relationship_repo.clone() as Arc<dyn RelationshipRepository>,
-            Arc::new(MemEmotionRepo),
+            Arc::new(MemMoodRepo),
             binding_repo.clone(),
         ));
         let cognition = Arc::new(CognitionLayer::new(
@@ -1501,7 +1473,7 @@ mod tests {
             .dispatch(
                 "alpha",
                 "character.state.write",
-                serde_json::json!({ "character_id": 1, "state": { "energy": 80.0, "social_mood": "happy" } }),
+                serde_json::json!({ "character_id": 1, "state": { "energy": 80.0, "stress": 20.0 } }),
             )
             .await
             .unwrap();
@@ -1515,7 +1487,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got["energy"], 80.0);
-        assert_eq!(got["social_mood"], "happy");
+        assert_eq!(got["stress"], 20.0);
     }
 
     #[tokio::test]
@@ -1526,36 +1498,35 @@ mod tests {
             .await
             .unwrap();
 
-        // 首次写入仅两个字段：其余取默认，超上限被 clamp。
+        // 首次写入仅一个字段：其余取默认，超上限被 clamp。
         let merged = h
             .api
             .dispatch(
                 "alpha",
                 "character.state.write",
-                serde_json::json!({ "character_id": 1, "state": { "energy": 250.0, "social_mood": "happy" } }),
+                serde_json::json!({ "character_id": 1, "state": { "energy": 250.0 } }),
             )
             .await
             .unwrap();
         assert_eq!(merged["energy"], 100.0, "超上限应被 clamped");
         assert_eq!(
-            merged["attention"],
-            CharacterState::default().attention,
+            merged["stress"],
+            CharacterState::default().stress,
             "未提供的字段保留默认"
         );
-        assert_eq!(merged["social_mood"], "happy");
 
-        // 部分补丁：只改 attention，energy 保留上次合并值。
+        // 部分补丁：只改 stress，energy 保留上次合并值。
         let merged2 = h
             .api
             .dispatch(
                 "alpha",
                 "character.state.write",
-                serde_json::json!({ "character_id": 1, "state": { "attention": 30.0 } }),
+                serde_json::json!({ "character_id": 1, "state": { "stress": 60.0 } }),
             )
             .await
             .unwrap();
         assert_eq!(merged2["energy"], 100.0);
-        assert_eq!(merged2["attention"], 30.0);
+        assert_eq!(merged2["stress"], 60.0);
 
         // 角色不存在 → 拒绝。
         let err = h

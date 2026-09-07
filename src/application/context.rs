@@ -13,13 +13,13 @@ use chrono::{DateTime, Utc};
 use crate::application::llm_scheduler::EmbeddingScheduler;
 use crate::domain::character::{Character, CharacterBinding, LorebookEntry};
 use crate::domain::conversation::Conversation;
-use crate::domain::emotion::EmotionState;
+use crate::domain::emotion::Mood;
 use crate::domain::memory::Memory;
 use crate::domain::message::{Message, MessageContent};
 use crate::domain::relationship::Relationship;
 use crate::domain::repository::{
-    CharacterBindingRepository, ConversationRepository, EmotionStateRepository, MemoryRepository,
-    MessageRepository, RelationshipRepository,
+    CharacterBindingRepository, ConversationRepository, MemoryRepository, MessageRepository,
+    MoodRepository, RelationshipRepository,
 };
 use crate::error::{DomainError, RuntimeError};
 
@@ -111,8 +111,8 @@ pub struct ConversationContext {
     pub memory: Vec<Memory>,
     /// 与当前参与者（发送者）的关系（若有）。
     pub relationship: Option<Relationship>,
-    /// 角色当前情绪状态（若有）。
-    pub current_emotion: Option<EmotionState>,
+    /// 角色当前情绪状态（Mood 标量，若有）。
+    pub current_mood: Option<Mood>,
     /// 角色定义的场景设定（若有）。
     pub scenario: Option<String>,
     /// 角色定义的历史后指令（若有）。
@@ -127,7 +127,7 @@ pub struct ContextBuilder {
     conversation_repo: Arc<dyn ConversationRepository>,
     memory_repo: Arc<dyn MemoryRepository>,
     relationship_repo: Arc<dyn RelationshipRepository>,
-    emotion_repo: Arc<dyn EmotionStateRepository>,
+    mood_repo: Arc<dyn MoodRepository>,
     binding_repo: Arc<dyn CharacterBindingRepository>,
     /// 向量嵌入调度器（可选，无时退化为纯关键词匹配）。
     embedding_scheduler: Option<Arc<dyn EmbeddingScheduler>>,
@@ -142,7 +142,7 @@ impl ContextBuilder {
         conversation_repo: Arc<dyn ConversationRepository>,
         memory_repo: Arc<dyn MemoryRepository>,
         relationship_repo: Arc<dyn RelationshipRepository>,
-        emotion_repo: Arc<dyn EmotionStateRepository>,
+        mood_repo: Arc<dyn MoodRepository>,
         binding_repo: Arc<dyn CharacterBindingRepository>,
     ) -> Self {
         Self {
@@ -150,7 +150,7 @@ impl ContextBuilder {
             conversation_repo,
             memory_repo,
             relationship_repo,
-            emotion_repo,
+            mood_repo,
             binding_repo,
             embedding_scheduler: None,
             lorebook_limits: LorebookLimits::default(),
@@ -272,9 +272,9 @@ impl ContextBuilder {
             .find(character.id, participant_id)
             .await?;
 
-        // 当前情绪（Character × Conversation 范围）。
-        let current_emotion = self
-            .emotion_repo
+        // 当前情绪（Mood，Character × Conversation 范围）。
+        let current_mood = self
+            .mood_repo
             .find_by_character_and_conversation(character.id, conversation_id)
             .await?;
 
@@ -286,7 +286,7 @@ impl ContextBuilder {
             binding,
             memory,
             relationship,
-            current_emotion,
+            current_mood,
             scenario: character.definition.scenario.clone(),
             post_history_instructions: character.definition.post_history_instructions.clone(),
         })
@@ -690,49 +690,30 @@ mod tests {
         }
     }
 
-    struct MemEmotionRepo {
-        states: Mutex<HashMap<(i64, i64), EmotionState>>,
+    struct MemMoodRepo {
+        moods: Mutex<HashMap<(i64, i64), Mood>>,
     }
     #[async_trait]
-    impl EmotionStateRepository for MemEmotionRepo {
-        #[allow(deprecated)]
-        async fn find_by_character_id(
-            &self,
-            _character_id: i64,
-        ) -> Result<Option<EmotionState>, RepositoryError> {
-            Ok(self.states.lock().unwrap().values().next().cloned())
-        }
+    impl MoodRepository for MemMoodRepo {
         async fn find_by_character_and_conversation(
             &self,
             character_id: i64,
             conversation_id: i64,
-        ) -> Result<Option<EmotionState>, RepositoryError> {
+        ) -> Result<Option<Mood>, RepositoryError> {
             Ok(self
-                .states
+                .moods
                 .lock()
                 .unwrap()
                 .get(&(character_id, conversation_id))
                 .cloned())
         }
-        #[allow(deprecated)]
         async fn upsert(
             &self,
             character_id: i64,
-            state: &EmotionState,
-        ) -> Result<(), RepositoryError> {
-            self.states
-                .lock()
-                .unwrap()
-                .insert((character_id, 0), state.clone());
-            Ok(())
-        }
-        async fn upsert_scoped(
-            &self,
-            character_id: i64,
             conversation_id: i64,
-            state: &EmotionState,
+            state: &Mood,
         ) -> Result<(), RepositoryError> {
-            self.states
+            self.moods
                 .lock()
                 .unwrap()
                 .insert((character_id, conversation_id), state.clone());
@@ -882,8 +863,8 @@ mod tests {
         let relationship_repo = Arc::new(MemRelationshipRepo {
             relationships: Mutex::new(relationships),
         });
-        let emotion_repo = Arc::new(MemEmotionRepo {
-            states: Mutex::new(HashMap::new()),
+        let mood_repo = Arc::new(MemMoodRepo {
+            moods: Mutex::new(HashMap::new()),
         });
         let binding_repo = Arc::new(MemBindingRepo {
             bindings: Mutex::new(bindings),
@@ -893,7 +874,7 @@ mod tests {
             conv_repo,
             memory_repo,
             relationship_repo,
-            emotion_repo,
+            mood_repo,
             binding_repo,
         )
     }
@@ -1066,8 +1047,8 @@ mod tests {
         let relationship_repo = Arc::new(MemRelationshipRepo {
             relationships: Mutex::new(vec![]),
         });
-        let emotion_repo = Arc::new(MemEmotionRepo {
-            states: Mutex::new(HashMap::new()),
+        let mood_repo = Arc::new(MemMoodRepo {
+            moods: Mutex::new(HashMap::new()),
         });
         let binding_repo = Arc::new(MemBindingRepo {
             bindings: Mutex::new(vec![]),
@@ -1077,7 +1058,7 @@ mod tests {
             conv_repo,
             memory_repo,
             relationship_repo,
-            emotion_repo,
+            mood_repo,
             binding_repo,
         );
         let result = builder

@@ -1,4 +1,12 @@
 //! SQLite 模式迁移。
+//!
+//! 迁移顺序与幂等性说明：
+//! - 001 定义全新数据库的完整模式（不含旧的 `emotion_states`，包含新的
+//!   `moods` / `conversation_states` / `behavior_states` 三张范围状态表）。
+//! - 002/003/004/005 为既有旧表补列，均带列存在性探测，重复执行安全。
+//! - 006 仅在旧库（不存在 `moods` 表）上运行：创建新状态表并把旧
+//!   `emotion_states` / `character_states.last_proactive_at` 的历史数据
+//!   回填到新表，保证升级不丢数据。
 
 use sqlx::SqlitePool;
 
@@ -11,23 +19,6 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
         .execute(pool)
         .await
         .map_err(|e| StorageError::Migration(format!("migration 001 failed: {e}")))?;
-
-    // 迁移 002：为既有数据库补上 character_states.last_proactive_at 列。
-    // MIGRATION_001 已把该列写入新建表的定义，因此这里只在列缺失时执行，保证幂等。
-    let has_last_proactive_at: i64 = sqlx::query_scalar(
-        r#"SELECT COUNT(*) FROM pragma_table_info('character_states')
-           WHERE name = 'last_proactive_at'"#,
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| StorageError::Migration(format!("migration 002 probe failed: {e}")))?;
-
-    if has_last_proactive_at == 0 {
-        sqlx::query(MIGRATION_002)
-            .execute(pool)
-            .await
-            .map_err(|e| StorageError::Migration(format!("migration 002 failed: {e}")))?;
-    }
 
     // 迁移 003：conversation_bindings 新增 switched_at 列（换角色生效时间）。
     let has_switched_at: i64 = sqlx::query_scalar(
@@ -108,23 +99,79 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
             .map_err(|e| StorageError::Migration(format!("migration 005 failed: {e}")))?;
     }
 
-    // 迁移 006：重建 emotion_states 为 Character × Conversation 范围。
-    // 通过检查旧表结构（character_id PRIMARY KEY）来判断是否需要迁移。
-    // 新表使用 (character_id, conversation_id) PRIMARY KEY，与旧表结构不兼容。
-    let old_emotion_table_rowid: i64 = sqlx::query_scalar(
-        r#"SELECT COUNT(*) FROM sqlite_master
-           WHERE type='table' AND name='emotion_states'
-           AND sql LIKE '%PRIMARY KEY (character_id)'"#,
+    // 迁移 006：双范围状态表（Mood / ConversationState / BehaviorState）。
+    // 全新库由 MIGRATION_001 直接建好三张表；旧库（残留 `emotion_states` 表，
+    // 新 001 不会创建它）在此补齐新表，并把历史 `emotion_states` 与
+    // `character_states.last_proactive_at` 回填到新表中。
+    let has_emotion_states: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='emotion_states'"#,
     )
     .fetch_one(pool)
     .await
     .map_err(|e| StorageError::Migration(format!("migration 006 probe failed: {e}")))?;
 
-    if old_emotion_table_rowid > 0 {
-        sqlx::query(MIGRATION_006_RECREATE_EMOTION_STATES)
+    if has_emotion_states > 0 {
+        sqlx::query(MIGRATION_006_CREATE_SCOPED_TABLES)
             .execute(pool)
             .await
-            .map_err(|e| StorageError::Migration(format!("migration 006 failed: {e}")))?;
+            .map_err(|e| StorageError::Migration(format!("migration 006 create failed: {e}")))?;
+        tracing::info!(target: "storage", "迁移 006：已补齐 moods / conversation_states / behavior_states 表");
+
+        // 旧 emotion_states 有历史数据 → 回填为新表初值。
+        let moods_empty: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM moods"#)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| StorageError::Migration(format!("migration 006 count failed: {e}")))?;
+
+        if moods_empty == 0 {
+            // 旧表是否已带 conversation_id（此前已做过一次范围化迁移）？
+            let scoped: i64 = sqlx::query_scalar(
+                r#"SELECT COUNT(*) FROM pragma_table_info('emotion_states')
+                   WHERE name = 'conversation_id'"#,
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(|e| StorageError::Migration(format!("migration 006 probe failed: {e}")))?;
+
+            let (mood_sql, conv_sql) = if scoped > 0 {
+                (
+                    MIGRATION_006_BACKFILL_MOOD_SCOPED,
+                    MIGRATION_006_BACKFILL_CONV_STATE_SCOPED,
+                )
+            } else {
+                (
+                    MIGRATION_006_BACKFILL_MOOD_LEGACY,
+                    MIGRATION_006_BACKFILL_CONV_STATE_LEGACY,
+                )
+            };
+            sqlx::query(mood_sql).execute(pool).await.map_err(|e| {
+                StorageError::Migration(format!("migration 006 mood backfill failed: {e}"))
+            })?;
+            sqlx::query(conv_sql).execute(pool).await.map_err(|e| {
+                StorageError::Migration(format!("migration 006 conv backfill failed: {e}"))
+            })?;
+            tracing::info!(target: "storage", "迁移 006：已从旧 emotion_states 回填 mood / conversation_states");
+        }
+
+        // 旧 character_states.last_proactive_at 列存在 → 回填行为状态（保持冷却连续）。
+        let has_last_proactive: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM pragma_table_info('character_states')
+               WHERE name = 'last_proactive_at'"#,
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            StorageError::Migration(format!("migration 006 proactive probe failed: {e}"))
+        })?;
+
+        if has_last_proactive > 0 {
+            sqlx::query(MIGRATION_006_BACKFILL_BEHAVIOR_STATE)
+                .execute(pool)
+                .await
+                .map_err(|e| {
+                    StorageError::Migration(format!("migration 006 behavior backfill failed: {e}"))
+                })?;
+        }
     }
 
     Ok(())
@@ -150,15 +197,12 @@ CREATE TABLE IF NOT EXISTS characters (
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Character runtime state
+-- Character runtime state（全局范围：energy / stress / current_activity）
 CREATE TABLE IF NOT EXISTS character_states (
     character_id    INTEGER PRIMARY KEY REFERENCES characters(id) ON DELETE CASCADE,
     energy          REAL NOT NULL DEFAULT 72.0,
-    attention       REAL NOT NULL DEFAULT 50.0,
-    current_activity TEXT,
-    social_mood     TEXT DEFAULT 'calm',
     stress          REAL NOT NULL DEFAULT 10.0,
-    last_proactive_at TEXT,
+    current_activity TEXT,
     last_updated    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -252,17 +296,32 @@ CREATE TABLE IF NOT EXISTS relationships (
     PRIMARY KEY (character_id, participant_id)
 );
 
--- Emotion states (Character's persistent emotional state)
-CREATE TABLE IF NOT EXISTS emotion_states (
-    character_id    INTEGER PRIMARY KEY REFERENCES characters(id) ON DELETE CASCADE,
-    happiness       REAL NOT NULL DEFAULT 0.5,
-    anger           REAL NOT NULL DEFAULT 0.0,
-    sadness         REAL NOT NULL DEFAULT 0.0,
-    fear            REAL NOT NULL DEFAULT 0.0,
-    affection       REAL NOT NULL DEFAULT 0.3,
-    stress          REAL NOT NULL DEFAULT 0.1,
-    energy          REAL NOT NULL DEFAULT 0.7,
-    last_updated    TEXT NOT NULL DEFAULT (datetime('now'))
+-- Mood（Character × Conversation 标量心情，0-100）
+CREATE TABLE IF NOT EXISTS moods (
+    character_id    INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    value           REAL NOT NULL DEFAULT 50.0,
+    last_updated    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (character_id, conversation_id)
+);
+
+-- ConversationState（Character × Conversation 的精力 / 压力）
+CREATE TABLE IF NOT EXISTS conversation_states (
+    character_id    INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    energy          REAL NOT NULL DEFAULT 50.0,
+    stress          REAL NOT NULL DEFAULT 10.0,
+    last_updated    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (character_id, conversation_id)
+);
+
+-- BehaviorState（Character × Conversation 的主动行为冷却状态）
+CREATE TABLE IF NOT EXISTS behavior_states (
+    character_id    INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    last_proactive_at TEXT,
+    last_updated    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (character_id, conversation_id)
 );
 
 -- Scheduled tasks
@@ -301,13 +360,6 @@ CREATE TABLE IF NOT EXISTS plugin_data (
     updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (plugin_name, key)
 );
-"#;
-
-/// 迁移 002：为既有数据库的 character_states 表新增 `last_proactive_at` 列。
-///
-/// 用于记录主动行为最后一次触发的时间，供 proactive cooldown 判断。
-const MIGRATION_002: &str = r#"
-ALTER TABLE character_states ADD COLUMN last_proactive_at TEXT;
 "#;
 
 /// 迁移 003：为 conversation_bindings 新增 `switched_at` 列（换角色生效时间）。
@@ -350,48 +402,96 @@ const MIGRATION_005_CROSS_REPLY_ENABLED: &str = r#"
 ALTER TABLE conversation_bindings ADD COLUMN cross_reply_enabled INTEGER NOT NULL DEFAULT 0;
 "#;
 
-/// 迁移 006：重建 emotion_states 为 Character × Conversation 范围。
-///
-/// 旧表 `emotion_states` 使用 `character_id PRIMARY KEY`，导致所有 Conversation 共享同一情绪。
-/// 新表 `emotion_states` 使用 `(character_id, conversation_id) PRIMARY KEY`，
-/// 实现设计文档规定的「Emotion 属于 Character × Conversation」。
-///
-/// 对于既有数据库：先将旧表的全局情绪数据回填到每个 Character × Conversation 的组合中，
-/// 保持行为不变（相当于情绪在切换前是"全局"的，切换后自动"隔离"到新 conversation）。
-const MIGRATION_006_RECREATE_EMOTION_STATES: &str = r#"
--- 1. 创建临时表，结构正确
-CREATE TABLE emotion_states_new (
-    character_id    INTEGER NOT NULL,
-    conversation_id INTEGER NOT NULL,
-    happiness       REAL NOT NULL DEFAULT 0.5,
-    anger           REAL NOT NULL DEFAULT 0.0,
-    sadness         REAL NOT NULL DEFAULT 0.0,
-    fear            REAL NOT NULL DEFAULT 0.0,
-    affection       REAL NOT NULL DEFAULT 0.3,
-    stress          REAL NOT NULL DEFAULT 0.1,
-    energy          REAL NOT NULL DEFAULT 0.7,
+/// 迁移 006a：为旧库补齐三张范围状态表（全新库由 001 直接创建）。
+const MIGRATION_006_CREATE_SCOPED_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS moods (
+    character_id    INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    value           REAL NOT NULL DEFAULT 50.0,
     last_updated    TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (character_id, conversation_id)
 );
 
--- 2. 回填旧数据：每个角色的全局情绪复制到该角色所在的每个 conversation
---    （保证历史数据不丢失，行为与重建前相同）
-INSERT INTO emotion_states_new (character_id, conversation_id, happiness, anger, sadness, fear, affection, stress, energy, last_updated)
+CREATE TABLE IF NOT EXISTS conversation_states (
+    character_id    INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    energy          REAL NOT NULL DEFAULT 50.0,
+    stress          REAL NOT NULL DEFAULT 10.0,
+    last_updated    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (character_id, conversation_id)
+);
+
+CREATE TABLE IF NOT EXISTS behavior_states (
+    character_id    INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    last_proactive_at TEXT,
+    last_updated    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (character_id, conversation_id)
+);
+"#;
+
+/// 迁移 006b：从旧 `emotion_states`（已带 conversation_id 的范围表）回填 `moods`。
+///
+/// 旧情绪为多维（0-1），新 Mood 为 0-100 标量：以 happiness 作为初始心情值（×100），
+/// 与旧默认值（happiness=0.5 → 50）保持一致。
+const MIGRATION_006_BACKFILL_MOOD_SCOPED: &str = r#"
+INSERT OR IGNORE INTO moods (character_id, conversation_id, value, last_updated)
+SELECT e.character_id,
+       e.conversation_id,
+       ROUND(MIN(100.0, MAX(0.0, e.happiness * 100.0)), 2),
+       e.last_updated
+FROM emotion_states e;
+"#;
+
+/// 迁移 006b（legacy）：从旧 `emotion_states`（无 conversation_id，全局情绪）回填 `moods`，
+/// 把每个角色的历史情绪复制到其绑定的每个会话（与原「全局情绪」语义一致）。
+const MIGRATION_006_BACKFILL_MOOD_LEGACY: &str = r#"
+INSERT OR IGNORE INTO moods (character_id, conversation_id, value, last_updated)
 SELECT DISTINCT
     e.character_id,
     cb.conversation_id,
-    e.happiness,
-    e.anger,
-    e.sadness,
-    e.fear,
-    e.affection,
-    e.stress,
-    e.energy,
+    ROUND(MIN(100.0, MAX(0.0, e.happiness * 100.0)), 2),
     e.last_updated
 FROM emotion_states e
 JOIN conversation_bindings cb ON cb.character_id = e.character_id;
+"#;
 
--- 3. 替换旧表
-DROP TABLE emotion_states;
-ALTER TABLE emotion_states_new RENAME TO emotion_states;
+/// 迁移 006b：从旧 `emotion_states`（已带 conversation_id 的范围表）回填 `conversation_states`。
+const MIGRATION_006_BACKFILL_CONV_STATE_SCOPED: &str = r#"
+INSERT OR IGNORE INTO conversation_states (character_id, conversation_id, energy, stress, last_updated)
+SELECT DISTINCT
+    e.character_id,
+    e.conversation_id,
+    ROUND(MIN(100.0, MAX(0.0, e.energy * 100.0)), 2),
+    ROUND(MIN(100.0, MAX(0.0, e.stress * 100.0)), 2),
+    e.last_updated
+FROM emotion_states e;
+"#;
+
+/// 迁移 006b（legacy）：从旧 `emotion_states`（无 conversation_id，全局情绪）回填
+/// `conversation_states`，按角色绑定分发到每个会话。
+const MIGRATION_006_BACKFILL_CONV_STATE_LEGACY: &str = r#"
+INSERT OR IGNORE INTO conversation_states (character_id, conversation_id, energy, stress, last_updated)
+SELECT DISTINCT
+    e.character_id,
+    cb.conversation_id,
+    ROUND(MIN(100.0, MAX(0.0, e.energy * 100.0)), 2),
+    ROUND(MIN(100.0, MAX(0.0, e.stress * 100.0)), 2),
+    e.last_updated
+FROM emotion_states e
+JOIN conversation_bindings cb ON cb.character_id = e.character_id;
+"#;
+
+/// 迁移 006c：把旧 `character_states.last_proactive_at` 回填到 `behavior_states`
+/// （按角色绑定的每个会话复制），保证主动冷却在升级后连续。
+const MIGRATION_006_BACKFILL_BEHAVIOR_STATE: &str = r#"
+INSERT OR IGNORE INTO behavior_states (character_id, conversation_id, last_proactive_at, last_updated)
+SELECT DISTINCT
+    cs.character_id,
+    cb.conversation_id,
+    cs.last_proactive_at,
+    cs.last_updated
+FROM character_states cs
+JOIN conversation_bindings cb ON cb.character_id = cs.character_id
+WHERE cs.last_proactive_at IS NOT NULL;
 "#;

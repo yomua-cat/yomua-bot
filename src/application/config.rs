@@ -113,6 +113,9 @@ websocket_url = "ws://127.0.0.1:3001"
 reconnect_interval_secs = 1
 max_reconnect_interval_secs = 30
 heartbeat_interval_secs = 30
+
+# 单次请求（如发消息）等待应答的超时时间（秒）。
+action_timeout_secs = 10
 "#;
 
 /// llm.toml 模板。

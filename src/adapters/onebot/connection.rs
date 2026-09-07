@@ -13,7 +13,7 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch, Mutex, oneshot};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use serde_json;
 
@@ -372,9 +372,15 @@ fn classify_incoming_message(text: &str) -> IncomingMessage {
                 .and_then(|v| v.as_str())
                 .unwrap_or("failed")
                 .to_string();
-            let retcode = json.get("retcode").and_then(|v| v.as_i64()).map(|v| v as i32);
+            let retcode = json
+                .get("retcode")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
             let data = json.get("data").cloned();
-            let error = json.get("error").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let error = json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             return IncomingMessage::Response(ActionResponse {
                 id,
                 action,

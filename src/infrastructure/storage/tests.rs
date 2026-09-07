@@ -675,14 +675,13 @@ mod storage_tests {
         };
         let char_id = char_repo.insert(&character).await.unwrap();
 
-        // 默认状态无 last_proactive_at。
+        // 首次写入：energy / stress / current_activity 往返。
         let mut state = CharacterState {
             energy: 30.0,
             stress: 80.0,
+            current_activity: Some("休息".to_string()),
             ..Default::default()
         };
-        assert!(state.last_proactive_at.is_none(), "默认无主动时间");
-
         state_repo.upsert(char_id, &state).await.unwrap();
 
         let loaded = state_repo
@@ -692,12 +691,11 @@ mod storage_tests {
             .unwrap();
         assert_eq!(loaded.energy, 30.0);
         assert_eq!(loaded.stress, 80.0);
-        assert!(loaded.last_proactive_at.is_none());
+        assert_eq!(loaded.current_activity.as_deref(), Some("休息"));
 
-        // 再次 upsert（更新），并写入 last_proactive_at 验证持久化往返。
+        // 再次 upsert（更新）验证覆盖语义。
         state.energy = 90.0;
-        let proactive_time = chrono::Utc::now() - chrono::Duration::minutes(5);
-        state.last_proactive_at = Some(proactive_time);
+        state.current_activity = None;
         state_repo.upsert(char_id, &state).await.unwrap();
 
         let loaded2 = state_repo
@@ -706,12 +704,409 @@ mod storage_tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded2.energy, 90.0);
-        let saved = loaded2
-            .last_proactive_at
-            .expect("last_proactive_at 应被持久化");
-        assert!(
-            (saved - proactive_time).num_seconds().abs() <= 1,
-            "last_proactive_at 应接近写入值"
+        assert_eq!(loaded2.current_activity, None);
+    }
+
+    #[tokio::test]
+    async fn test_mood_upsert_roundtrip_and_scope() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
         );
+        let conv_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let mood_repo = crate::infrastructure::storage::repository::SqliteMoodRepository::new(
+            storage.pool().clone(),
+        );
+
+        let character = Character {
+            id: 0,
+            definition: CharacterDefinition {
+                name: "MoodTest".to_string(),
+                description: None,
+                personality: None,
+                scenario: None,
+                style: None,
+                background: None,
+                greetings: vec![],
+                example_messages: vec![],
+                system_prompt: None,
+                post_history_instructions: None,
+                lorebook: vec![],
+                metadata: serde_json::json!({}),
+            },
+            state: CharacterState::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let char_id = char_repo.insert(&character).await.unwrap();
+        let conv1 = Conversation {
+            id: 0,
+            conversation_type: ConversationType::Private,
+            external_id: "u_mood_1".to_string(),
+            name: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let conv2 = Conversation {
+            id: 0,
+            conversation_type: ConversationType::Private,
+            external_id: "u_mood_2".to_string(),
+            name: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let conv1_id = conv_repo.insert(&conv1).await.unwrap();
+        let conv2_id = conv_repo.insert(&conv2).await.unwrap();
+
+        // 写入与读取往返。
+        let mood = crate::domain::emotion::Mood {
+            value: 68.0,
+            last_updated: chrono::Utc::now(),
+        };
+        mood_repo.upsert(char_id, conv1_id, &mood).await.unwrap();
+        let loaded = mood_repo
+            .find_by_character_and_conversation(char_id, conv1_id)
+            .await
+            .unwrap()
+            .expect("应能读回 mood");
+        assert!((loaded.value - 68.0).abs() < 1e-6);
+
+        // 范围隔离：另一个会话无 mood；写入后互不影响。
+        assert!(mood_repo
+            .find_by_character_and_conversation(char_id, conv2_id)
+            .await
+            .unwrap()
+            .is_none());
+        mood_repo
+            .upsert(
+                char_id,
+                conv2_id,
+                &crate::domain::emotion::Mood {
+                    value: 30.0,
+                    last_updated: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let v1 = mood_repo
+            .find_by_character_and_conversation(char_id, conv1_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let v2 = mood_repo
+            .find_by_character_and_conversation(char_id, conv2_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!((v1.value - 68.0).abs() < 1e-6);
+        assert!((v2.value - 30.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_conversation_state_upsert_roundtrip() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let conv_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let cs_repo =
+            crate::infrastructure::storage::repository::SqliteConversationStateRepository::new(
+                storage.pool().clone(),
+            );
+
+        let character = Character {
+            id: 0,
+            definition: CharacterDefinition {
+                name: "ConvStateTest".to_string(),
+                description: None,
+                personality: None,
+                scenario: None,
+                style: None,
+                background: None,
+                greetings: vec![],
+                example_messages: vec![],
+                system_prompt: None,
+                post_history_instructions: None,
+                lorebook: vec![],
+                metadata: serde_json::json!({}),
+            },
+            state: CharacterState::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let char_id = char_repo.insert(&character).await.unwrap();
+        let conv = Conversation {
+            id: 0,
+            conversation_type: ConversationType::Private,
+            external_id: "u_cs_1".to_string(),
+            name: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let conv_id = conv_repo.insert(&conv).await.unwrap();
+
+        let state = crate::domain::character::ConversationState {
+            energy: 42.0,
+            stress: 65.0,
+            last_updated: chrono::Utc::now(),
+        };
+        cs_repo.upsert(char_id, conv_id, &state).await.unwrap();
+        let loaded = cs_repo
+            .find_by_character_and_conversation(char_id, conv_id)
+            .await
+            .unwrap()
+            .expect("应能读回 conversation state");
+        assert!((loaded.energy - 42.0).abs() < 1e-6);
+        assert!((loaded.stress - 65.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_behavior_state_upsert_roundtrip() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let conv_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let bs_repo =
+            crate::infrastructure::storage::repository::SqliteBehaviorStateRepository::new(
+                storage.pool().clone(),
+            );
+
+        let character = Character {
+            id: 0,
+            definition: CharacterDefinition {
+                name: "BehaviorStateTest".to_string(),
+                description: None,
+                personality: None,
+                scenario: None,
+                style: None,
+                background: None,
+                greetings: vec![],
+                example_messages: vec![],
+                system_prompt: None,
+                post_history_instructions: None,
+                lorebook: vec![],
+                metadata: serde_json::json!({}),
+            },
+            state: CharacterState::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let char_id = char_repo.insert(&character).await.unwrap();
+        let conv = Conversation {
+            id: 0,
+            conversation_type: ConversationType::Private,
+            external_id: "u_bs_1".to_string(),
+            name: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let conv_id = conv_repo.insert(&conv).await.unwrap();
+
+        // 默认不含主动时间。
+        let state = crate::domain::character::BehaviorState::default();
+        bs_repo.upsert(char_id, conv_id, &state).await.unwrap();
+        let loaded = bs_repo
+            .find_by_character_and_conversation(char_id, conv_id)
+            .await
+            .unwrap()
+            .expect("应能读回 behavior state");
+        assert!(loaded.last_proactive_at.is_none());
+
+        // 主动时间往返。
+        let t = chrono::Utc::now() - chrono::Duration::minutes(5);
+        bs_repo
+            .upsert(
+                char_id,
+                conv_id,
+                &crate::domain::character::BehaviorState {
+                    last_proactive_at: Some(t),
+                    last_updated: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let loaded2 = bs_repo
+            .find_by_character_and_conversation(char_id, conv_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let saved = loaded2.last_proactive_at.expect("应能读回主动时间");
+        assert!((saved - t).num_seconds().abs() <= 1, "主动时间应接近写入值");
+    }
+
+    #[tokio::test]
+    async fn migration_006_backfills_legacy_emotion_and_proactive() {
+        // 构造一个「旧库」：只有旧 emotion_states（无 conversation_id）与
+        // character_states.last_proactive_at，尚无新三张表。
+        let storage = SqliteStorage::open_in_memory().await.unwrap();
+        let pool = storage.pool().clone();
+
+        sqlx::query(
+            r#"CREATE TABLE characters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL, description TEXT, personality TEXT, scenario TEXT,
+                style TEXT, background TEXT, greetings TEXT NOT NULL DEFAULT '[]',
+                example_messages TEXT NOT NULL DEFAULT '[]', system_prompt TEXT,
+                post_history_instructions TEXT, lorebook TEXT NOT NULL DEFAULT '[]',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"CREATE TABLE character_states (
+                character_id INTEGER PRIMARY KEY,
+                energy REAL NOT NULL DEFAULT 72.0,
+                stress REAL NOT NULL DEFAULT 10.0,
+                current_activity TEXT,
+                last_proactive_at TEXT,
+                last_updated TEXT NOT NULL DEFAULT (datetime('now'))
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_type TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                name TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"CREATE TABLE conversation_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                character_id INTEGER NOT NULL,
+                conversation_id INTEGER NOT NULL,
+                reply_mode TEXT NOT NULL DEFAULT 'mention_only',
+                proactive_enabled INTEGER NOT NULL DEFAULT 0,
+                mute_schedule TEXT,
+                behavior_overrides TEXT NOT NULL DEFAULT '{}',
+                context_policy TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"CREATE TABLE emotion_states (
+                character_id INTEGER NOT NULL,
+                happiness REAL NOT NULL DEFAULT 0.5,
+                energy REAL NOT NULL DEFAULT 0.7,
+                stress REAL NOT NULL DEFAULT 0.1,
+                last_updated TEXT NOT NULL DEFAULT (datetime('now'))
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 制造数据：角色 1 绑定会话 10 / 20，全局情绪 happiness=0.8、精力 0.9、压力 0.2；
+        // 全局角色状态带 last_proactive_at。
+        sqlx::query("INSERT INTO characters (id, name) VALUES (1, 'Alice')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (id, conversation_type, external_id) VALUES (10, 'private', 'u10'), (20, 'private', 'u20')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_bindings (character_id, conversation_id) VALUES (1, 10), (1, 20)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO emotion_states (character_id, happiness, energy, stress) VALUES (1, 0.8, 0.9, 0.2)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO character_states (character_id, energy, stress, last_proactive_at) VALUES (1, 80.0, 10.0, '2026-01-01T10:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 运行迁移。
+        storage.migrate().await.expect("旧库迁移应成功");
+
+        // 校验 moods 回填：character 1 的每个会话都有 mood，值为 happiness(0.8)*100 ≈ 80。
+        let mood_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM moods WHERE character_id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mood_count, 2, "每个绑定会话都应回填一个 mood");
+        let mood_val: f64 = sqlx::query_scalar(
+            "SELECT value FROM moods WHERE character_id = 1 AND conversation_id = 10",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            (mood_val - 80.0).abs() < 1e-6,
+            "mood 应取 happiness*100，实际 {mood_val}"
+        );
+
+        // conversation_states 回填：energy 90 / stress 20。
+        let cs_val: (f64, f64) = sqlx::query_as(
+            "SELECT energy, stress FROM conversation_states WHERE character_id = 1 AND conversation_id = 20",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            (cs_val.0 - 90.0).abs() < 1e-6 && (cs_val.1 - 20.0).abs() < 1e-6,
+            "conversation_states 应回填 energy/stress，实际 ({}, {})",
+            cs_val.0,
+            cs_val.1
+        );
+
+        // behavior_states 回填：last_proactive_at 从 character_states 复制到每个会话。
+        let bs_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM behavior_states WHERE character_id = 1 AND last_proactive_at IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bs_count, 2, "每个绑定会话都应回填 last_proactive_at");
+
+        // 幂等：再次运行迁移不报错、不产生重复。
+        storage.migrate().await.expect("迁移应幂等");
+        let mood_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM moods WHERE character_id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mood_after, 2, "重复迁移不应重复回填");
     }
 }
