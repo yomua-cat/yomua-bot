@@ -146,6 +146,7 @@ mod storage_tests {
             mentions: vec![],
             attachments: vec![],
             metadata: serde_json::json!({}),
+            active_character_id: None,
         };
         let msg_id = msg_repo.insert(&msg).await.expect("insert message failed");
         assert!(msg_id > 0);

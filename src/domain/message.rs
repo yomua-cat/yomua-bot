@@ -31,6 +31,11 @@ pub struct Message {
 
     /// 来自适配器的任意元数据。
     pub metadata: serde_json::Value,
+
+    /// 该消息被记录时，哪个角色正处于 Active 状态。
+    /// 用于 Character × Conversation 可见性过滤：只有当时为 Active 的角色才能看到此消息。
+    /// 如果为 None（存量数据），过滤时退化为 switched_at 逻辑。
+    pub active_character_id: Option<i64>,
 }
 
 /// 消息内容。

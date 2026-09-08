@@ -16,6 +16,7 @@ use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 
 use crate::application::clock::Clock;
+use crate::application::context::filter_messages_by_switched_at;
 use crate::application::llm_scheduler::{EmbeddingScheduler, LlmScheduler};
 use crate::domain::character::CharacterBinding;
 use crate::domain::message::Message;
@@ -224,12 +225,18 @@ impl CognitionDriver {
                 ))
             })?;
 
-        // 获取最近消息作为上下文。
+        // 获取最近消息作为上下文，并按角色可见性过滤
+        //（active_character_id 精确过滤；None 时退化为 switched_at 粗粒度过滤）。
         let recent_messages = self
             .message_repo
             .find_recent(binding.conversation_id, 20)
             .await
             .map_err(RuntimeError::Repository)?;
+        let recent_messages = filter_messages_by_switched_at(
+            recent_messages,
+            binding.character_id,
+            binding.switched_at,
+        );
 
         let prompt = self.build_cognition_prompt(&character, &recent_messages);
 
@@ -405,6 +412,7 @@ mod tests {
                 mentions: vec![],
                 attachments: vec![],
                 metadata: serde_json::json!({}),
+                active_character_id: None,
             };
             msgs.entry(conv_id).or_default().push(msg);
         }

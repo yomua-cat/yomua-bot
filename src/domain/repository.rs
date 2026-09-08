@@ -185,6 +185,27 @@ pub trait MessageRepository: Send + Sync {
         &self,
         conversation_id: i64,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, RepositoryError>;
+    /// 回填某条消息的 active_character_id（在 reply_processor 确定 Active 角色后调用）。
+    /// 对于不支持此功能的存储实现，默认 no-op。
+    async fn update_active_character_id(
+        &self,
+        message_id: i64,
+        active_character_id: i64,
+    ) -> Result<(), RepositoryError> {
+        let _ = (message_id, active_character_id);
+        Ok(())
+    }
+    /// 按 (conversation_id, sender_id, timestamp, content) 精确去重查找，用于防止重复插入。
+    /// 不存在时返回 Ok(None)。不支持此功能的实现返回 Ok(None)。
+    async fn find_by_conversation_sender_time_content(
+        &self,
+        _conversation_id: i64,
+        _sender_id: i64,
+        _timestamp: chrono::DateTime<chrono::Utc>,
+        _content: &str,
+    ) -> Result<Option<Message>, RepositoryError> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------

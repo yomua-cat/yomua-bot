@@ -46,10 +46,42 @@ impl MessagePersistence {
     }
 
     /// 处理单条事件：若为 `MessageReceived` 则持久化。
+    ///
+    /// 去重策略：精确匹配 (conversation_id, sender_id, timestamp, content)。
+    /// 这避免与 ReplyProcessor.process 中插入的消息产生重复（ReplyProcessor 先插入
+    /// 带了 active_character_id 的版本）。
+    /// 注意：内容去重保证了同一秒内两条不同消息不会被误判为重复。
     pub async fn handle(&self, event: &CoreEvent) -> Result<(), RuntimeError> {
         let CoreEvent::MessageReceived(e) = event else {
             return Ok(());
         };
+
+        // 去重检查：精确匹配 (conversation_id, sender_id, timestamp, content)。
+        // 两个不同消息在同一秒到达会因 content 不同而不碰撞。
+        let existing: Result<Option<Message>, _> = self
+            .message_repo
+            .find_by_conversation_sender_time_content(
+                e.conversation_id,
+                e.sender_id,
+                e.timestamp,
+                &e.content,
+            )
+            .await;
+        match existing {
+            Ok(Some(_)) => {
+                tracing::debug!(
+                    target: "storage",
+                    conversation_id = e.conversation_id,
+                    sender_id = e.sender_id,
+                    "消息已存在（由 ReplyProcessor 插入），跳过"
+                );
+                return Ok(());
+            }
+            Ok(None) => { /* 继续插入 */ }
+            Err(e) => {
+                tracing::warn!(target: "storage", error = %e, "去重查询失败，继续插入");
+            }
+        }
 
         let message = Message {
             id: 0, // 由数据库分配
@@ -61,6 +93,7 @@ impl MessagePersistence {
             mentions: vec![],
             attachments: vec![],
             metadata: serde_json::json!({}),
+            active_character_id: None,
         };
 
         self.message_repo.insert(&message).await?;

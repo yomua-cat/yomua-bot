@@ -106,6 +106,8 @@ struct TestEnv {
     state_repo: Arc<dyn CharacterStateRepository>,
     conversation_state_repo: Arc<dyn ConversationStateRepository>,
     mood_repo: Arc<dyn MoodRepository>,
+    character_repo: Arc<dyn CharacterRepository>,
+    memory_repo: Arc<dyn MemoryRepository>,
 }
 
 /// 进程内目录序号：macOS 上 SystemTime 纳秒精度粗（存在大量重复），
@@ -286,6 +288,11 @@ async fn create_env() -> TestEnv {
         state_repo,
         conversation_state_repo,
         mood_repo,
+        // 以下在后续测试中按需使用。
+        #[allow(dead_code)]
+        character_repo: character_repo.clone(),
+        #[allow(dead_code)]
+        memory_repo: memory_repo.clone(),
     }
 }
 
@@ -936,4 +943,96 @@ async fn test_state_get_full_snapshot_after_mixed_updates() {
     assert_eq!(resp["data"]["conversation_state"]["energy"], 60.0);
     assert_eq!(resp["data"]["conversation_state"]["stress"], 15.0);
     assert_eq!(resp["data"]["mood"]["value"], 75.0);
+}
+
+/// Character × User Memory 隔离验证：Character A 的记忆对 Character B 不可见，反之亦然。
+/// 使用真实 SQLite（SqliteMemoryRepository）验证 schema 层面的 character_id 隔离。
+#[tokio::test]
+async fn test_character_memory_isolation() {
+    use chrono::Utc;
+    use yomua_bot::domain::memory::{Memory, MemoryType};
+
+    let env = create_env().await;
+    let cid = env.character_id;
+
+    // 显式创建 Character B（确保存在于当前 in-memory DB）。
+    let char_b = yomua_bot::domain::character::Character {
+        id: 0,
+        definition: test_definition(),
+        state: CharacterState::default(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let char_b_id = env
+        .character_repo
+        .insert(&char_b)
+        .await
+        .expect("插入角色 B 失败");
+    assert!(char_b_id > 0);
+
+    // 为角色 A 存储一条 Episodic 记忆。
+    let mem_a = Memory {
+        id: 0,
+        character_id: cid,
+        conversation_id: Some(env.conv_a_id),
+        memory_type: MemoryType::Episodic,
+        content: "A 记得用户喜欢猫".to_string(),
+        importance: 0.8,
+        created_at: Utc::now(),
+        last_accessed: Utc::now(),
+        embedding: None,
+        metadata: serde_json::json!({}),
+    };
+    env.memory_repo
+        .insert(&mem_a)
+        .await
+        .expect("A 记忆插入失败");
+
+    // 为角色 B 存储一条不同的 Episodic 记忆。
+    let mem_b = Memory {
+        id: 0,
+        character_id: char_b_id,
+        conversation_id: Some(env.conv_a_id),
+        memory_type: MemoryType::Episodic,
+        content: "B 记得用户讨厌狗".to_string(),
+        importance: 0.8,
+        created_at: Utc::now(),
+        last_accessed: Utc::now(),
+        embedding: None,
+        metadata: serde_json::json!({}),
+    };
+    env.memory_repo
+        .insert(&mem_b)
+        .await
+        .expect("B 记忆插入失败");
+
+    // A 的记忆查询只返回 A 的记忆。
+    let a_memories = env
+        .memory_repo
+        .find_by_character_id(cid, None, 100)
+        .await
+        .expect("A 记忆查询失败");
+    assert!(
+        a_memories.iter().any(|m| m.content.contains("喜欢猫")),
+        "A 应该有自己的记忆"
+    );
+    assert!(
+        !a_memories.iter().any(|m| m.content.contains("讨厌狗")),
+        "A 不应看到 B 的记忆"
+    );
+
+    // B 的记忆查询只返回 B 的记忆。
+    let b_memories = env
+        .memory_repo
+        .find_by_character_id(char_b_id, None, 100)
+        .await
+        .expect("B 记忆查询失败");
+    assert!(
+        b_memories.iter().any(|m| m.content.contains("讨厌狗")),
+        "B 应该有自己的记忆"
+    );
+    assert!(
+        !b_memories.iter().any(|m| m.content.contains("喜欢猫")),
+        "B 不应看到 A 的记忆"
+    );
 }

@@ -35,9 +35,10 @@ impl MessageRepository for SqliteMessageRepository {
             String,
             String,
             String,
+            Option<i64>,
         )> = sqlx::query_as(
             r#"SELECT id, conversation_id, sender_id, content, timestamp,
-                    reply_to, mentions, attachments, metadata
+                    reply_to, mentions, attachments, metadata, active_character_id
                  FROM messages WHERE id = ?"#,
         )
         .bind(id)
@@ -62,9 +63,10 @@ impl MessageRepository for SqliteMessageRepository {
             String,
             String,
             String,
+            Option<i64>,
         )> = sqlx::query_as(
             r#"SELECT id, conversation_id, sender_id, content, timestamp,
-                    reply_to, mentions, attachments, metadata
+                    reply_to, mentions, attachments, metadata, active_character_id
                  FROM messages WHERE conversation_id = ?
                  ORDER BY timestamp DESC LIMIT ?"#,
         )
@@ -95,8 +97,8 @@ impl MessageRepository for SqliteMessageRepository {
 
         let result = sqlx::query(
             r#"INSERT INTO messages
-                (conversation_id, sender_id, content, timestamp, reply_to, mentions, attachments, metadata)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+                (conversation_id, sender_id, content, timestamp, reply_to, mentions, attachments, metadata, active_character_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(message.conversation_id)
         .bind(message.sender_id)
@@ -106,11 +108,60 @@ impl MessageRepository for SqliteMessageRepository {
         .bind(&mentions_json)
         .bind(&attachments_json)
         .bind(&metadata_json)
+        .bind(message.active_character_id)
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         Ok(result.last_insert_rowid())
+    }
+
+    async fn update_active_character_id(
+        &self,
+        message_id: i64,
+        active_character_id: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(r#"UPDATE messages SET active_character_id = ? WHERE id = ?"#)
+            .bind(active_character_id)
+            .bind(message_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn find_by_conversation_sender_time_content(
+        &self,
+        conversation_id: i64,
+        sender_id: i64,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        content: &str,
+    ) -> Result<Option<Message>, RepositoryError> {
+        let row: Option<(
+            i64,
+            i64,
+            i64,
+            String,
+            String,
+            Option<i64>,
+            String,
+            String,
+            String,
+            Option<i64>,
+        )> = sqlx::query_as(
+            r#"SELECT id, conversation_id, sender_id, content, timestamp,
+                    reply_to, mentions, attachments, metadata, active_character_id
+                 FROM messages
+                 WHERE conversation_id = ? AND sender_id = ? AND timestamp = ? AND content = ?"#,
+        )
+        .bind(conversation_id)
+        .bind(sender_id)
+        .bind(timestamp.to_rfc3339())
+        .bind(content)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(parse_message_row).transpose()
     }
 
     async fn latest_message_time(
@@ -143,6 +194,7 @@ type MessageRow = (
     String,
     String,
     String,
+    Option<i64>,
 );
 
 fn parse_message_row(row: MessageRow) -> Result<Message, RepositoryError> {
@@ -156,6 +208,7 @@ fn parse_message_row(row: MessageRow) -> Result<Message, RepositoryError> {
         mentions_json,
         attachments_json,
         metadata_json,
+        active_character_id,
     ) = row;
 
     let content: MessageContent = serde_json::from_str(&content_json)
@@ -179,5 +232,6 @@ fn parse_message_row(row: MessageRow) -> Result<Message, RepositoryError> {
         mentions,
         attachments,
         metadata,
+        active_character_id,
     })
 }

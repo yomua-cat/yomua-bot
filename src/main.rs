@@ -261,6 +261,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         bus.clone(),
         delay_executor,
         repos.participant_repo.clone(),
+        repos.message_repo.clone(),
     ));
 
     // 系统指令处理器（硬性约束 B）：订阅 CommandReceived，执行换角色并中文回复。

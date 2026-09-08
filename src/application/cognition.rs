@@ -162,6 +162,11 @@ impl CognitionLayer {
             parts.push(format!("当前情绪（心情值 0-100）：{:.2}", mood.value));
         }
 
+        // 当前活动（Activity 描述角色正在做什么；不代表忙/不可用）。
+        if let Some(activity) = &ctx.character.state.current_activity {
+            parts.push(format!("当前活动：{activity}"));
+        }
+
         // 相关记忆。
         if !ctx.memory.is_empty() {
             let mem = ctx

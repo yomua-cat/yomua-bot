@@ -174,6 +174,72 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
         }
     }
 
+    // 迁移 007：messages 表新增 active_character_id 列，
+    // 用于记录该消息是哪个角色在 Active 时观察到的（用于可见性过滤）。
+    // 旧消息此列为 NULL，过滤时退化为 switched_at 逻辑。
+    let has_active_character_id: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM pragma_table_info('messages')
+           WHERE name = 'active_character_id'"#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 007 probe failed: {e}")))?;
+
+    if has_active_character_id == 0 {
+        sqlx::query(
+            r#"ALTER TABLE messages ADD COLUMN active_character_id INTEGER REFERENCES characters(id)"#,
+        )
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            StorageError::Migration(format!("migration 007 failed: {e}"))
+        })?;
+    }
+
+    // 迁移 008：messages 表 dedup key 的数据库层 UNIQUE 约束。
+    // 应用层 dedup (conversation_id, sender_id, timestamp, content) 在并发情况下
+    // 可能两侧都判断"不存在"并各自插入；加唯一约束确保不会出现重复行。
+    // 已有重复数据时跳过（warn），不自动删除。
+    let idx_exists: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM sqlite_master
+           WHERE type = 'index' AND name = 'idx_messages_dedup'"#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 008 probe failed: {e}")))?;
+
+    if idx_exists == 0 {
+        // 先检查是否有重复（conversation_id, sender_id, timestamp, content 都相同）。
+        let dup_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM (
+                SELECT conversation_id, sender_id, timestamp, content,
+                       COUNT(*) as cnt
+                  FROM messages
+              GROUP BY conversation_id, sender_id, timestamp, content
+                HAVING cnt > 1
+            )"#,
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| StorageError::Migration(format!("migration 008 dup probe failed: {e}")))?;
+
+        if dup_count > 0 {
+            tracing::warn!(
+                target: "storage",
+                "messages 表存在 {} 组重复记录，跳过 dedup UNIQUE 索引创建",
+                dup_count
+            );
+        } else {
+            sqlx::query(
+                r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_dedup
+                      ON messages (conversation_id, sender_id, timestamp, content)"#,
+            )
+            .execute(pool)
+            .await
+            .map_err(|e| StorageError::Migration(format!("migration 008 failed: {e}")))?;
+        }
+    }
+
     Ok(())
 }
 

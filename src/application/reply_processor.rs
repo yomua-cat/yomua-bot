@@ -28,7 +28,7 @@ use crate::domain::conversation::ParticipantRole;
 use crate::domain::event::{
     BehaviorDecidedEvent, CoreEvent, MessageReceivedEvent, ResponseGeneratedEvent, ResponseSource,
 };
-use crate::domain::repository::ParticipantRepository;
+use crate::domain::repository::{MessageRepository, ParticipantRepository};
 use crate::error::RuntimeError;
 
 /// 单次回复最长允许的拟人化延迟（毫秒）。
@@ -88,6 +88,8 @@ pub struct ReplyProcessor {
     delay_executor: Arc<dyn DelayExecutor>,
     /// 参与者仓储（用于跨回复场景：查询当前 Bot 的 participant_id）。
     participant_repo: Arc<dyn ParticipantRepository>,
+    /// 消息仓储（用于回填 active_character_id）。
+    message_repo: Arc<dyn MessageRepository>,
 }
 
 impl ReplyProcessor {
@@ -105,6 +107,7 @@ impl ReplyProcessor {
         event_bus: EventBus,
         delay_executor: Arc<dyn DelayExecutor>,
         participant_repo: Arc<dyn ParticipantRepository>,
+        message_repo: Arc<dyn MessageRepository>,
     ) -> Self {
         Self {
             runtime,
@@ -118,6 +121,7 @@ impl ReplyProcessor {
             event_bus,
             delay_executor,
             participant_repo,
+            message_repo,
         }
     }
 
@@ -126,7 +130,7 @@ impl ReplyProcessor {
     /// 遍历该会话的所有绑定，每个绑定独立决策是否回复。
     /// 多 Bot 共群时，所有待发送回复延迟随机打乱后顺序发送。
     pub async fn process(&self, event: &MessageReceivedEvent) -> Result<(), RuntimeError> {
-        // 1. 获取该会话的所有绑定。
+        // 1. 获取该会话的所有绑定（从中得到 active_character_id）。
         let bindings = self
             .binding_manager
             .by_conversation(event.conversation_id)
@@ -139,8 +143,61 @@ impl ReplyProcessor {
             );
             return Ok(());
         }
+        let character_id = bindings.first().map(|b| b.character_id).unwrap_or(0);
 
-        // 2. 收集所有待发送回复（延迟发送，打乱顺序）。
+        // 2. 尝试插入消息（使用正确的 active_character_id）。
+        //    如果 MessagePersistence 已先插入（dedup 命中），则跳到回填步骤。
+        let message_id = {
+            let msg = crate::domain::message::Message {
+                id: 0,
+                conversation_id: event.conversation_id,
+                sender_id: event.sender_id,
+                content: crate::domain::message::MessageContent::Text(event.content.clone()),
+                timestamp: event.timestamp,
+                reply_to: None,
+                mentions: vec![],
+                attachments: vec![],
+                metadata: serde_json::json!({}),
+                active_character_id: Some(character_id),
+            };
+            match self.message_repo.insert(&msg).await {
+                Ok(id) => id,
+                Err(crate::error::RepositoryError::Database(ref s))
+                    if s.contains("UNIQUE") || s.contains("Duplicate") =>
+                {
+                    // MessagePersistence 已插入，从头查一次 message_id 用于回填。
+                    self.message_repo
+                        .find_by_conversation_sender_time_content(
+                            event.conversation_id,
+                            event.sender_id,
+                            event.timestamp,
+                            &event.content,
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|m| m.id)
+                        .unwrap_or(0)
+                }
+                Err(e) => {
+                    return Err(RuntimeError::Repository(e));
+                }
+            }
+        };
+
+        // 3. 回填 active_character_id（处理 MessagePersistence 先插入导致 INSERT 时
+        //    active_character_id 仍为 NULL 的情况）。UPDATE 对已正确的值也是 no-op。
+        if message_id > 0 && character_id > 0 {
+            if let Err(e) = self
+                .message_repo
+                .update_active_character_id(message_id, character_id)
+                .await
+            {
+                tracing::warn!(target: "runtime", message_id, "回填 active_character_id 失败: {e}");
+            }
+        }
+
+        // 4. 收集所有待发送回复（延迟发送，打乱顺序）。
         let mut pending_replies: Vec<PendingReply> = Vec::new();
 
         for binding in &bindings {
@@ -1013,7 +1070,7 @@ mod tests {
             conv_repo.clone(),
         ));
         let context_builder = Arc::new(ContextBuilder::new(
-            message_repo,
+            message_repo.clone(),
             conv_repo.clone(),
             memory_repo.clone(),
             relationship_repo.clone(),
@@ -1076,6 +1133,7 @@ mod tests {
             bus,
             delay_executor,
             participant_repo.clone(),
+            message_repo.clone(),
         ));
 
         (

@@ -205,10 +205,11 @@ impl ContextBuilder {
             .into_iter()
             .find(|b| b.character_id == character.id);
 
-        // 硬性约束 A：按换角色生效时间过滤。switched_at 为 None（未换过角色）不过滤，
-        // 保持既有行为不变（回归保障）。
+        // 硬性约束 A：按 active_character_id + switched_at 过滤。
+        // active_character_id 精确过滤；None 时退化为 switched_at 粗粒度过滤。
         let recent_messages = filter_messages_by_switched_at(
             recent_messages,
+            character.id,
             binding.as_ref().and_then(|b| b.switched_at),
         );
 
@@ -425,15 +426,33 @@ impl ContextBuilder {
 /// 按换角色生效时间过滤消息：只保留 `switched_at` 之后（含）的消息。
 ///
 /// `switched_at` 为 None（该会话从未换过角色）时不过滤，保持既有行为不变。
-/// 被过滤的消息同时不进入后续的 lorebook 匹配与关键词检索（顺序上先过滤再组装）。
-fn filter_messages_by_switched_at(
+/// 按角色可见性过滤消息：
+/// 1. 如果消息有 active_character_id 且不等于当前角色 → 过滤掉（消息是其他角色观察到的）
+/// 2. 如果消息的 active_character_id == 当前角色 → 保留
+/// 3. 如果消息的 active_character_id == None（存量数据）→ 退化为 switched_at 逻辑
+///    （在 active_character_id 机制建立之前的消息，用切换时间做粗粒度过滤）
+///    switched_at = None 且 active_character_id = None → 不过滤（保持既有行为）
+pub fn filter_messages_by_switched_at(
     messages: Vec<Message>,
+    character_id: i64,
     switched_at: Option<DateTime<Utc>>,
 ) -> Vec<Message> {
-    match switched_at {
-        None => messages,
-        Some(t) => messages.into_iter().filter(|m| m.timestamp >= t).collect(),
-    }
+    messages
+        .into_iter()
+        .filter(|m| {
+            match m.active_character_id {
+                // 消息有 active_character_id：只保留属于当前角色的消息
+                Some(cid) => cid == character_id,
+                // 存量消息（active_character_id = None）：退化为 switched_at 粗粒度过滤
+                None => {
+                    match switched_at {
+                        None => true,                // 从未切换，不过滤
+                        Some(t) => m.timestamp >= t, // 只保留切换后的消息
+                    }
+                }
+            }
+        })
+        .collect()
 }
 
 /// 提取一条消息的纯文本内容（供关键词匹配）。
@@ -784,6 +803,7 @@ mod tests {
             mentions: vec![],
             attachments: vec![],
             metadata: serde_json::json!({}),
+            active_character_id: None,
         }
     }
 
@@ -1159,17 +1179,87 @@ mod tests {
             text_message_at(3, "第三条", t3),
         ];
 
-        // None 不过滤。
-        let kept = filter_messages_by_switched_at(messages.clone(), None);
+        // character_id = 99, switched_at = None：所有消息均不过滤（存量数据）
+        let kept = filter_messages_by_switched_at(messages.clone(), 99, None);
         assert_eq!(kept.len(), 3);
 
-        // Some(t2)：t2 之前（不含）被过滤，边界 == t2 保留。
-        let kept = filter_messages_by_switched_at(messages.clone(), Some(t2));
+        // character_id = 99, switched_at = Some(t2)：
+        // 存量消息（active_character_id = None）退化为 switched_at → t2 之前过滤
+        let kept = filter_messages_by_switched_at(messages.clone(), 99, Some(t2));
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().all(|m| m.timestamp >= t2));
 
-        // Some(t3)：只保留 t3 本身。
-        let kept = filter_messages_by_switched_at(messages, Some(t3));
+        // character_id = 99, switched_at = Some(t3)：只保留 t3 本身
+        let kept = filter_messages_by_switched_at(messages, 99, Some(t3));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, 3);
+    }
+
+    /// 测试 active_character_id 精确过滤：角色只能看到自己观察到的消息。
+    #[test]
+    fn filter_messages_by_active_character_id() {
+        let base = base_time();
+        let t1 = base;
+        let t2 = base + chrono::Duration::minutes(1);
+        let t3 = base + chrono::Duration::minutes(2);
+
+        // 消息 1：Alice（角色 1）在 t1 观察
+        let mut m1 = text_message_at(1, "Alice 的消息", t1);
+        m1.active_character_id = Some(1);
+        // 消息 2：Bob（角色 2）在 t2 观察
+        let mut m2 = text_message_at(2, "Bob 的消息", t2);
+        m2.active_character_id = Some(2);
+        // 消息 3：Alice 在 t3 再次观察
+        let mut m3 = text_message_at(3, "Alice 再次出现", t3);
+        m3.active_character_id = Some(1);
+        let messages = vec![m1, m2, m3];
+
+        // Alice（角色 1）应该只看到自己的消息（t1 的 m1 和 t3 的 m3）
+        let kept = filter_messages_by_switched_at(messages.clone(), 1, None);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().any(|m| m.id == 1));
+        assert!(kept.iter().any(|m| m.id == 3));
+        assert!(
+            !kept.iter().any(|m| m.id == 2),
+            "Bob 的消息不应被 Alice 看到"
+        );
+
+        // Bob（角色 2）应该只看到自己的消息（t2 的 m2）
+        let kept = filter_messages_by_switched_at(messages.clone(), 2, None);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, 2);
+
+        // 角色 99（不存在）看不到任何消息
+        let kept = filter_messages_by_switched_at(messages.clone(), 99, None);
+        assert_eq!(kept.len(), 0);
+    }
+
+    /// 测试 active_character_id = None 时退化为 switched_at 过滤（存量消息）。
+    #[test]
+    fn filter_messages_falls_back_to_switched_at_for_legacy_messages() {
+        let base = base_time();
+        let t1 = base;
+        let t2 = base + chrono::Duration::minutes(1);
+        let t3 = base + chrono::Duration::minutes(2);
+
+        // 存量消息（active_character_id = None）
+        let messages = vec![
+            text_message_at(1, "旧消息1", t1),
+            text_message_at(2, "旧消息2", t2),
+            text_message_at(3, "旧消息3", t3),
+        ];
+
+        // switched_at = None：不过滤（存量消息全保留）
+        let kept = filter_messages_by_switched_at(messages.clone(), 1, None);
+        assert_eq!(kept.len(), 3);
+
+        // switched_at = Some(t2)：只保留 t2 及之后的消息
+        let kept = filter_messages_by_switched_at(messages.clone(), 1, Some(t2));
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|m| m.timestamp >= t2));
+
+        // switched_at = Some(t3)：只保留 t3
+        let kept = filter_messages_by_switched_at(messages, 1, Some(t3));
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].id, 3);
     }
