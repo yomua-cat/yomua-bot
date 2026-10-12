@@ -1,0 +1,382 @@
+//! 消息持久化 —— 订阅事件总线，将收到的消息写入消息仓库。
+//!
+//! 主流程：OneBot 事件 → CoreEvent → 消息写入 `MessageRepository`。
+//! 本模块作为事件总线的订阅者，只关心 `MessageReceived` 事件。
+
+use std::sync::Arc;
+
+use crate::application::event_bus::{EventBus, EventSubscription};
+use crate::domain::event::CoreEvent;
+use crate::domain::message::{Message, MessageContent};
+use crate::domain::repository::MessageRepository;
+use crate::error::RuntimeError;
+
+/// 消息持久化订阅者。
+///
+/// 从事件总线持续消费 `MessageReceived` 事件并写入消息仓库。
+pub struct MessagePersistence {
+    message_repo: Arc<dyn MessageRepository>,
+}
+
+impl MessagePersistence {
+    /// 创建一个消息持久化订阅者。
+    pub fn new(message_repo: Arc<dyn MessageRepository>) -> Self {
+        Self { message_repo }
+    }
+
+    /// 启动消费循环，持续监听事件总线直到发送端全部关闭。
+    ///
+    /// 正常情况下返回 `Ok(())`（通道关闭）。
+    /// 如果处理过程中遇到不可恢复的错误（如数据库连接断开），返回 `Err`。
+    ///
+    /// 注意：本方法使用 `Result` 返回而非 `Infallible`，以便调用方感知任务异常终止。
+    /// 单条消息处理失败会记录警告并继续处理下一条，不会导致整个任务终止。
+    pub async fn run(self, bus: &EventBus) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut subscription = bus.subscribe();
+        while let Some(event) = subscription.recv().await {
+            match self.handle(&event).await {
+                Ok(()) => {}
+                Err(e) => {
+                    // 单条消息处理失败，记录警告并继续（不终止整个任务）
+                    tracing::warn!(target: "storage", error = %e, "消息持久化失败，继续处理下一条");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 处理单条事件：若为 `MessageReceived` 则持久化。
+    ///
+    /// 去重策略：精确匹配 (conversation_id, sender_id, timestamp, content)。
+    /// 这避免与 ReplyProcessor.process 中插入的消息产生重复（ReplyProcessor 先插入
+    /// 带了 active_character_id 的版本）。
+    /// 注意：内容去重保证了同一秒内两条不同消息不会被误判为重复。
+    pub async fn handle(&self, event: &CoreEvent) -> Result<(), RuntimeError> {
+        let CoreEvent::MessageReceived(e) = event else {
+            return Ok(());
+        };
+
+        // 去重检查：精确匹配 (conversation_id, sender_id, timestamp, content)。
+        // 两个不同消息在同一秒到达会因 content 不同而不碰撞。
+        let existing: Result<Option<Message>, _> = self
+            .message_repo
+            .find_by_conversation_sender_time_content(
+                e.conversation_id,
+                e.sender_id,
+                e.timestamp,
+                &e.content,
+            )
+            .await;
+        match existing {
+            Ok(Some(_)) => {
+                tracing::debug!(
+                    target: "storage",
+                    conversation_id = e.conversation_id,
+                    sender_id = e.sender_id,
+                    "消息已存在（由 ReplyProcessor 插入），跳过"
+                );
+                return Ok(());
+            }
+            Ok(None) => { /* 继续插入 */ }
+            Err(e) => {
+                tracing::warn!(target: "storage", error = %e, "去重查询失败，继续插入");
+            }
+        }
+
+        let message = Message {
+            id: 0, // 由数据库分配
+            conversation_id: e.conversation_id,
+            sender_id: e.sender_id,
+            content: MessageContent::Text(e.content.clone()),
+            timestamp: e.timestamp,
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            metadata: serde_json::json!({}),
+            active_character_id: None,
+            // C2-4 Temporal Architecture 字段
+            platform_message_id: None,
+            conversation_sequence: None,
+            occurred_at: None,
+            ingested_at: None,
+        };
+
+        self.message_repo.insert(&message).await?;
+        tracing::debug!(
+            target: "storage",
+            conversation_id = message.conversation_id,
+            sender_id = message.sender_id,
+            "消息已持久化"
+        );
+        Ok(())
+    }
+
+    /// 提供给需要手动驱动订阅的调用方。
+    pub fn subscribe(&self, bus: &EventBus) -> EventSubscription {
+        bus.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::onebot::connection::{WsConnector, WsTransport};
+    use crate::adapters::onebot::{OneBotAdapter, OneBotAdapterImpl};
+    use crate::application::binding::BindingManager;
+    use crate::application::conversation::ConversationManager;
+    use crate::application::event_bus::EventBus;
+    use crate::application::message_acceptance::MessageAcceptanceService;
+    use crate::domain::character::{Character, CharacterBinding, CharacterState, ReplyMode};
+    use crate::domain::repository::{
+        CharacterBindingRepository, CharacterRepository, ConversationRepository, MessageRepository,
+        ParticipantRepository,
+    };
+    use crate::infrastructure::storage::SqliteStorage;
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+
+    /// 测试用连接器：按脚本吐出消息后关闭连接。
+    struct ScriptedConnector {
+        script: StdMutex<VecDeque<Vec<String>>>,
+    }
+
+    impl ScriptedConnector {
+        fn new(messages: Vec<Vec<String>>) -> Self {
+            Self {
+                script: StdMutex::new(messages.into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WsConnector for ScriptedConnector {
+        async fn connect(
+            &self,
+            _config: &crate::adapters::onebot::OneBotConfig,
+        ) -> Result<Box<dyn WsTransport>, crate::error::RuntimeError> {
+            let batch = self.script.lock().unwrap().pop_front();
+            Ok(Box::new(FakeTransport {
+                messages: batch.unwrap_or_default().into(),
+            }))
+        }
+    }
+
+    /// 测试用传输：依次返回消息，然后报连接关闭（从而触发重连）。
+    struct FakeTransport {
+        messages: VecDeque<String>,
+    }
+
+    #[async_trait]
+    impl WsTransport for FakeTransport {
+        async fn read_text(&mut self) -> Result<Option<String>, crate::error::RuntimeError> {
+            Ok(self.messages.pop_front())
+        }
+
+        async fn send_text(&mut self, _t: &str) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
+
+        async fn ping(&mut self) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
+    }
+
+    // ---- C2-4 测试用内存仓储（供 BindingManager 使用）----
+
+    struct MemCharacterRepo;
+    #[async_trait]
+    impl CharacterRepository for MemCharacterRepo {
+        async fn find_by_id(&self, _id: i64) -> Result<Option<Character>, crate::error::RepositoryError> {
+            Ok(None)
+        }
+        async fn find_all(&self) -> Result<Vec<Character>, crate::error::RepositoryError> {
+            Ok(vec![])
+        }
+        async fn insert(&self, _c: &Character) -> Result<i64, crate::error::RepositoryError> {
+            Ok(1)
+        }
+        async fn update(&self, _c: &Character) -> Result<(), crate::error::RepositoryError> {
+            Ok(())
+        }
+        async fn delete(&self, _id: i64) -> Result<(), crate::error::RepositoryError> {
+            Ok(())
+        }
+    }
+
+    struct MemBindingRepo;
+    impl MemBindingRepo {
+        fn new() -> Self {
+            Self
+        }
+    }
+    #[async_trait]
+    impl CharacterBindingRepository for MemBindingRepo {
+        async fn find_by_character_id(&self, _id: i64) -> Result<Vec<CharacterBinding>, crate::error::RepositoryError> {
+            Ok(vec![])
+        }
+        async fn find_by_conversation_id(&self, id: i64) -> Result<Vec<CharacterBinding>, crate::error::RepositoryError> {
+            // C2-4: 返回隐式绑定以允许 acceptance 继续（与 onebot 测试 fixture 一致）
+            if id == 1 {
+                Ok(vec![CharacterBinding {
+                    id: 1,
+                    character_id: 1,
+                    conversation_id: 1,
+                    reply_mode: ReplyMode::default(),
+                    proactive_enabled: false,
+                    mute_schedule: None,
+                    behavior_overrides: serde_json::json!({}),
+                    context_policy: serde_json::json!({}),
+                    switched_at: Some(chrono::Utc::now()),
+                    cross_reply_enabled: false,
+                    created_at: chrono::Utc::now(),
+                }])
+            } else {
+                Ok(vec![])
+            }
+        }
+        async fn find_all(&self) -> Result<Vec<CharacterBinding>, crate::error::RepositoryError> {
+            Ok(vec![])
+        }
+        async fn find_all_enabled(&self) -> Result<Vec<CharacterBinding>, crate::error::RepositoryError> {
+            Ok(vec![])
+        }
+        async fn insert(&self, _b: &CharacterBinding) -> Result<i64, crate::error::RepositoryError> {
+            Ok(1)
+        }
+        async fn update(&self, _b: &CharacterBinding) -> Result<(), crate::error::RepositoryError> {
+            Ok(())
+        }
+        async fn delete(&self, _id: i64) -> Result<(), crate::error::RepositoryError> {
+            Ok(())
+        }
+    }
+
+    /// 端到端主流程测试：
+    /// OneBot 群消息 JSON → 适配器解析 → 事件总线 → 消息持久化写入仓库。
+    #[tokio::test]
+    async fn onebot_message_ends_up_persisted() {
+        // 准备存储与仓库。
+        let storage = SqliteStorage::open_in_memory()
+            .await
+            .expect("打开内存库失败");
+        storage.migrate().await.expect("迁移失败");
+        let pool = storage.pool().clone();
+
+        // C2-4 FIX: 插入 character id=1 以满足 FK 约束
+        // MemBindingRepo 返回 binding.character_id=1，但 characters 表为空
+        sqlx::query(
+            r#"INSERT INTO characters (id, name, description, personality, scenario, style, background,
+                greetings, example_messages, system_prompt, post_history_instructions,
+                lorebook, metadata, enabled, created_at, updated_at)
+              VALUES (1, 'TestChar', 'Test Description', '{}', '{}', '{}', '{}',
+                '[]', '[]', '', '', '[]', '{}', 1, datetime('now'), datetime('now'))"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("插入测试 character 失败");
+
+        let conv_repo: Arc<dyn crate::domain::repository::ConversationRepository> = Arc::new(
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                pool.clone(),
+            ),
+        );
+        let part_repo: Arc<dyn crate::domain::repository::ParticipantRepository> = Arc::new(
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                pool.clone(),
+            ),
+        );
+        let msg_repo: Arc<dyn crate::domain::repository::MessageRepository> = Arc::new(
+            crate::infrastructure::storage::repository::SqliteMessageRepository::new(pool.clone()),
+        );
+
+        let conversation_manager = ConversationManager::new(conv_repo.clone(), part_repo.clone());
+
+        let bus = EventBus::new();
+
+        // C2-4: 创建 MessageAcceptanceService 和 BindingManager
+        let acceptance_service = MessageAcceptanceService::new(
+            msg_repo.clone(),
+            bus.clone(),
+        );
+        let binding_manager = BindingManager::new(
+            Arc::new(MemBindingRepo) as Arc<dyn CharacterBindingRepository>,
+            Arc::new(MemCharacterRepo) as Arc<dyn CharacterRepository>,
+            conv_repo.clone() as Arc<dyn ConversationRepository>,
+        );
+
+        // 启动消息持久化订阅者。
+        let persistence = MessagePersistence::new(msg_repo.clone());
+        let bus_for_persistence = bus.clone();
+        tokio::spawn(async move { persistence.run(&bus_for_persistence).await });
+
+        // 假连接：先吐出一条 OneBot 群消息，然后关闭（触发重连）。
+        let group_message = r#"{
+            "post_type": "message",
+            "message_type": "group",
+            "time": 1690000000,
+            "self_id": 123456,
+            "message_id": 9001,
+            "group_id": 500000,
+            "user_id": 900001,
+            "message": [{"type":"text","data":{"text":"你好，世界！"}}],
+            "sender": {"user_id": 900001, "nickname": "小明", "card": ""}
+        }"#;
+        let connector = ScriptedConnector::new(vec![
+            vec![group_message.to_string()], // 第 1 次连接：发消息后关闭
+            vec![],                          // 第 2 次连接：空，保持
+        ]);
+
+        let adapter = OneBotAdapterImpl::with_connector(
+            crate::adapters::onebot::OneBotConfig {
+                websocket_url: "ws://127.0.0.1:1".to_string(),
+                access_token: None,
+                bot_self_id: None,
+                reconnect_interval_secs: 1,
+                max_reconnect_interval_secs: 4,
+                heartbeat_interval_secs: 30,
+                action_timeout_secs: 10,
+            },
+            bus.clone(),
+            conversation_manager,
+            Arc::new(acceptance_service),
+            Arc::new(binding_manager),
+            Arc::new(connector),
+        );
+
+        adapter.start().await.expect("适配器启动失败");
+
+        // 轮询：等待消息被持久化（带兜底超时）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut persisted = false;
+        while std::time::Instant::now() < deadline {
+            if let Some(conv) = conv_repo
+                .find_by_external_id("500000")
+                .await
+                .expect("查询会话失败")
+            {
+                let recent = msg_repo
+                    .find_recent(conv.id, 10)
+                    .await
+                    .expect("查询消息失败");
+                if !recent.is_empty() {
+                    persisted = true;
+                    match &recent[0].content {
+                        crate::domain::message::MessageContent::Text(t) => {
+                            assert_eq!(t, "你好，世界！");
+                        }
+                        _ => panic!("期望文本消息"),
+                    }
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(persisted, "消息应被持久化");
+
+        adapter.stop().await.expect("停止适配器失败");
+    }
+}

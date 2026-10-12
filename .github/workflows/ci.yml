@@ -1,0 +1,136 @@
+name: 仓库检查
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 必过 / 构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: 构建库、二进制及示例
+        run: cargo build --locked --lib --bins --examples
+
+  unit-tests:
+    name: 必过 / 库和二进制测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: 运行库和二进制测试
+        run: cargo test --locked --lib --bins
+
+  documentation:
+    name: 必过 / 文档链接
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 检查 Markdown 本地文件链接
+        run: |
+          python3 - <<'PYTHON'
+          import re
+          from pathlib import Path
+          from urllib.parse import unquote, urlsplit
+
+          root = Path.cwd()
+          files = [root / "README.md", root / "CONTRIBUTING.md"]
+          files += sorted((root / "docs").rglob("*.md"))
+          files += sorted((root / ".github").rglob("*.md"))
+          failures = []
+          for source in files:
+              content = re.sub(r"^```[^\n]*\n.*?^```[^\n]*$", "", source.read_text(), flags=re.M | re.S)
+              for match in re.finditer(r"!?\[[^\]]*\]\(([^)]+)\)", content):
+                  target = match.group(1).strip().strip("<>")
+                  parts = urlsplit(target)
+                  if parts.scheme or parts.netloc or not parts.path:
+                      continue
+                  destination = source.parent / unquote(parts.path)
+                  if not destination.exists():
+                      failures.append(f"{source.relative_to(root)}: {target}")
+          if failures:
+              raise SystemExit("无效的本地文档链接：\n" + "\n".join(failures))
+          print(f"文档本地文件链接检查通过：{len(files)} 个文件")
+          PYTHON
+
+  diagnostics:
+    name: 非阻断 / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 全目标测试
+            command: cargo test --locked --all-targets
+          - name: Rust 格式
+            command: cargo fmt --all -- --check
+          - name: 严格 Clippy
+            command: cargo clippy --locked --all-targets -- -D warnings
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 Rust stable 与检查组件
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: 执行检查并保留实际结果
+        env:
+          CHECK_NAME: ${{ matrix.name }}
+          CHECK_COMMAND: ${{ matrix.command }}
+        run: |
+          set +e
+          bash -c "$CHECK_COMMAND"
+          result=$?
+          if [ "$result" -eq 0 ]; then
+            verdict="通过"
+          else
+            verdict="失败"
+          fi
+          {
+            echo "### 非阻断检查：$CHECK_NAME"
+            echo
+            echo "结果：$verdict，退出码：$result。"
+            echo
+            echo "命令：\`$CHECK_COMMAND\`"
+            echo
+            echo "此作业暂不阻断整体工作流；失败仍须修复，不能作为完整检查通过的依据。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$result"

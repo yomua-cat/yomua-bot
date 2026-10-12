@@ -1,0 +1,81 @@
+# 架构
+
+本页描述当前程序的装配与调用关系。模型类型或接口存在，不等于相应能力已接入运行链路；接线缺口见[项目现状](status.md)。
+
+## 分层与入口
+
+| 层 | 职责与入口 |
+| --- | --- |
+| Domain | 角色、会话、消息、状态、决策、事件、Outbox 类型及仓储接口；[模块入口](../src/domain/mod.rs) |
+| Application | 运行时、行为判断、上下文、认知、控制、导入与后台任务；[模块入口](../src/application/mod.rs) |
+| Infrastructure | SQLite、HTTP 模型服务、角色卡解析、插件进程与 IPC；[模块入口](../src/infrastructure/mod.rs) |
+| Adapters | OneBot 协议转换、连接、入站消息及出站调用；[模块入口](../src/adapters/mod.rs) |
+
+[主程序](../src/main.rs)负责装配具体实现。Domain 通过仓储接口表达持久化需求；实际装配中 Application 也直接引用部分适配器和基础设施类型，不能把分层目标当成已验证的严格依赖隔离。
+
+`yomua-bot` 是常驻程序及角色卡管理工具；`yomua-bot-ctl` 是 Unix socket 控制客户端；`yomua-audit-harness` 是源码中保留的开发验证工具。它们共享[库入口](../src/lib.rs)。
+
+## 启动与消息链路
+
+启动流程为：读取配置并校验 → 初始化日志 → 创建数据目录、打开 SQLite 并迁移 → 装配仓储与服务 → 按配置启动插件 → 启动后台任务和控制 socket → 启动 OneBot 适配器 → 等待控制关停信号。
+
+```mermaid
+flowchart TD
+    A[OneBot WebSocket 入站] --> B[转换事件、解析会话和参与者]
+    B --> C{系统指令}
+    C -->|是| D[EventBus CommandReceived]
+    D --> E[管理员校验及指令处理]
+    C -->|否| F[查询会话角色绑定]
+    F --> G[MessageAcceptanceService]
+    G --> H[SQLite 事务：序号、消息、Outbox]
+    H --> I[OutboxDispatcher：领取租约]
+    I --> J[MPSC 与完成应答]
+    J --> K[OutboxProcessor]
+    K --> L[ReplyProcessor]
+    L --> M[状态与关系、规则决策、上下文、回复生成]
+    M --> N[ActionDispatcher → OneBot]
+    H --> O[EventBus MessageReceived → 观察者与插件]
+```
+
+入站实现见[OneBot 适配器](../src/adapters/onebot/mod.rs)。系统指令先截流，管理员身份依据 `admin_users`；普通消息无角色绑定时不进入消息落库及回复流程，但会话与发送者可能已经创建。
+
+[消息接受服务](../src/application/message_acceptance.rs)调用[消息仓储](../src/infrastructure/storage/repository/message_repository.rs)，在同一事务内递增会话序号并写入消息和 Outbox 行。广播事件保留给插件和观察者；[EventProcessor](../src/application/event_processor.rs)不再承担普通消息回复路由。
+
+[OutboxDispatcher](../src/application/outbox_dispatcher.rs)轮询、领取租约并等待消费者应答；[OutboxProcessor](../src/application/outbox_processor.rs)把 payload 转交[回复处理器](../src/application/reply_processor.rs)。默认租约 30 秒、轮询间隔 100 毫秒、最大重试次数 5，属于代码默认值，当前没有对应 TOML 字段。消费者成功后标记完成，失败可转入等待重试或死信。
+
+这条链路不构成端到端可靠投递保证：当前 payload、错误传播、角色归属和外部回执仍有明确缺口。完成状态只能按实际实现解释，不能据此推断 QQ 用户已收到消息。
+
+## 角色与状态边界
+
+| 数据 | 作用域 | 当前内容 |
+| --- | --- | --- |
+| 角色定义 | Character | 人格、场景、提示、示例、Lorebook 与元数据 |
+| CharacterState | Character | energy、stress、current_activity、last_updated |
+| ConversationState | Character × Conversation | 会话精力、压力与更新时间 |
+| Mood | Character × Conversation | mood 标量与更新时间 |
+| BehaviorState | Character × Conversation | 主动行为冷却时间 |
+| Relationship | Character × Participant | 关系数值与交互记录 |
+| Memory | Character，可附会话 | 确定性提取的记忆及语义记忆存储能力 |
+| CharacterBinding | Conversation → Character | 回复模式、主动行为、静默时段等绑定设置 |
+
+[领域模型](../src/domain/character.rs)与[情绪模型](../src/domain/emotion.rs)定义状态。[角色运行时](../src/application/runtime.rs)按需加载并缓存角色，以每角色锁保护状态更新。控制命令直接写仓储时与缓存同步的关系仍需整顿。
+
+当前绑定管理目标是每会话一个角色；历史重复绑定会在启动时警告。接收时记录的角色 ID 与消费时重新读取绑定的处理方式仍需统一。
+
+## 决策、上下文与模型
+
+[规则行为引擎](../src/application/behavior_engine.rs)结合回复模式、提及、静默时段、状态和关系决定是否回复及延迟。[决策编排器](../src/application/decision_orchestrator.rs)在主程序使用 `NoOpTrigger`，没有接入决策 LLM pipeline。
+
+[ContextBuilder](../src/application/context.rs)加载角色归属的历史、Lorebook、记忆、关系及会话情绪；[CharacterHistoryProvider](../src/application/character_history.rs)负责历史归属和序号边界。[ContextAssembler](../src/application/context_assembler.rs)估算 token、预留输出空间并按层降级，需要已知的 `context_window`。主程序从 `llm.toml` 的 `[options]` 读取预算，即使使用多模型配置也是如此。
+
+[认知层](../src/application/cognition.rs)通过[调度器](../src/application/llm_scheduler.rs)发起请求，HTTP 实现在[OpenAI-compatible Provider](../src/infrastructure/llm/openai_compatible.rs)。LLM 关闭时使用确定性回复；启用后出现模型或上下文错误，并不保证自动生成确定性备用回复。
+
+主程序没有给 ContextBuilder 注入 embedding scheduler，因此当前对话上下文使用关键词 Lorebook 与记忆检索。存在语义存储或混合检索接口不代表对话已经使用 RAG。
+
+## 后台任务与持久化
+
+- 常驻任务：事件观察、系统指令处理、主动行为评估、Outbox 调度和消费、控制服务、适配器连接与入站处理。
+- LLM 启用后启动后台认知任务，使用 `cognition` role；插件启用后增加事件桥接、传输和进程监督任务。
+- 主动行为当前只维护状态与冷却，不发送主动消息；调度器 trait 不代表已有通用定时任务服务。
+- SQLite 使用 WAL、外键约束和连接池。[迁移](../src/infrastructure/storage/migrations.rs)在代码中执行并探测已有表列，没有独立迁移文件或自动回滚机制。
+- 控制关停会发广播信号、停止插件与适配器、关闭存储；后台任务尚未统一等待退出，详见[部署运维](deployment.md)。
