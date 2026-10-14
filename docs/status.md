@@ -47,6 +47,7 @@
 - 主动发言的静默时段仍按 UTC 解释，显式时区配置尚未接入；跨时区部署前不能把当前静默行为视为最终生产语义。
 - 单 Provider 模式仍是首次发布的最小可用模式：一个兼容接口、一个凭据和一个默认模型覆盖对话与认知任务。多 Provider 路由已支持同一 Provider 复用多个模型、按任务配置备用链，并只在网络错误、超时、429 或 5xx 时切换；`decision.toml` 单独配置决策模型。Grok 按 OpenAI-compatible Provider 接入，真实 endpoint、模型名、额度和延迟仍待填写后验证。
 - 语音能力尚未接入；当前 OneBot 出站只有文本动作，后续应以独立 VoiceGateway 接入，并把最终转写作为带来源 metadata 的消息写回现有记忆链。
+- 跨会话全域唯一用户 ID 尚未实现：participants 表按 (conversation_id, external_id) 唯一，同一 QQ 号在不同群会记为不同参与者；全域身份是设计目标，未合入。
 
 ## 决策模型选型
 
