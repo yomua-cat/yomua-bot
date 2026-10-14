@@ -485,6 +485,13 @@ async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
             },
             bus.clone(),
             conversation_manager,
+            Arc::new(
+                yomua_bot::application::message_acceptance::MessageAcceptanceService::new(
+                    msg_repo.clone(),
+                    bus.clone(),
+                ),
+            ),
+            binding_manager.clone(),
             held_connector,
         ));
 
@@ -660,6 +667,7 @@ async fn p0_2_a_b_a_http_body() {
         conversation_sequence: 0,
         platform_message_id: None,
         ingested_at: chrono::Utc::now(),
+        metadata: serde_json::json!({}),
     };
 
     h.reply_processor
@@ -702,7 +710,8 @@ async fn p0_2_a_b_a_http_body() {
     assert_eq!(mt, 256, "max_tokens = min(512, 256, 512) = 256");
 
     println!("[P0-2] ✅ A→B→A HTTP Body verified:");
-    println!("  system (truncated): {}...", &sys[..sys.len().min(80)]);
+    let system_preview: String = sys.chars().take(80).collect();
+    println!("  system (truncated): {}...", system_preview);
     println!("  messages: {:?}", msg_contents);
     println!("  max_tokens: {}", mt);
 }
@@ -727,6 +736,7 @@ async fn p0_3_max_tokens_effective() {
         conversation_sequence: 0,
         platform_message_id: None,
         ingested_at: chrono::Utc::now(),
+        metadata: serde_json::json!({}),
     };
 
     h.reply_processor
@@ -770,6 +780,7 @@ async fn p0_4_unknown_context_window_no_http() {
         conversation_sequence: 0,
         platform_message_id: None,
         ingested_at: chrono::Utc::now(),
+        metadata: serde_json::json!({}),
     };
 
     // BehaviorEngine 会 Reply（Natural mode + mentioned）
@@ -808,6 +819,7 @@ async fn p0_5_outbound_captured() {
         conversation_sequence: 0,
         platform_message_id: None,
         ingested_at: chrono::Utc::now(),
+        metadata: serde_json::json!({}),
     };
 
     h.reply_processor.process(&event).await.expect("process");
@@ -854,6 +866,7 @@ async fn p0_6_single_inbound_single_llm_single_outbound() {
         conversation_sequence: 0,
         platform_message_id: None,
         ingested_at: chrono::Utc::now(),
+        metadata: serde_json::json!({}),
     };
 
     h.reply_processor.process(&event).await.expect("process");
@@ -882,7 +895,7 @@ async fn p1_1_ignore_persists_and_future_visible() {
         Arc::new(SqliteMessageRepository::new(h.pool.clone()));
 
     // "hi" 未被提及 → BehaviorEngine 应该决定 Ignore
-    // 消息通过 MessagePersistence 持久化（E2E 场景下由 EventBus 触发）
+    // 消息通过 MessageAcceptanceService 持久化，测试中手动插入以验证 Ignore ≠ forget。
     // 测试中手动插入以验证 Ignore ≠ forget
     let ignored_msg = Message {
         id: 0,
@@ -919,6 +932,7 @@ async fn p1_1_ignore_persists_and_future_visible() {
         conversation_sequence: 0,
         platform_message_id: None,
         ingested_at: chrono::Utc::now(),
+        metadata: serde_json::json!({}),
     };
 
     h.reply_processor.process(&event).await.expect("process");
@@ -1079,6 +1093,13 @@ async fn p1_2_cold_start_behavior() {
             },
             bus.clone(),
             conversation_manager,
+            Arc::new(
+                yomua_bot::application::message_acceptance::MessageAcceptanceService::new(
+                    msg_repo.clone(),
+                    bus.clone(),
+                ),
+            ),
+            binding_manager.clone(),
             held_connector,
         ));
     let action_dispatcher = Arc::new(ActionDispatcher::new(conv_repo.clone(), adapter.clone()));
@@ -1195,6 +1216,7 @@ async fn p1_2_cold_start_behavior() {
         conversation_sequence: 0,
         platform_message_id: None,
         ingested_at: chrono::Utc::now(),
+        metadata: serde_json::json!({}),
     };
 
     reply_processor

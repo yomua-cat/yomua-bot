@@ -23,7 +23,9 @@ use crate::application::binding::BindingManager;
 use crate::application::conversation::ConversationManager;
 use crate::application::event_bus::EventBus;
 use crate::application::message_acceptance::MessageAcceptanceService;
-use crate::domain::event::{CommandReceivedEvent, CoreEvent, MessageReceivedEvent};
+use crate::domain::blacklist::BlacklistType;
+use crate::domain::event::{CommandReceivedEvent, CoreEvent};
+use crate::domain::repository::BlacklistRepository;
 use crate::error::RuntimeError;
 
 pub mod connection;
@@ -32,11 +34,13 @@ pub mod conversion;
 pub use connection::ActionResponse;
 use connection::{ConnectionShared, TungsteniteConnector, WsConnector};
 pub use conversion::{
-    build_group_send_request, build_private_send_request, OneBotEvent, OutgoingRequest,
+    build_get_message_request, build_group_send_request, build_private_send_request, OneBotEvent,
+    OutgoingRequest,
 };
 
 /// OneBot 适配器配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OneBotConfig {
     /// WebSocket URL（例如 "ws://127.0.0.1:3001"）。
     pub websocket_url: String,
@@ -129,6 +133,8 @@ pub struct OneBotAdapterImpl {
     acceptance_service: Arc<MessageAcceptanceService>,
     /// C2-4: BindingManager for active character determination
     binding_manager: Arc<BindingManager>,
+    /// 入站硬拦截：用户或群组在有效黑名单中时不进入命令、消息和插件链路。
+    blacklist_repo: Option<Arc<dyn BlacklistRepository>>,
     /// 共享的连接状态与出站通道。
     shared: ConnectionShared,
     /// 出站接收端（在 `start` 时被连接循环接管）。
@@ -194,6 +200,7 @@ impl OneBotAdapterImpl {
             conversation_manager,
             acceptance_service,
             binding_manager,
+            blacklist_repo: None,
             shared,
             outbound_rx: Mutex::new(Some(outbound_rx)),
             event_rx: Mutex::new(Some(event_rx)),
@@ -202,6 +209,12 @@ impl OneBotAdapterImpl {
             started: AtomicBool::new(false),
             connector,
         }
+    }
+
+    /// 装配入站黑名单仓储。测试和不需要持久黑名单的调用方可保持默认关闭。
+    pub fn with_blacklist_repo(mut self, repo: Arc<dyn BlacklistRepository>) -> Self {
+        self.blacklist_repo = Some(repo);
+        self
     }
 }
 
@@ -249,6 +262,7 @@ impl OneBotAdapter for OneBotAdapterImpl {
             bus: self.bus.clone(),
             acceptance_service: self.acceptance_service.clone(),
             binding_manager: self.binding_manager.clone(),
+            blacklist_repo: self.blacklist_repo.clone(),
         };
         tokio::spawn(async move { processor.run().await });
 
@@ -287,13 +301,19 @@ impl OneBotAdapter for OneBotAdapterImpl {
 }
 
 impl OneBotAdapterImpl {
+    /// 查询平台上的单条消息，用于核查发送结果未知的任务。
+    pub async fn get_message(&self, message_id: i64) -> Result<ActionResponse, RuntimeError> {
+        self.send_action(build_get_message_request(message_id))
+            .await
+    }
+
     /// 发送一个 Action 请求，等待 NapCat 响应。
     ///
     /// 流程：注册 pending 请求 → 发送 WebSocket 帧 → 等待响应或超时 → 清理 pending。
     async fn send_action(&self, request: OutgoingRequest) -> Result<ActionResponse, RuntimeError> {
         // 仅在已连接状态下才能发送。
         if self.shared.state().await != OneBotConnectionState::Connected {
-            return Err(RuntimeError::Adapter(
+            return Err(RuntimeError::SendRejected(
                 "OneBot 未连接，暂时无法发送消息".to_string(),
             ));
         }
@@ -308,15 +328,15 @@ impl OneBotAdapterImpl {
             "echo": id.to_string(),
         });
         let text = serde_json::to_string(&frame)
-            .map_err(|_e| RuntimeError::Adapter("serialization failed".to_string()))?;
+            .map_err(|_e| RuntimeError::SendRejected("消息序列化失败".to_string()))?;
 
         // 发送到出站 channel。
-        let _ = self
-            .shared
-            .outbound_tx
-            .send(text)
-            .await
-            .map_err(|_e| RuntimeError::Adapter("outbound closed".to_string()));
+        if self.shared.outbound_tx.send(text).await.is_err() {
+            self.shared.pending.lock().unwrap().remove(&id);
+            return Err(RuntimeError::SendRejected(
+                "出站通道已关闭，消息未发送".to_string(),
+            ));
+        }
 
         // 等待 NapCat 响应或超时。
         let timeout = Duration::from_secs(self.shared.request_timeout_secs);
@@ -332,7 +352,7 @@ impl OneBotAdapterImpl {
             }
             Ok(Err(_)) => {
                 // oneshot 被 drop（请求被清理，如连接断开时 cleanup_timed_out_requests）
-                Err(RuntimeError::Adapter(
+                Err(RuntimeError::SendUnknown(
                     "请求被清理（连接已断开）".to_string(),
                 ))
             }
@@ -341,7 +361,7 @@ impl OneBotAdapterImpl {
                 // 超时后响应仍可能到达，但调用方已不再等待，所以安全清理。
                 self.shared.pending.lock().unwrap().remove(&id);
                 tracing::warn!(target: "adapter", id, "action request timeout");
-                Err(RuntimeError::Adapter(format!(
+                Err(RuntimeError::SendUnknown(format!(
                     "等待 NapCat 响应超时（{} 秒）",
                     timeout.as_secs()
                 )))
@@ -359,6 +379,7 @@ struct InboundProcessor {
     bus: EventBus,
     acceptance_service: Arc<MessageAcceptanceService>,
     binding_manager: Arc<BindingManager>,
+    blacklist_repo: Option<Arc<dyn BlacklistRepository>>,
 }
 
 impl InboundProcessor {
@@ -390,6 +411,41 @@ impl InboundProcessor {
                 return;
             }
         };
+
+        // 黑名单必须在 resolve 之前检查。resolve 会按需创建会话和参与者，
+        // 否则首次来自被拉黑目标的消息仍会留下身份记录。
+        if let Some(blacklist_repo) = &self.blacklist_repo {
+            let user_blocked = match blacklist_repo
+                .is_blacklisted(&inbound.external_sender_id, BlacklistType::User)
+                .await
+            {
+                Ok(blocked) => blocked,
+                Err(error) => {
+                    tracing::warn!(target: "adapter", %error, "查询用户黑名单失败，拒绝本条入站消息");
+                    return;
+                }
+            };
+            if user_blocked {
+                tracing::info!(target: "adapter", sender_id = %inbound.external_sender_id, "用户处于黑名单，忽略入站消息");
+                return;
+            }
+            if inbound.conversation_type == crate::domain::conversation::ConversationType::Group {
+                let group_blocked = match blacklist_repo
+                    .is_blacklisted(&inbound.external_conversation_id, BlacklistType::Group)
+                    .await
+                {
+                    Ok(blocked) => blocked,
+                    Err(error) => {
+                        tracing::warn!(target: "adapter", %error, "查询群组黑名单失败，拒绝本条入站消息");
+                        return;
+                    }
+                };
+                if group_blocked {
+                    tracing::info!(target: "adapter", group_id = %inbound.external_conversation_id, "群组处于黑名单，忽略入站消息");
+                    return;
+                }
+            }
+        }
 
         // 解析外部 ID → 核心 ID。
         let resolved = match self
@@ -462,38 +518,40 @@ impl InboundProcessor {
         let character_id = sorted[0].character_id;
 
         // C2-4: 调用 MessageAcceptanceService 进行 durable acceptance
-        let timestamp = chrono::DateTime::from_timestamp(inbound.unix_time, 0)
-            .unwrap_or_else(chrono::Utc::now);
+        let timestamp =
+            chrono::DateTime::from_timestamp(inbound.unix_time, 0).unwrap_or_else(chrono::Utc::now);
         let acceptance_result = self
             .acceptance_service
-            .accept(
+            .accept_inbound(
                 conversation_id,
                 sender_id,
                 inbound.content.clone(),
                 timestamp,
                 Some(inbound.platform_message_id),
                 character_id,
+                inbound.is_mentioned,
+                serde_json::json!({"author_kind":"user","external_sender_id":inbound.external_sender_id,"display_name":inbound.display_name,"mentions":inbound.mention_targets,"reply_to":inbound.reply_to,"content_metadata":inbound.content_metadata,"binding_id":sorted[0].id,"binding_version":sorted[0].switched_at}),
             )
             .await;
 
         let (message_id, conversation_sequence) = match acceptance_result {
             Ok(result) => result,
             Err(e) => {
-            // Acceptance 失败是严重的——消息未被持久化但入站已接收
-            // 记录错误并继续（不能 silence drop）
-            tracing::error!(
-                target: "adapter",
-                error = %e,
-                conversation_id,
-                sender_id,
-                character_id,
-                "MessageAcceptanceService.accept() 失败，消息未持久化"
-            );
-            return;
-        }
-    };
+                // Acceptance 失败是严重的——消息未被持久化但入站已接收
+                // 记录错误并继续（不能 silence drop）
+                tracing::error!(
+                    target: "adapter",
+                    error = %e,
+                    conversation_id,
+                    sender_id,
+                    character_id,
+                    "MessageAcceptanceService.accept() 失败，消息未持久化"
+                );
+                return;
+            }
+        };
 
-    tracing::debug!(
+        tracing::debug!(
             target: "adapter",
             conversation_id,
             sender_id,
@@ -503,29 +561,13 @@ impl InboundProcessor {
             "C2-4: MessageAcceptanceService.accept() 成功"
         );
 
-        // C2-4: MessageReceived 仍然发布到 EventBus（为保持插件兼容），
-        // 但现在 character_id 和 conversation_sequence 由 acceptance 填充
-        let event_out = CoreEvent::MessageReceived(MessageReceivedEvent {
-            conversation_id,
-            sender_id,
-            message_id: inbound.platform_message_id,
-            content: inbound.content,
-            timestamp,
-            is_mentioned: inbound.is_mentioned,
-            // C2-4: 由 acceptance 填充的 authoritative 值
-            character_id,
-            conversation_sequence,
-            platform_message_id: Some(inbound.platform_message_id),
-            ingested_at: chrono::Utc::now(),
-        });
-
-        let receivers = self.bus.publish(&event_out);
         tracing::info!(
             target: "adapter",
             conversation_id,
             sender_id,
-            receivers,
-            "C2-4: 入站消息已通过 Acceptance 并发布为核心事件"
+            message_id,
+            conversation_sequence,
+            "C2-4: 入站消息已通过 Acceptance；canonical MessageAccepted 事件由事务入口发布"
         );
     }
 }
@@ -551,11 +593,11 @@ mod tests {
     use crate::application::conversation::ConversationManager;
     use crate::application::event_bus::EventSubscription;
     use crate::application::message_acceptance::MessageAcceptanceService;
-    use crate::domain::character::CharacterBinding;
     use crate::domain::conversation::{Conversation, Participant};
     use crate::domain::event::Command;
     use crate::domain::repository::{
-        CharacterBindingRepository, CharacterRepository, ConversationRepository, MessageRepository, ParticipantRepository,
+        CharacterBindingRepository, CharacterRepository, ConversationRepository, MessageRepository,
+        ParticipantRepository,
     };
     use crate::error::RepositoryError;
     use async_trait::async_trait;
@@ -633,6 +675,7 @@ mod tests {
             Arc::new(MemParticipantRepo),
         );
         let (_event_tx, event_rx) = mpsc::channel(8);
+        let bus = EventBus::new();
 
         // C2-4: 使用内存仓储创建真实的 MessageAcceptanceService 和 BindingManager
         let mem_msg_repo: Arc<MemMessageRepo> = Arc::new(MemMessageRepo::new());
@@ -641,20 +684,23 @@ mod tests {
 
         let acceptance_service = MessageAcceptanceService::new(
             mem_msg_repo.clone() as Arc<dyn MessageRepository>,
-            EventBus::new(),
+            bus.clone(),
         );
         let binding_manager = BindingManager::new(
             mem_binding_repo as Arc<dyn CharacterBindingRepository>,
             mem_char_repo as Arc<dyn CharacterRepository>,
-            Arc::new(MemConversationRepo { convs: StdMutex::new(vec![]) }) as Arc<dyn ConversationRepository>,
+            Arc::new(MemConversationRepo {
+                convs: StdMutex::new(vec![]),
+            }) as Arc<dyn ConversationRepository>,
         );
 
         InboundProcessor {
             event_rx,
             conversation_manager,
-            bus: EventBus::new(),
+            bus,
             acceptance_service: Arc::new(acceptance_service),
             binding_manager: Arc::new(binding_manager),
+            blacklist_repo: None,
         }
     }
 
@@ -675,13 +721,21 @@ mod tests {
     }
     #[async_trait]
     impl MessageRepository for MemMessageRepo {
-        async fn find_by_id(&self, id: i64) -> Result<Option<crate::domain::message::Message>, RepositoryError> {
+        async fn find_by_id(
+            &self,
+            id: i64,
+        ) -> Result<Option<crate::domain::message::Message>, RepositoryError> {
             let msgs = self.messages.lock().unwrap();
             Ok(msgs.iter().find(|m| m.id == id).cloned())
         }
-        async fn find_recent(&self, conversation_id: i64, limit: i64) -> Result<Vec<crate::domain::message::Message>, RepositoryError> {
+        async fn find_recent(
+            &self,
+            conversation_id: i64,
+            limit: i64,
+        ) -> Result<Vec<crate::domain::message::Message>, RepositoryError> {
             let msgs = self.messages.lock().unwrap();
-            let mut result: Vec<_> = msgs.iter()
+            let mut result: Vec<_> = msgs
+                .iter()
                 .filter(|m| m.conversation_id == conversation_id)
                 .take(limit as usize)
                 .cloned()
@@ -689,17 +743,29 @@ mod tests {
             result.reverse();
             Ok(result)
         }
-        async fn find_recent_attributed(&self, conversation_id: i64, character_id: i64, limit: i64) -> Result<Vec<crate::domain::message::Message>, RepositoryError> {
+        async fn find_recent_attributed(
+            &self,
+            conversation_id: i64,
+            character_id: i64,
+            limit: i64,
+        ) -> Result<Vec<crate::domain::message::Message>, RepositoryError> {
             let msgs = self.messages.lock().unwrap();
-            let mut result: Vec<_> = msgs.iter()
-                .filter(|m| m.conversation_id == conversation_id && m.active_character_id == Some(character_id))
+            let mut result: Vec<_> = msgs
+                .iter()
+                .filter(|m| {
+                    m.conversation_id == conversation_id
+                        && m.active_character_id == Some(character_id)
+                })
                 .take(limit as usize)
                 .cloned()
                 .collect();
             result.reverse();
             Ok(result)
         }
-        async fn insert(&self, msg: &crate::domain::message::Message) -> Result<i64, RepositoryError> {
+        async fn insert(
+            &self,
+            msg: &crate::domain::message::Message,
+        ) -> Result<i64, RepositoryError> {
             let mut msgs = self.messages.lock().unwrap();
             let mut next_id = self.next_id.lock().unwrap();
             let mut m = msg.clone();
@@ -708,39 +774,76 @@ mod tests {
             msgs.push(m);
             Ok(msg.id)
         }
-        async fn latest_message_time(&self, conversation_id: i64) -> Result<Option<chrono::DateTime<chrono::Utc>>, RepositoryError> {
+        async fn latest_message_time(
+            &self,
+            conversation_id: i64,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, RepositoryError> {
             let msgs = self.messages.lock().unwrap();
-            Ok(msgs.iter().filter(|m| m.conversation_id == conversation_id).map(|m| m.timestamp).max())
+            Ok(msgs
+                .iter()
+                .filter(|m| m.conversation_id == conversation_id)
+                .map(|m| m.timestamp)
+                .max())
         }
-        async fn update_active_character_id(&self, message_id: i64, active_character_id: i64) -> Result<(), RepositoryError> {
+        async fn update_active_character_id(
+            &self,
+            message_id: i64,
+            active_character_id: i64,
+        ) -> Result<(), RepositoryError> {
             let mut msgs = self.messages.lock().unwrap();
             if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
                 m.active_character_id = Some(active_character_id);
             }
             Ok(())
         }
-        async fn find_by_conversation_sender_time_content(&self, conversation_id: i64, sender_id: i64, timestamp: chrono::DateTime<chrono::Utc>, content: &str) -> Result<Option<crate::domain::message::Message>, RepositoryError> {
+        async fn find_by_conversation_sender_time_content(
+            &self,
+            conversation_id: i64,
+            sender_id: i64,
+            timestamp: chrono::DateTime<chrono::Utc>,
+            content: &str,
+        ) -> Result<Option<crate::domain::message::Message>, RepositoryError> {
             let msgs = self.messages.lock().unwrap();
-            Ok(msgs.iter().find(|m| {
-                m.conversation_id == conversation_id &&
-                m.sender_id == sender_id &&
-                m.timestamp == timestamp &&
-                serde_json::to_string(&m.content).map(|c| c == content).unwrap_or(false)
-            }).cloned())
+            Ok(msgs
+                .iter()
+                .find(|m| {
+                    m.conversation_id == conversation_id
+                        && m.sender_id == sender_id
+                        && m.timestamp == timestamp
+                        && serde_json::to_string(&m.content)
+                            .map(|c| c == content)
+                            .unwrap_or(false)
+                })
+                .cloned())
         }
-        async fn find_before_sequence(&self, conversation_id: i64, character_id: i64, before_sequence: i64, limit: i64) -> Result<Vec<crate::domain::message::Message>, RepositoryError> {
+        async fn find_before_sequence(
+            &self,
+            conversation_id: i64,
+            _character_id: i64,
+            before_sequence: i64,
+            limit: i64,
+        ) -> Result<Vec<crate::domain::message::Message>, RepositoryError> {
             let msgs = self.messages.lock().unwrap();
-            let mut result: Vec<_> = msgs.iter()
-                .filter(|m| m.conversation_id == conversation_id && m.conversation_sequence < Some(before_sequence))
+            let mut result: Vec<_> = msgs
+                .iter()
+                .filter(|m| {
+                    m.conversation_id == conversation_id
+                        && m.conversation_sequence < Some(before_sequence)
+                })
                 .take(limit as usize)
                 .cloned()
                 .collect();
             result.reverse();
             Ok(result)
         }
-        async fn find_recent_by_sequence(&self, conversation_id: i64, limit: i64) -> Result<Vec<crate::domain::message::Message>, RepositoryError> {
+        async fn find_recent_by_sequence(
+            &self,
+            conversation_id: i64,
+            limit: i64,
+        ) -> Result<Vec<crate::domain::message::Message>, RepositoryError> {
             let msgs = self.messages.lock().unwrap();
-            let mut result: Vec<_> = msgs.iter()
+            let mut result: Vec<_> = msgs
+                .iter()
                 .filter(|m| m.conversation_id == conversation_id)
                 .take(limit as usize)
                 .cloned()
@@ -750,35 +853,30 @@ mod tests {
         }
         async fn accept_message(
             &self,
-            conversation_id: i64,
-            sender_id: i64,
-            content_json: &str,
-            timestamp: &str,
-            platform_message_id: Option<i64>,
-            character_id: i64,
-            _event_uuid: &str,
-            _outbox_payload: &str,
+            input: &crate::domain::repository::AcceptedMessageInput,
         ) -> Result<(i64, i64, chrono::DateTime<chrono::Utc>), RepositoryError> {
             use chrono::DateTime;
-            let timestamp_dt = DateTime::parse_from_rfc3339(timestamp)
+            let timestamp_dt = DateTime::parse_from_rfc3339(&input.timestamp)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now());
-            let content: crate::domain::message::MessageContent = serde_json::from_str(content_json)
-                .unwrap_or(crate::domain::message::MessageContent::Text(content_json.to_string()));
+            let content: crate::domain::message::MessageContent =
+                serde_json::from_str(&input.content_json).unwrap_or(
+                    crate::domain::message::MessageContent::Text(input.content_json.clone()),
+                );
             let ingested_at = chrono::Utc::now();
             let conversation_sequence = 1;
             let mut msg = crate::domain::message::Message {
                 id: 0,
-                conversation_id,
-                sender_id,
+                conversation_id: input.conversation_id,
+                sender_id: input.sender_id,
                 content,
                 timestamp: timestamp_dt,
                 reply_to: None,
                 mentions: vec![],
                 attachments: vec![],
                 metadata: serde_json::json!({}),
-                active_character_id: Some(character_id),
-                platform_message_id,
+                active_character_id: Some(input.character_id),
+                platform_message_id: input.platform_message_id,
                 conversation_sequence: Some(conversation_sequence),
                 occurred_at: Some(timestamp_dt),
                 ingested_at: Some(ingested_at),
@@ -796,28 +894,35 @@ mod tests {
     }
 
     /// 内存角色仓储（测试用）
-    struct MemCharacterRepo {
-        characters: StdMutex<Vec<crate::domain::character::Character>>,
-    }
+    struct MemCharacterRepo;
     impl MemCharacterRepo {
         fn new() -> Self {
-            Self {
-                characters: StdMutex::new(vec![]),
-            }
+            Self
         }
     }
     #[async_trait]
     impl CharacterRepository for MemCharacterRepo {
-        async fn find_by_id(&self, _id: i64) -> Result<Option<crate::domain::character::Character>, RepositoryError> {
+        async fn find_by_id(
+            &self,
+            _id: i64,
+        ) -> Result<Option<crate::domain::character::Character>, RepositoryError> {
             Ok(None)
         }
-        async fn find_all(&self) -> Result<Vec<crate::domain::character::Character>, RepositoryError> {
+        async fn find_all(
+            &self,
+        ) -> Result<Vec<crate::domain::character::Character>, RepositoryError> {
             Ok(vec![])
         }
-        async fn insert(&self, _c: &crate::domain::character::Character) -> Result<i64, RepositoryError> {
+        async fn insert(
+            &self,
+            _c: &crate::domain::character::Character,
+        ) -> Result<i64, RepositoryError> {
             Ok(1)
         }
-        async fn update(&self, _c: &crate::domain::character::Character) -> Result<(), RepositoryError> {
+        async fn update(
+            &self,
+            _c: &crate::domain::character::Character,
+        ) -> Result<(), RepositoryError> {
             Ok(())
         }
         async fn delete(&self, _id: i64) -> Result<(), RepositoryError> {
@@ -850,24 +955,104 @@ mod tests {
             }
         }
     }
+
+    struct MemBlacklistRepo {
+        blocked: bool,
+    }
+
     #[async_trait]
-    impl CharacterBindingRepository for MemBindingRepo {
-        async fn find_by_character_id(&self, _character_id: i64) -> Result<Vec<crate::domain::character::CharacterBinding>, RepositoryError> {
-            Ok(self.bindings.lock().unwrap().clone())
-        }
-        async fn find_by_conversation_id(&self, _conversation_id: i64) -> Result<Vec<crate::domain::character::CharacterBinding>, RepositoryError> {
-            Ok(self.bindings.lock().unwrap().clone())
-        }
-        async fn find_all(&self) -> Result<Vec<crate::domain::character::CharacterBinding>, RepositoryError> {
+    impl crate::domain::repository::BlacklistRepository for MemBlacklistRepo {
+        async fn find_all(
+            &self,
+        ) -> Result<Vec<crate::domain::blacklist::BlacklistEntry>, RepositoryError> {
             Ok(vec![])
         }
-        async fn find_all_enabled(&self) -> Result<Vec<crate::domain::character::CharacterBinding>, RepositoryError> {
-            Ok(vec![])
+
+        async fn find_by_target(
+            &self,
+            _target: &str,
+            _target_type: crate::domain::blacklist::BlacklistType,
+        ) -> Result<Option<crate::domain::blacklist::BlacklistEntry>, RepositoryError> {
+            Ok(None)
         }
-        async fn insert(&self, _b: &crate::domain::character::CharacterBinding) -> Result<i64, RepositoryError> {
+
+        async fn is_blacklisted(
+            &self,
+            _target: &str,
+            _target_type: crate::domain::blacklist::BlacklistType,
+        ) -> Result<bool, RepositoryError> {
+            Ok(self.blocked)
+        }
+
+        async fn insert(
+            &self,
+            _entry: &crate::domain::blacklist::NewBlacklistEntry,
+        ) -> Result<i64, RepositoryError> {
             Ok(1)
         }
-        async fn update(&self, _b: &crate::domain::character::CharacterBinding) -> Result<(), RepositoryError> {
+
+        async fn update_reason(
+            &self,
+            _id: i64,
+            _reason: Option<String>,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+
+        async fn set_expiration(
+            &self,
+            _id: i64,
+            _expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _id: i64) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+
+        async fn delete_by_target(
+            &self,
+            _target: &str,
+            _target_type: crate::domain::blacklist::BlacklistType,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+    #[async_trait]
+    impl CharacterBindingRepository for MemBindingRepo {
+        async fn find_by_character_id(
+            &self,
+            _character_id: i64,
+        ) -> Result<Vec<crate::domain::character::CharacterBinding>, RepositoryError> {
+            Ok(self.bindings.lock().unwrap().clone())
+        }
+        async fn find_by_conversation_id(
+            &self,
+            _conversation_id: i64,
+        ) -> Result<Vec<crate::domain::character::CharacterBinding>, RepositoryError> {
+            Ok(self.bindings.lock().unwrap().clone())
+        }
+        async fn find_all(
+            &self,
+        ) -> Result<Vec<crate::domain::character::CharacterBinding>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn find_all_enabled(
+            &self,
+        ) -> Result<Vec<crate::domain::character::CharacterBinding>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn insert(
+            &self,
+            _b: &crate::domain::character::CharacterBinding,
+        ) -> Result<i64, RepositoryError> {
+            Ok(1)
+        }
+        async fn update(
+            &self,
+            _b: &crate::domain::character::CharacterBinding,
+        ) -> Result<(), RepositoryError> {
             Ok(())
         }
         async fn delete(&self, _id: i64) -> Result<(), RepositoryError> {
@@ -954,9 +1139,9 @@ mod tests {
         }
     }
 
-    /// 普通消息（不含指令前缀）→ 仍发布 MessageReceived（回归保障）。
+    /// 普通消息（不含指令前缀）→ 发布持久化后的 MessageAccepted。
     #[tokio::test]
-    async fn normal_message_still_published_as_message_received() {
+    async fn normal_message_publishes_message_accepted_once() {
         let p = processor();
         let mut sub = p.bus.subscribe();
 
@@ -965,8 +1150,8 @@ mod tests {
         let events = drain(&mut sub);
         assert_eq!(events.len(), 1, "普通消息应只发布一条事件");
         assert!(
-            matches!(&events[0], CoreEvent::MessageReceived(e) if e.content == "你好"),
-            "普通消息应发布 MessageReceived，实际 {:?}",
+            matches!(&events[0], CoreEvent::MessageAccepted(e) if e.content == "你好"),
+            "普通消息应发布 MessageAccepted，实际 {:?}",
             events[0]
         );
     }
@@ -996,7 +1181,18 @@ mod tests {
         }
     }
 
-    /// 群聊未 at 的"换角色 木然" → 不识别，继续发布 MessageReceived。
+    #[tokio::test]
+    async fn blacklisted_inbound_message_is_dropped_before_command_or_persistence() {
+        let mut p = processor();
+        p.blacklist_repo = Some(Arc::new(MemBlacklistRepo { blocked: true }));
+        let mut sub = p.bus.subscribe();
+
+        p.handle_raw(&group_message_json("你好", false)).await;
+
+        assert!(drain(&mut sub).is_empty(), "黑名单消息不得发布任何核心事件");
+    }
+
+    /// 群聊未 at 的"换角色 木然" → 不识别，继续走普通持久化消息路径。
     #[tokio::test]
     async fn group_command_without_mention_not_intercepted() {
         let p = processor();
@@ -1008,8 +1204,8 @@ mod tests {
         let events = drain(&mut sub);
         assert_eq!(events.len(), 1, "未 @ 的群聊消息应走普通路径");
         assert!(
-            matches!(&events[0], CoreEvent::MessageReceived(e) if e.content == "换角色 木然"),
-            "未 @ 的群聊指令应发布 MessageReceived，实际 {:?}",
+            matches!(&events[0], CoreEvent::MessageAccepted(e) if e.content == "换角色 木然"),
+            "未 @ 的群聊指令应发布 MessageAccepted，实际 {:?}",
             events[0]
         );
     }

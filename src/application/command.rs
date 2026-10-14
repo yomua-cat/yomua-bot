@@ -63,6 +63,7 @@ pub struct CommandHandler {
     character_repo: Arc<dyn CharacterRepository>,
     action_dispatcher: Arc<ActionDispatcher>,
     admin_users: Option<Vec<String>>,
+    live_settings: Option<tokio::sync::watch::Receiver<crate::application::config::RuntimeConfig>>,
 }
 
 impl CommandHandler {
@@ -77,7 +78,16 @@ impl CommandHandler {
             character_repo,
             action_dispatcher,
             admin_users,
+            live_settings: None,
         }
+    }
+
+    pub fn with_live_settings(
+        mut self,
+        settings: tokio::sync::watch::Receiver<crate::application::config::RuntimeConfig>,
+    ) -> Self {
+        self.live_settings = Some(settings);
+        self
     }
 
     /// 从事件总线持续消费并处理 `CommandReceived`。
@@ -96,7 +106,12 @@ impl CommandHandler {
     /// 处理一条指令：权限校验 → 执行 → 中文结果回复。
     pub async fn handle(&self, event: &CommandReceivedEvent) -> Result<(), RuntimeError> {
         // 1. 权限校验：非管理员直接中文拒绝（不执行）。
-        if !is_admin(&event.external_sender_id, self.admin_users.as_deref()) {
+        let administrators = self
+            .live_settings
+            .as_ref()
+            .map(|settings| settings.borrow().admin_users.clone())
+            .unwrap_or_else(|| self.admin_users.clone());
+        if !is_admin(&event.external_sender_id, administrators.as_deref()) {
             self.reply(event.conversation_id, "你没有权限执行该指令。")
                 .await?;
             return Ok(());
@@ -460,7 +475,7 @@ mod tests {
                 created_at: Utc::now(),
             }]),
         });
-        let participant_repo = Arc::new(MemParticipantRepo {
+        let _participant_repo = Arc::new(MemParticipantRepo {
             participants: Mutex::new(vec![]),
         });
 

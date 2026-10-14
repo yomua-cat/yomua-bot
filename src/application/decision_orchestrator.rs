@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use crate::domain::behavior::BehaviorDecision;
 // Re-export for use by application layers (main, reply_processor)
+pub use crate::application::decision_pipeline::DecisionLlmPipeline;
 pub use crate::domain::decision::{
-    DecisionEvaluator, DecisionLlmPipeline, DecisionLlmService, DecisionResult,
-    DecisionResultValidator, LlmAssistance, LlmAssistanceTrigger, NoOpTrigger,
+    DecisionEvaluator, DecisionLlmService, DecisionResult, DecisionResultValidator, LlmAssistance,
+    LlmAssistanceTrigger, NoOpTrigger,
 };
 
 #[cfg(test)]
@@ -113,7 +114,7 @@ impl DecisionOrchestrator {
                     match pipeline.execute(&ctx, &built_in).await {
                         Ok(result) => {
                             // LLM 成功 → 应用 override
-                            Ok(self.apply_override(result, built_in))
+                            Ok(self.apply_override(result, built_in, &ctx))
                         }
                         Err(_) => {
                             // LLM 全部失败 → 返回原始
@@ -134,6 +135,7 @@ impl DecisionOrchestrator {
         &self,
         result: DecisionResult,
         built_in: BuiltInDecision,
+        context: &DecisionContext,
     ) -> BehaviorDecision {
         use DecisionAction::*;
         let mut behavior = built_in.behavior.clone();
@@ -143,10 +145,21 @@ impl DecisionOrchestrator {
                 // 无 override
             }
             SuggestReply => {
-                behavior.action = crate::domain::behavior::BehaviorAction::Reply;
+                if !context.behavior_config.in_mute_window {
+                    behavior.action = crate::domain::behavior::BehaviorAction::Reply;
+                }
             }
             SuggestIgnore => {
-                behavior.action = crate::domain::behavior::BehaviorAction::Ignore;
+                let explicitly_mentioned = matches!(
+                    context.situation,
+                    DecisionSituation::Response {
+                        is_mentioned: true,
+                        ..
+                    }
+                );
+                if !explicitly_mentioned {
+                    behavior.action = crate::domain::behavior::BehaviorAction::Ignore;
+                }
             }
             AdjustDelay { delta_ms } => {
                 let new_delay = (behavior.delay_ms as i64 + delta_ms).max(0) as u64;
@@ -174,17 +187,11 @@ impl DecisionOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::clock::Clock;
     use crate::domain::behavior::{BehaviorAction, CognitionLevel, Priority};
     use crate::domain::character::{CharacterBinding, ReplyMode};
-    use crate::domain::emotion::Mood;
     use crate::domain::relationship::Relationship;
-    use crate::domain::repository::BehaviorStateRepository;
-    use crate::error::RepositoryError;
     use async_trait::async_trait;
-    use chrono::{DateTime, Utc};
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+    use chrono::Utc;
 
     /// 假的 AlwaysRequiredTrigger——强制走 LLM path。
     pub struct AlwaysRequiredTrigger;
@@ -303,6 +310,7 @@ mod tests {
                 message_content: "hello".to_string(),
                 is_mentioned: true,
                 participant_id: Some(1),
+                in_mute_window: false,
                 evaluated_at: Utc::now(),
             },
         }
@@ -391,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn primary_success_suggest_reply_overrides_ignore() {
-        // Original is Reply, LLM suggests Ignore
+        // Original is Reply for an explicitly mentioned message; LLM cannot suppress it.
         let output = sample_output();
         let evaluator = Arc::new(MockDecisionEvaluator { output });
         let trigger = Arc::new(AlwaysRequiredTrigger);
@@ -414,8 +422,8 @@ mod tests {
             .await
             .unwrap();
 
-        // LLM suggests Ignore, override should apply
-        assert_eq!(result.action, BehaviorAction::Ignore);
+        // Hard mention constraint wins over the advisory override.
+        assert_eq!(result.action, BehaviorAction::Reply);
     }
 
     // -------------------------------------------------------------------------

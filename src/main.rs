@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify, RwLock};
 use tracing_subscriber::EnvFilter;
 
 use yomua_bot::adapters::onebot::{OneBotAdapter, OneBotAdapterImpl};
@@ -25,22 +25,23 @@ use yomua_bot::application::cognition::CognitionLayer;
 use yomua_bot::application::cognition_driver::CognitionDriver;
 use yomua_bot::application::command::CommandHandler;
 use yomua_bot::application::config::{
-    load_llm, load_onebot, load_runtime, validate_runtime, write_template_if_missing, LlmConfig,
-    LlmModelInstanceConfig, LLM_TEMPLATE, ONEBOT_TEMPLATE, RUNTIME_TEMPLATE,
+    load_runtime, write_template_if_missing, ConfigurationBundle, DecisionConfig, LlmConfig,
+    DECISION_TEMPLATE, LLM_TEMPLATE, ONEBOT_TEMPLATE, RUNTIME_TEMPLATE,
 };
 use yomua_bot::application::context::ContextBuilder;
 use yomua_bot::application::context_assembler::{
     ContextAssembler, ModelCapabilitiesProviderAdapter, TokenEstimatorAdapter,
 };
-use yomua_bot::application::control::{start_control_service, CommandRegistry, RuntimeHandle};
+use yomua_bot::application::control::{
+    start_control_service, CommandRegistry, RuntimeHandle, ShutdownResult,
+};
 use yomua_bot::application::conversation::ConversationManager;
 use yomua_bot::application::decision_orchestrator::{
-    DecisionEvaluator, DecisionOrchestrator, LlmAssistanceTrigger, NoOpTrigger,
+    DecisionEvaluator, DecisionLlmPipeline, DecisionOrchestrator, LlmAssistanceTrigger,
 };
 use yomua_bot::application::event_bus::EventBus;
-use yomua_bot::application::event_processor::EventProcessor;
 use yomua_bot::application::llm_scheduler::{
-    DefaultLlmScheduler, EmbeddingScheduler, LlmScheduler,
+    DefaultLlmScheduler, EmbeddingScheduler, LlmRouteConfig, LlmScheduler,
 };
 use yomua_bot::application::memory_service::MemoryService;
 use yomua_bot::application::message_acceptance::MessageAcceptanceService;
@@ -49,6 +50,7 @@ use yomua_bot::application::outbox_dispatcher::{OutboxDispatcher, OutboxDispatch
 use yomua_bot::application::outbox_processor::OutboxProcessor;
 use yomua_bot::application::plugin_api::PluginApi;
 use yomua_bot::application::proactive::ProactiveDriver;
+use yomua_bot::application::proactive::ProactiveReplyScheduler;
 use yomua_bot::application::relationship_service::RelationshipService;
 use yomua_bot::application::reply_processor::{DelayExecutor, ReplyProcessor, TokioDelayExecutor};
 use yomua_bot::application::runtime::CharacterRuntime;
@@ -56,6 +58,10 @@ use yomua_bot::application::session_service::SessionService;
 use yomua_bot::domain::behavior::BehaviorEngine;
 use yomua_bot::domain::character::ReplyMode;
 use yomua_bot::domain::conversation::ConversationType;
+use yomua_bot::domain::decision::{
+    DecisionLlmServiceImpl, DecisionResultValidator, DefaultOverridePolicy, HeuristicTrigger,
+    NoOpTrigger,
+};
 use yomua_bot::domain::repository::{
     BehaviorStateRepository, BlacklistRepository, CharacterBindingRepository, CharacterRepository,
     CharacterStateRepository, ConversationRepository, ConversationStateRepository,
@@ -85,143 +91,45 @@ use yomua_bot::infrastructure::storage::SqliteStorage;
 const RUNTIME_CONFIG: &str = "runtime.toml";
 const ONEBOT_CONFIG: &str = "onebot.toml";
 const LLM_CONFIG: &str = "llm.toml";
+const DECISION_CONFIG: &str = "decision.toml";
+/// 默认配置目录。相对于启动目录解析，部署时启动目录应为项目/服务根目录。
+const DEFAULT_CONFIG_DIR: &str = "config";
 
-/// 从 `LlmConfig` 读取模型能力配置。
-///
-/// 从 `options` 中读取：
-/// - `context_window`: 模型的上下文窗口大小（必须配置）
-/// - `max_output_tokens`: 模型的最大输出 token 数（可选）
-/// - `output_reservation`: 为输出预留的 input context 空间（可选，默认 512）
-fn read_llm_capabilities(cfg: &LlmConfig) -> (Option<usize>, Option<usize>, usize) {
-    let options = &cfg.options;
-
-    let context_window = options
-        .get("context_window")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
-
-    let max_output_tokens = options
-        .get("max_output_tokens")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
-
-    // output_reservation 必须为正数
-    let output_reservation = options
-        .get("output_reservation")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(512); // 默认值
-
-    (context_window, max_output_tokens, output_reservation)
-}
-
-/// 使用 `llm_cfg.model_instances` 和 `llm_cfg.roles` 构建多 Provider 调度器。
-///
-/// 架构：
-/// ```text
-/// llm_cfg.roles (role -> model_instance name)
-///     ↓
-/// llm_cfg.model_instances (model_instance name -> provider + model + capabilities)
-///     ↓
-/// llm_cfg.providers (provider name -> HTTP transport)
-/// ```
-fn build_multi_provider_scheduler(
-    llm_cfg: LlmConfig,
-) -> Result<Arc<DefaultLlmScheduler>, RuntimeError> {
-    use std::collections::HashMap;
-
-    // Step 1: 构建 providers registry（name -> LlmProvider 实例）
-    let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-    for provider_name in llm_cfg.providers.keys() {
-        let p: Arc<dyn LlmProvider> = Arc::new(
-            build_openai_provider(llm_cfg.clone(), Some(provider_name)).map_err(|e| {
-                RuntimeError::Config(format!("LLM Provider '{}' 配置错误: {}", provider_name, e))
-            })?,
-        );
-        tracing::info!(target = "llm", name = provider_name, impl = p.name(), "Provider 已加载");
-        providers.insert(provider_name.clone(), p);
+/// 只使用已展开、已校验的模型路由；默认 Provider 来自 conversation。
+fn build_model_scheduler(
+    config: &LlmConfig,
+    decision_config: &DecisionConfig,
+) -> Result<Option<Arc<DefaultLlmScheduler>>, RuntimeError> {
+    let Some(mut resolved) = config.resolve()? else {
+        return Ok(None);
+    };
+    LlmConfig::apply_decision_config(&mut resolved, decision_config)?;
+    let mut providers = std::collections::HashMap::new();
+    for (name, config) in &resolved.providers {
+        let provider: Arc<dyn LlmProvider> = Arc::new(build_provider_from_config(config)?);
+        providers.insert(name.clone(), provider);
     }
-
-    // Step 2: 构建 model_instances registry（name -> LlmModelInstanceConfig）
-    let mut model_instances: HashMap<String, LlmModelInstanceConfig> = HashMap::new();
-    for (mi_name, mi_config) in &llm_cfg.model_instances {
-        if !providers.contains_key(&mi_config.provider) {
-            return Err(RuntimeError::Config(format!(
-                "ModelInstance '{}' 引用的 Provider '{}' 未注册",
-                mi_name, mi_config.provider,
-            )));
-        }
-        tracing::info!(
-            target = "llm",
-            instance = mi_name,
-            provider = %mi_config.provider,
-            model = %mi_config.model,
-            "ModelInstance 已加载",
-        );
-        model_instances.insert(mi_name.clone(), mi_config.clone());
-    }
-
-    // Step 3: 加载 Role -> ModelInstance 路由配置
-    let mut role_mis: HashMap<String, LlmModelInstanceConfig> = HashMap::new();
-    for (role_name, role_config) in &llm_cfg.roles {
-        let mi = model_instances
-            .get(&role_config.model_instance)
-            .ok_or_else(|| {
-                RuntimeError::Config(format!(
-                    "Role '{}' 引用的 ModelInstance '{}' 未注册",
-                    role_name, role_config.model_instance,
-                ))
-            })?;
-        tracing::info!(
-            target = "llm",
-            role = role_name,
-            model_instance = %role_config.model_instance,
-            provider = %mi.provider,
-            model = %mi.model,
-            "Role 路由已注册",
-        );
-        role_mis.insert(role_name.clone(), mi.clone());
-    }
-
-    if role_mis.is_empty() {
-        return Err(RuntimeError::Config("roles 配置为空".to_string()));
-    }
-
-    // Step 4: 取第一个 Role 对应的 Provider 作为默认 inner
-    let first_role = role_mis.keys().next().unwrap().clone();
-    let first_mi = &role_mis[&first_role];
-    let inner = providers.get(&first_mi.provider).unwrap();
-
-    // Step 5: 创建调度器
-    let scheduler = Arc::new(DefaultLlmScheduler::with_providers(
-        Arc::clone(inner),
-        4, // pending_limit
-        4, // embedding_limit
-        providers,
-        role_mis,
-    ));
-
-    tracing::info!(target = "llm", primary_role = %first_role, "LLM 多 Provider 调度器已初始化");
-    Ok(scheduler)
-}
-
-/// 从 `LlmConfig` 构造 OpenAI-compatible Provider。
-///
-/// 优先使用新格式 `providers[name]`；若不存在，则 fallback 到旧格式 `options`。
-/// 这确保向后兼容：已有 `llm.toml` 不需要修改即可工作。
-fn build_openai_provider(
-    cfg: LlmConfig,
-    name: Option<&str>,
-) -> Result<OpenAiCompatibleProvider, RuntimeError> {
-    // 新格式优先：从 providers registry 中查找
-    if let Some(key) = name.or(cfg.provider.as_deref()) {
-        if let Some(pc) = cfg.providers.get(key) {
-            return build_provider_from_config(pc);
-        }
-    }
-
-    // 旧格式 fallback：从 options 构建
-    build_from_options(&cfg.options, cfg.provider.as_deref())
+    let default = providers
+        .get(&resolved.default_provider)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Config("默认模型 Provider 不存在".to_string()))?;
+    let routes = resolved
+        .routes
+        .into_iter()
+        .map(|(role, route)| {
+            (
+                role,
+                LlmRouteConfig {
+                    models: route.models,
+                    max_attempts: route.max_attempts,
+                    budget_tokens: route.budget_tokens,
+                },
+            )
+        })
+        .collect();
+    Ok(Some(Arc::new(DefaultLlmScheduler::with_provider_routes(
+        default, 4, 4, providers, routes,
+    ))))
 }
 
 /// 从 `LlmProviderConfig` 构造单个 Provider。
@@ -247,44 +155,7 @@ fn build_provider_from_config(
     }))
 }
 
-/// 从旧的 `options` JSON 构建 Provider（向后兼容）。
-fn build_from_options(
-    options: &serde_json::Value,
-    provider_name: Option<&str>,
-) -> Result<OpenAiCompatibleProvider, RuntimeError> {
-    let base_url = options
-        .get("base_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("http://127.0.0.1:11434/v1")
-        .to_string();
-
-    let api_key = options
-        .get("api_key")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    // 若配置了 provider 名（如 "ollama"）且未显式给出 model，则用 provider 名兜底。
-    let model = options
-        .get("model")
-        .and_then(|v| v.as_str())
-        .or(provider_name)
-        .unwrap_or("default-model")
-        .to_string();
-
-    let timeout_secs = options
-        .get("timeout_secs")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(60);
-
-    Ok(OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
-        base_url,
-        api_key,
-        model,
-        embedding_model: None,
-        timeout: Duration::from_secs(timeout_secs),
-    }))
-}
-
+/// 从单 Provider `options` JSON 构建 Provider（当前单 Provider 配置）。
 /// 运行时 CLI 帮助文本。
 const RUNTIME_HELP: &str = r#"yomua-bot —— Character Runtime
 
@@ -293,10 +164,10 @@ const RUNTIME_HELP: &str = r#"yomua-bot —— Character Runtime
 
 选项：
   --help, -h          显示本帮助信息
-  --config-dir <目录>  指定配置目录（默认：当前目录）
+  --config-dir <目录>  指定配置目录（默认：./config）
 
-无参数时，使用当前目录作为配置目录。
-配置文件：<config-dir>/runtime.toml、<config-dir>/llm.toml、<config-dir>/onebot.toml。
+无参数时，使用启动目录下的 `config/` 作为配置目录；首次启动会在其中生成模板。
+配置文件：<config-dir>/runtime.toml、<config-dir>/llm.toml、<config-dir>/decision.toml、<config-dir>/onebot.toml。
 运行数据目录在 runtime.toml 的 data_dir 字段中指定（默认 data/）。
 "#;
 
@@ -305,9 +176,7 @@ const RUNTIME_HELP: &str = r#"yomua-bot —— Character Runtime
 /// 规则：
 /// - `--help` / `-h`：打印帮助并以 0 退出
 /// - `--config-dir <path>`：设置配置目录
-/// - 第一个非 `-` 开头的 positional 参数：配置目录（向后兼容）
-/// - 任何剩余的 `-` 开头的未知参数：报错
-/// - 多余的 positional 参数：报错
+/// - 任何非选项参数：报错
 pub(crate) fn parse_runtime_args(args: &[String]) -> Result<PathBuf, RuntimeError> {
     let mut config_dir: Option<PathBuf> = None;
     let mut i = 0;
@@ -330,15 +199,9 @@ pub(crate) fn parse_runtime_args(args: &[String]) -> Result<PathBuf, RuntimeErro
                 i += 1;
             }
             _ if !arg.starts_with('-') => {
-                // 第一个 positional 参数作为配置目录（向后兼容）。
-                if config_dir.is_none() {
-                    config_dir = Some(PathBuf::from(arg));
-                    i += 1;
-                } else {
-                    return Err(RuntimeError::Config(format!(
-                        "不支持的位置参数：{arg}，运行 yomua-bot --help 查看用法"
-                    )));
-                }
+                return Err(RuntimeError::Config(format!(
+                    "不支持的位置参数：{arg}，运行 yomua-bot --help 查看用法"
+                )));
             }
             _ => {
                 return Err(RuntimeError::Config(format!(
@@ -348,15 +211,14 @@ pub(crate) fn parse_runtime_args(args: &[String]) -> Result<PathBuf, RuntimeErro
         }
     }
 
-    Ok(config_dir.unwrap_or_else(|| PathBuf::from(".")))
+    Ok(config_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_DIR)))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // 子命令分发：import-card / list-characters / list-bindings / switch-character
-    // 走各自命令流程；其余参数视为配置目录（兼容旧用法，直接启动运行时）。
+    // 子命令分发：import-card / list-characters / list-bindings / switch-character。
     match args.first().map(String::as_str) {
         Some("import-card") => return run_import(&args[1..]).await,
         Some("list-characters") => return run_list_characters(&args[1..]).await,
@@ -376,54 +238,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// （Runtime / 行为 / 认知 / 情绪 / 关系）→ 启动订阅者 → 启动插件系统
 /// （可选）→ 启动 OneBot 适配器 → 等待关停信号。
 async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
-    // 1. 配置初始化：文件不存在时生成模板并退出提示用户修改。
+    // 1. 配置初始化：任一配置文件缺失时补齐模板并退出提示用户修改。
     let runtime_path = config_dir.join(RUNTIME_CONFIG);
     let onebot_path = config_dir.join(ONEBOT_CONFIG);
     let llm_path = config_dir.join(LLM_CONFIG);
+    let decision_path = config_dir.join(DECISION_CONFIG);
 
-    if !runtime_path.exists() {
-        write_template_if_missing(&runtime_path.display().to_string(), RUNTIME_TEMPLATE).map_err(
-            |e| RuntimeError::Config(format!("无法创建配置文件 {}: {e}", runtime_path.display())),
-        )?;
-        write_template_if_missing(&onebot_path.display().to_string(), ONEBOT_TEMPLATE).ok();
-        write_template_if_missing(&llm_path.display().to_string(), LLM_TEMPLATE).ok();
+    let mut created_templates = Vec::new();
+    for (path, template) in [
+        (&runtime_path, RUNTIME_TEMPLATE),
+        (&onebot_path, ONEBOT_TEMPLATE),
+        (&llm_path, LLM_TEMPLATE),
+        (&decision_path, DECISION_TEMPLATE),
+    ] {
+        if write_template_if_missing(&path.display().to_string(), template).map_err(|e| {
+            RuntimeError::Config(format!("无法创建配置文件 {}: {e}", path.display()))
+        })? {
+            created_templates.push(path.clone());
+        }
+    }
+
+    if !created_templates.is_empty() {
         eprintln!(
-            "错误: 配置文件不存在，已在当前目录生成模板文件。\n\
-             请修改 runtime.toml 和 onebot.toml 后重新启动。\n\
-             文件路径：\n\
-             - ./runtime.toml\n\
-             - ./onebot.toml\n\
-             - ./llm.toml（可选）"
+            "错误：配置文件不完整，已在 {} 生成占位模板。\n\
+             请先填写 runtime.toml 的 admin_users、onebot.toml 的连接参数，\n\
+             需要模型时填写 llm.toml；需要决策模型时再填写 decision.toml，并重新启动。\n\
+             已生成：\n{}",
+            config_dir.display(),
+            created_templates
+                .iter()
+                .map(|path| format!("- {}", path.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         std::process::exit(1);
     }
 
-    // 加载配置。
-    let runtime_cfg = load_runtime(&runtime_path.display().to_string())?;
-    let onebot_cfg = load_onebot(&onebot_path.display().to_string())?;
-    let llm_cfg = load_llm(&llm_path.display().to_string())?;
+    let launch_config = Arc::new(ConfigurationBundle::load(config_dir)?);
+    let runtime_cfg = launch_config.runtime.clone();
+    let onebot_cfg = launch_config.onebot.clone();
+    let llm_cfg = launch_config.llm.clone();
+    let decision_cfg = launch_config.decision.clone();
+    let (settings_tx, settings_rx) = watch::channel(runtime_cfg.clone());
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
-    // 1.2 配置校验：所有错误同时报告，不静默忽略。
-    // 注意：此时 tracing 尚未初始化，必须直接输出到 stderr，
-    // 否则用户只会看到“配置校验失败 N 个错误”而不知道改哪个配置项。
-    let validation_errors = validate_runtime(&runtime_cfg);
-    if !validation_errors.is_empty() {
-        for err in &validation_errors {
-            eprintln!("配置错误：{err}");
-        }
-        return Err(RuntimeError::Config(format!(
-            "配置校验失败：{} 个错误（见上文）",
-            validation_errors.len()
-        )));
-    }
-
-    // 2. 初始化日志。
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&runtime_cfg.log_level)),
-        )
+    // 日志过滤器与运行设置按完整校验后的配置一起更新。
+    use tracing_subscriber::prelude::*;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&runtime_cfg.log_level));
+    let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
         .init();
+    let log_reload: yomua_bot::application::control::LogReload = Arc::new(move |level| {
+        let filter = EnvFilter::try_new(level)
+            .map_err(|e| RuntimeError::Config(format!("日志过滤器无效：{e}")))?;
+        filter_handle
+            .reload(filter)
+            .map_err(|e| RuntimeError::Internal(format!("更新日志过滤器失败：{e}")))
+    });
 
     tracing::info!(target: "runtime", log_level = %runtime_cfg.log_level, "yomua-bot 正在启动...");
 
@@ -439,7 +313,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     // 4. 建立仓库。
     let repos = build_repos(pool);
 
-    // G1 启动检测：同一会话存在多个角色绑定为脏数据（旧版模型遗留），
+    // G1 启动检测：同一会话存在多个角色绑定为脏数据（历史数据或人工修改遗留），
     // 仅 warn 不自动删除；行为层取第一个绑定。
     check_binding_dirtiness(&repos.binding_repo)
         .await
@@ -453,7 +327,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     };
 
     // 6. 装配应用层编排依赖。
-    let app = build_app_layer(&runtime_cfg, &llm_cfg, &repos, bus.clone())?;
+    let app = build_app_layer(&runtime_cfg, &llm_cfg, &decision_cfg, &repos, bus.clone())?;
 
     // 7. 建立会话管理器、动作执行器、OneBot 适配器。
     let conversation_manager = ConversationManager::new(
@@ -474,7 +348,8 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         acceptance_service,
         app.binding_manager.clone(),
     )
-    .await;
+    .await
+    .with_blacklist_repo(repos.blacklist_repo.clone());
     let adapter = Arc::new(adapter);
 
     let action_dispatcher = Arc::new(ActionDispatcher::new(
@@ -485,34 +360,40 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     // 插件系统装配：注册表 + API 分发器。仅创建不启动；plugins_dir 未配置时
     // 不产生任何插件相关任务（保持既有部署行为不变）。
     let plugin_registry = Arc::new(PluginRegistry::new());
-    let plugin_api = Arc::new(PluginApi::new(
-        repos.character_repo.clone() as Arc<dyn CharacterRepository>,
-        repos.state_repo.clone(),
-        repos.binding_repo.clone(),
-        repos.message_repo.clone(),
-        repos.memory_repo.clone(),
-        repos.relationship_repo.clone(),
-        repos.plugin_data_repo.clone(),
-        action_dispatcher.clone(),
-        app.cognition.clone(),
-        plugin_registry.clone(),
-    ));
+    let plugin_api = Arc::new(
+        PluginApi::new(
+            repos.character_repo.clone() as Arc<dyn CharacterRepository>,
+            repos.state_repo.clone(),
+            repos.binding_repo.clone(),
+            repos.message_repo.clone(),
+            repos.memory_repo.clone(),
+            repos.relationship_repo.clone(),
+            repos.plugin_data_repo.clone(),
+            action_dispatcher.clone(),
+            app.cognition.clone(),
+            plugin_registry.clone(),
+        )
+        .with_runtime(app.runtime.clone()),
+    );
 
     let delay_executor: Arc<dyn DelayExecutor> = Arc::new(TokioDelayExecutor);
-    let reply_processor = Arc::new(ReplyProcessor::new(
-        app.runtime.clone(),
-        app.binding_manager.clone(),
-        app.decision_orchestrator.clone(),
-        app.cognition.clone(),
-        app.relationship_service.clone(),
-        app.mood_service.clone(),
-        app.memory_service.clone(),
-        action_dispatcher.clone(),
-        bus.clone(),
-        delay_executor,
-        repos.participant_repo.clone(),
-        onebot_cfg.bot_self_id,
-    ));
+    let reply_processor = Arc::new(
+        ReplyProcessor::new(
+            app.runtime.clone(),
+            app.binding_manager.clone(),
+            app.decision_orchestrator.clone(),
+            app.cognition.clone(),
+            app.relationship_service.clone(),
+            app.mood_service.clone(),
+            app.memory_service.clone(),
+            action_dispatcher.clone(),
+            bus.clone(),
+            delay_executor,
+            repos.participant_repo.clone(),
+            onebot_cfg.bot_self_id,
+        )
+        .with_message_repository(repos.message_repo.clone()),
+    );
 
     // 系统指令处理器（硬性约束 B）：订阅 CommandReceived，执行换角色并中文回复。
     let command_handler = CommandHandler::new(
@@ -520,7 +401,8 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         repos.character_repo.clone() as Arc<dyn CharacterRepository>,
         action_dispatcher.clone(),
         runtime_cfg.admin_users.clone(),
-    );
+    )
+    .with_live_settings(settings_rx);
 
     // 8. 启动订阅者和后台任务（在 shutdown_rx 创建后）。
     // OutboxDispatcher 和 OutboxProcessor 也在这里启动（C2-4 durable event delivery）。
@@ -534,6 +416,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("plugins")),
         sockets_dir: PathBuf::from(&runtime_cfg.data_dir).join("plugin-sockets"),
+        shutdown_timeout: Duration::from_secs(runtime_cfg.shutdown_timeout_secs),
         ..Default::default()
     };
     let supervisor = Arc::new(PluginSupervisor::new(
@@ -542,6 +425,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         plugin_api.clone(),
     ));
 
+    let mut auxiliary_tasks = BackgroundTasks::default();
     // 插件系统（仅在 plugins_dir 配置时加载插件）。
     if let Some(plugins_dir) = &runtime_cfg.plugins_dir {
         tracing::info!(plugins_dir = %plugins_dir, "插件系统已启用");
@@ -549,7 +433,11 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         // EventBridge 订阅：把 Core 事件总线上的事件转发给已订阅插件。
         let bridge = EventBridge::new(plugin_registry.clone());
         let subscription = bus.subscribe();
-        tokio::spawn(async move { bridge.run(subscription).await });
+        auxiliary_tasks
+            .handles
+            .push(spawn_until_stopped(shutdown_rx.clone(), async move {
+                bridge.run(subscription).await
+            }));
 
         // 启动全部插件；单个插件失败不致命（supervisor 内部已隔离），
         // 插件目录不存在只 warn 记录，不中断 Core。
@@ -560,11 +448,8 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         tracing::info!("插件系统未启用（runtime.toml 未配置 plugins_dir）");
     }
 
-    // 10. 创建关停通道和控制句柄。
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-
-    // 8. 启动后台任务（EventProcessor、CommandHandler、ProactiveDriver、OutboxDispatcher、OutboxProcessor）。
-    spawn_background_tasks(
+    // 8. 启动后台任务（CommandHandler、ProactiveDriver、OutboxDispatcher、OutboxProcessor）。
+    let mut background_tasks = spawn_background_tasks(
         &repos,
         &bus,
         reply_processor,
@@ -573,16 +458,25 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         shutdown_rx.clone(),
     );
 
-    // RuntimeHandle 暴露 State System 仓储：控制命令（state-set / state-get）
+    let shutdown_complete = Arc::new(Notify::new());
+    let shutdown_result = Arc::new(RwLock::new(None));
+
+    // RuntimeHandle 暴露 State System 仓储：控制请求（character state set / get）
     // 必须经由这些仓储读写，不得直接操作 SQL。
     let handle = RuntimeHandle {
         config_dir: config_dir.to_path_buf(),
         runtime_cfg: runtime_cfg.clone(),
+        live_settings: Some(settings_tx),
+        launch_config: Some(Arc::new(tokio::sync::RwLock::new((*launch_config).clone()))),
+        log_reload: Some(log_reload),
+        runtime: Some(app.runtime.clone()),
         data_dir: PathBuf::from(&runtime_cfg.data_dir),
         supervisor: supervisor.clone(),
         adapter: adapter.clone(),
         storage: storage.clone(),
         shutdown_tx,
+        shutdown_complete: shutdown_complete.clone(),
+        shutdown_result: shutdown_result.clone(),
         commands: CommandRegistry::builtin(),
         character_repo: repos.character_repo.clone() as Arc<dyn CharacterRepository>,
         state_repo: repos.state_repo.clone(),
@@ -600,27 +494,74 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     };
 
     // 启动控制服务（后台任务，监听 data/control.sock）。
-    let control_handle = start_control_service(handle.clone(), shutdown_rx.clone());
+    // 控制服务单独持有句柄。关停命令需要等待主流程完成，不能把控制服务本身
+    // 放进 auxiliary_tasks，否则会形成“控制请求等待主流程、主流程等待控制请求”的环。
+    let control_task = start_control_service(handle.clone(), shutdown_rx.clone());
     tracing::info!(target: "runtime", socket_path = %handle.data_dir.join("control.sock").display(), "控制服务已启动（可用 yomua-bot-ctl status/reload-config/shutdown）");
 
-    // 11. 启动适配器并等待消息。
-    adapter.start().await?;
-    tracing::info!(target: "runtime", "字符运行时已就绪，等待消息...");
-
-    // 12. 等待关停信号（Ctrl+C 或控制 socket）。Core 常驻，适配器断线自动重连。
-    tracing::info!(target: "runtime", "正在运行；按 Ctrl+C 或使用 yomua-bot-ctl shutdown 退出。");
-    let _ = shutdown_rx.changed().await;
-    tracing::info!(target: "runtime", "收到关停信号，正在优雅关闭...");
-
-    // 13. 优雅关停：先停插件（发 shutdown 通知 → 等超时 → 杀残余）→ 停适配器 → 关数据库。
-    if let Err(e) = supervisor.shutdown_all().await {
-        tracing::warn!(target: "runtime", error = %e, "停止插件失败");
+    // 启动失败也进入同一清理流程，避免插件或 socket 遗留。
+    let start_result = adapter.start().await;
+    if start_result.is_ok() {
+        tracing::info!(target: "runtime", "运行时已就绪，等待消息。Ctrl+C、SIGTERM 或控制命令可关停。");
+        tokio::select! {
+            _ = wait_for_stop(&mut shutdown_rx) => {},
+            result = shutdown_signal() => { if let Err(error) = result { tracing::warn!(error = %error, "监听系统关停信号失败"); } },
+        }
     }
-    if let Err(e) = adapter.stop().await {
-        tracing::warn!(target: "runtime", error = %e, "停止适配器失败");
+    handle.shutdown();
+    tracing::info!(target: "runtime", "停止接收工作，正在保存并关闭后台任务...");
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(handle.effective_config().shutdown_timeout_secs);
+    if let Some(driver) = &background_tasks.cognition {
+        driver.stop();
     }
-    storage.close().await;
-    let _ = control_handle.await;
+    let cleanup = async {
+        if let Err(error) = adapter.stop().await {
+            tracing::warn!(error = %error, "停止适配器失败");
+        }
+        let (_, plugin_result) = tokio::join!(background_tasks.join(), supervisor.shutdown_all());
+        if let Err(error) = plugin_result {
+            tracing::warn!(error = %error, "停止插件失败");
+        }
+        auxiliary_tasks.join().await;
+        storage.close().await;
+    };
+    let cleanup_timed_out = tokio::time::timeout_at(deadline, cleanup).await.is_err();
+    let unfinished_tasks = if cleanup_timed_out {
+        tracing::warn!("关停超过配置时限，取消剩余任务，未完成回复保留供重启核查");
+        let count = background_tasks
+            .handles
+            .iter()
+            .filter(|task| !task.is_finished())
+            .count()
+            + auxiliary_tasks
+                .handles
+                .iter()
+                .filter(|task| !task.is_finished())
+                .count();
+        background_tasks.abort();
+        auxiliary_tasks.abort();
+        supervisor.force_shutdown().await;
+        Some(count)
+    } else {
+        Some(0)
+    };
+
+    *shutdown_result.write().await = Some(ShutdownResult {
+        completed: !cleanup_timed_out,
+        timed_out: cleanup_timed_out,
+        unfinished_tasks,
+        message: if cleanup_timed_out {
+            "关停超时，未完成任务已取消，持久化任务可在下次启动时恢复".to_string()
+        } else {
+            "关停已完成".to_string()
+        },
+    });
+    shutdown_complete.notify_waiters();
+
+    // 主流程已经完成后再结束控制服务，给 shutdown 请求留下写完响应的机会。
+    let _ = tokio::time::timeout(Duration::from_secs(2), control_task).await;
+    start_result?;
 
     tracing::info!(target: "runtime", "yomua-bot 已退出。");
     Ok(handle)
@@ -632,7 +573,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
 /// 用法：`cargo run -- import-card <卡片路径> [选项]`
 ///
 /// 选项：
-/// - `--config-dir <目录>`：配置目录（默认当前目录，读其中的 `runtime.toml`）
+/// - `--config-dir <目录>`：配置目录（默认 `./config`，读其中的 `runtime.toml`）
 /// - `--conversation <外部ID>`：绑定到的会话外部 ID（例如 QQ 群号）
 /// - `--group`：目标会话为群聊（默认私聊）
 /// - `--participant <外部ID>`：创建/复用会话中的一个人类参与者
@@ -641,7 +582,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
 /// - `--proactive`：启用主动消息
 async fn run_import(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // --- 解析命令行参数 ---
-    let mut config_dir = PathBuf::from(".");
+    let mut config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
     let mut path: Option<PathBuf> = None;
     let mut conversation: Option<String> = None;
     let mut conversation_type = ConversationType::Private;
@@ -778,9 +719,9 @@ async fn open_cli_storage(
     ))
 }
 
-/// 解析 CLI 公共参数：`--config-dir <目录>`（默认当前目录）。
+/// 解析 CLI 公共参数：`--config-dir <目录>`（默认 `./config`）。
 fn parse_config_dir_arg(args: &[String]) -> Result<PathBuf, RuntimeError> {
-    let mut config_dir = PathBuf::from(".");
+    let mut config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -874,7 +815,7 @@ async fn run_list_bindings(args: &[String]) -> Result<(), Box<dyn std::error::Er
 /// `--group` 表示目标会话为群聊（默认私聊）；本命令只查询已存在会话，
 /// 不会像 `import-card` 那样创建会话。
 async fn run_switch_character(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config_dir = PathBuf::from(".");
+    let mut config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
     let mut conversation_external_id: Option<String> = None;
     let mut character_name: Option<String> = None;
     let mut conversation_type = ConversationType::Private;
@@ -906,7 +847,7 @@ async fn run_switch_character(args: &[String]) -> Result<(), Box<dyn std::error:
     tracing::debug!(target: "cli", ?conversation_type, "准备切换会话角色");
 
     // 打开存储并装配局部仓储（只读查询，不创建会话）。
-    let (storage, character_repo, conversation_repo, participant_repo, binding_repo) =
+    let (storage, character_repo, conversation_repo, _participant_repo, binding_repo) =
         open_cli_storage(&config_dir).await?;
 
     let target_conversation = conversation_repo
@@ -962,7 +903,7 @@ fn parse_reply_mode(s: &str) -> Result<ReplyMode, RuntimeError> {
 }
 
 // ---------------------------------------------------------------------------
-// 辅助函数（AUDIT-049：run_runtime 过长，拆分为私有辅助方法）
+// 运行时装配辅助函数。
 // ---------------------------------------------------------------------------
 
 use sqlx::SqlitePool;
@@ -1033,7 +974,7 @@ fn build_repos(pool: SqlitePool) -> Repos {
     }
 }
 
-/// G1 启动检测：同一会话存在多个角色绑定为脏数据（旧版模型遗留），
+/// G1 启动检测：同一会话存在多个角色绑定为脏数据（历史数据或人工修改遗留），
 /// 仅 warn 不自动删除；行为层取第一个绑定。
 async fn check_binding_dirtiness(
     binding_repo: &Arc<dyn CharacterBindingRepository>,
@@ -1073,6 +1014,7 @@ struct AppLayer {
 fn build_app_layer(
     _runtime_cfg: &yomua_bot::application::config::RuntimeConfig,
     llm_cfg: &LlmConfig,
+    decision_cfg: &DecisionConfig,
     repos: &Repos,
     bus: EventBus,
 ) -> Result<AppLayer, RuntimeError> {
@@ -1120,31 +1062,15 @@ fn build_app_layer(
         yomua_bot::application::clock::system_clock(),
     ));
 
-    // LLM 是能力不是生命线：enabled=false 时 scheduler 为 None，走确定性回复。
-    let llm_scheduler: Option<Arc<DefaultLlmScheduler>> = if llm_cfg.enabled {
-        // 多 Provider 模式：若 llm_cfg.has_multi_provider()，使用 providers registry
-        let scheduler = if llm_cfg.has_multi_provider() {
-            build_multi_provider_scheduler(llm_cfg.clone())?
-        } else {
-            // 旧格式 fallback：单 Provider（向后兼容）
-            let provider: Arc<dyn LlmProvider> = Arc::new(
-                build_openai_provider(llm_cfg.clone(), None)
-                    .map_err(|e| RuntimeError::Config(format!("LLM 配置错误: {e}")))?,
-            );
-            tracing::info!(target = "llm", model = %provider.name(), "LLM 已启用（单 Provider 模式）");
-            Arc::new(DefaultLlmScheduler::new(provider))
-        };
-        Some(scheduler)
-    } else {
-        tracing::info!(target = "llm", "LLM 未启用，使用确定性回复");
-        None
-    };
-    let scheduler: Option<Arc<dyn LlmScheduler>> =
-        llm_scheduler.clone().map(|s| s as Arc<dyn LlmScheduler>);
-
-    // Phase 3: ContextAssembler = Token Budget + Layered Degradation
-    // 从 llm.toml [options] 读取 context_window、max_output_tokens 和 output_reservation
-    let (context_window, max_output_tokens, output_reservation) = read_llm_capabilities(llm_cfg);
+    let llm_scheduler = build_model_scheduler(llm_cfg, decision_cfg)?;
+    let scheduler: Option<Arc<dyn LlmScheduler>> = llm_scheduler
+        .clone()
+        .map(|scheduler| scheduler as Arc<dyn LlmScheduler>);
+    let resolved = llm_cfg.resolve()?;
+    let conversation_model = resolved.as_ref().map(|config| config.conversation_model());
+    let context_window = conversation_model.and_then(|model| model.context_window);
+    let max_output_tokens = conversation_model.and_then(|model| model.max_output_tokens);
+    let output_reservation = max_output_tokens.unwrap_or(512);
     let token_estimator = Arc::new(TokenEstimatorAdapter(Arc::new(ApproximateTokenEstimator)));
     let model_capabilities = Arc::new(ModelCapabilitiesProviderAdapter(Arc::new(
         FixedModelCapabilities::new(context_window, max_output_tokens),
@@ -1166,11 +1092,30 @@ fn build_app_layer(
         context_assembler,
     ));
 
-    // DecisionOrchestrator：使用 RuleBehaviorEngine 作为 evaluator，NoOpTrigger 作为默认 trigger。
-    // Pipeline 为 None（MVP 阶段不调用真实 LLM）。
+    // DecisionOrchestrator：规则引擎永远是基线；只有显式配置 decision role
+    // 时才启用 advisory 决策模型，模型不能绕过验证器和硬约束。
     let evaluator: Arc<dyn DecisionEvaluator> = behavior_engine.clone();
-    let trigger: Arc<dyn LlmAssistanceTrigger> = Arc::new(NoOpTrigger);
-    let decision_orchestrator = DecisionOrchestrator::new(evaluator, trigger, None);
+    let (trigger, pipeline): (
+        Arc<dyn LlmAssistanceTrigger>,
+        Option<Arc<DecisionLlmPipeline>>,
+    ) = if let (Some(scheduler), Some(_resolved)) = (llm_scheduler.clone(), resolved.as_ref()) {
+        if decision_cfg.enabled {
+            let service = Arc::new(DecisionLlmServiceImpl::new(scheduler));
+            let validator = DecisionResultValidator::new(5_000, 30_000);
+            let policy = Arc::new(DefaultOverridePolicy);
+            (
+                Arc::new(HeuristicTrigger),
+                Some(Arc::new(DecisionLlmPipeline::new(
+                    service, None, validator, policy,
+                ))),
+            )
+        } else {
+            (Arc::new(NoOpTrigger), None)
+        }
+    } else {
+        (Arc::new(NoOpTrigger), None)
+    };
+    let decision_orchestrator = DecisionOrchestrator::new(evaluator, trigger, pipeline);
 
     Ok(AppLayer {
         runtime,
@@ -1193,21 +1138,58 @@ fn spawn_background_tasks(
     command_handler: CommandHandler,
     app: &AppLayer,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    let processor_bus = bus.clone();
+) -> BackgroundTasks {
+    let mut tasks = BackgroundTasks::default();
     let reply_processor_for_outbox = reply_processor.clone();
-    tokio::spawn(async move {
-        EventProcessor::new(reply_processor)
-            .run(&processor_bus)
-            .await;
-    });
 
     let command_bus = bus.clone();
-    tokio::spawn(async move {
-        command_handler.run(&command_bus).await;
+    tasks
+        .handles
+        .push(spawn_until_stopped(shutdown_rx.clone(), async move {
+            command_handler.run(&command_bus).await;
+        }));
+
+    // 主动消息复用普通回复任务：从同一会话最近的已持久化消息取得依据。
+    struct ProactiveEnqueuer {
+        reply_processor: Arc<ReplyProcessor>,
+        binding_repo: Arc<dyn yomua_bot::domain::repository::CharacterBindingRepository>,
+        message_repo: Arc<dyn yomua_bot::domain::repository::MessageRepository>,
+    }
+    #[async_trait::async_trait]
+    impl ProactiveReplyScheduler for ProactiveEnqueuer {
+        async fn enqueue_proactive(
+            &self,
+            character_id: i64,
+            conversation_id: i64,
+            reason: &str,
+        ) -> Result<(), RuntimeError> {
+            let binding = self
+                .binding_repo
+                .find_by_conversation_id(conversation_id)
+                .await?
+                .into_iter()
+                .find(|item| item.character_id == character_id)
+                .ok_or_else(|| RuntimeError::Internal("主动任务找不到当前角色绑定".into()))?;
+            let source = self
+                .message_repo
+                .find_recent(conversation_id, 50)
+                .await?
+                .into_iter()
+                .rev()
+                .find(|message| message.active_character_id == Some(character_id))
+                .ok_or_else(|| RuntimeError::Internal("主动任务缺少已有话题依据".into()))?;
+            self.reply_processor
+                .enqueue_proactive(&binding, &source, reason)
+                .await
+        }
+    }
+    let proactive_scheduler: Arc<dyn ProactiveReplyScheduler> = Arc::new(ProactiveEnqueuer {
+        reply_processor: reply_processor.clone(),
+        binding_repo: repos.binding_repo.clone(),
+        message_repo: repos.message_repo.clone(),
     });
 
-    // 启动主动行为驱动（后台 tick，无 LLM，仅状态维护）。
+    // 启动主动行为驱动（具备来源约束、冷却、每日上限和统一关停）。
     let proactive_driver = ProactiveDriver::new(
         repos.binding_repo.clone(),
         repos.state_repo.clone(),
@@ -1215,10 +1197,14 @@ fn spawn_background_tasks(
         app.behavior_engine.clone() as Arc<dyn BehaviorEngine>,
         bus.clone(),
         yomua_bot::application::clock::system_clock(),
-    );
-    tokio::spawn(async move {
-        proactive_driver.run().await;
-    });
+    )
+    .with_reply_scheduler(proactive_scheduler);
+    let proactive_shutdown = shutdown_rx.clone();
+    tasks
+        .handles
+        .push(spawn_until_stopped(shutdown_rx.clone(), async move {
+            proactive_driver.run_until_stopped(proactive_shutdown).await;
+        }));
 
     // 启动后台认知驱动（LLM 启用时才有意义）。
     if let Some(ref sched) = app.llm_scheduler {
@@ -1236,9 +1222,12 @@ fn spawn_background_tasks(
             ),
             yomua_bot::application::clock::system_clock(),
         ));
-        tokio::spawn(async move {
-            cognition_driver.run().await;
-        });
+        tasks.cognition = Some(cognition_driver.clone());
+        tasks
+            .handles
+            .push(spawn_until_stopped(shutdown_rx.clone(), async move {
+                cognition_driver.run().await;
+            }));
     }
 
     // C2-4: 启动 OutboxDispatcher 和 OutboxProcessor（durable event delivery）
@@ -1249,17 +1238,84 @@ fn spawn_background_tasks(
     let dispatcher_shutdown_rx = shutdown_rx.clone();
     let processor_shutdown_rx = shutdown_rx.clone();
 
-    tokio::spawn(async move {
+    tasks.handles.push(tokio::spawn(async move {
         outbox_dispatcher
             .run(event_tx, dispatcher_shutdown_rx)
             .await;
-    });
+    }));
 
-    tokio::spawn(async move {
+    tasks.handles.push(tokio::spawn(async move {
         outbox_processor.run(event_rx, processor_shutdown_rx).await;
-    });
+    }));
 
-    tracing::info!(target: "runtime", "OutboxDispatcher 和 OutboxProcessor 已启动");
+    tracing::info!(target: "runtime", "消息处理与后台任务已启动");
+    tasks
+}
+
+#[derive(Default)]
+struct BackgroundTasks {
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    cognition: Option<Arc<CognitionDriver>>,
+}
+
+impl BackgroundTasks {
+    async fn join(&mut self) {
+        // 保留句柄直到完成；整体关停超时时仍能定位并取消当前等待的任务。
+        for handle in &mut self.handles {
+            let _ = handle.await;
+        }
+        self.handles.clear();
+    }
+    fn abort(&self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+async fn wait_for_stop(receiver: &mut watch::Receiver<bool>) {
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+fn spawn_until_stopped<F>(
+    mut receiver: watch::Receiver<bool>,
+    future: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        tokio::select! { _ = wait_for_stop(&mut receiver) => {}, _ = future => {} }
+    })
+}
+
+async fn shutdown_signal() -> Result<(), RuntimeError> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|error| RuntimeError::Internal(format!("注册 SIGTERM 失败：{error}")))?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(|error| RuntimeError::Internal(format!("注册 SIGINT 失败：{error}")))?,
+            _ = terminate.recv() => {},
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|error| RuntimeError::Internal(format!("注册关停信号失败：{error}")))
+    }
 }
 
 #[cfg(test)]
@@ -1272,15 +1328,8 @@ mod tests {
     #[test]
     fn test_parse_runtime_args_empty() {
         let result = parse_runtime_args(&[] as &[String]);
-        let path = result.expect("空参数应返回 cwd");
-        assert_eq!(path, PathBuf::from("."));
-    }
-
-    #[test]
-    fn test_parse_runtime_args_positional_config_dir() {
-        let result = parse_runtime_args(&["/tmp/my-config".to_string()]);
-        let path = result.expect("positional 应被接受");
-        assert_eq!(path, PathBuf::from("/tmp/my-config"));
+        let path = result.expect("空参数应返回默认配置目录");
+        assert_eq!(path, PathBuf::from(DEFAULT_CONFIG_DIR));
     }
 
     #[test]
@@ -1314,27 +1363,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_runtime_args_extra_positional() {
-        // 第二个 positional 参数应报错
-        let result = parse_runtime_args(&["/tmp/first".to_string(), "second".to_string()]);
-        assert!(result.is_err(), "多余位置参数应返回错误");
-    }
-
-    #[test]
-    fn test_parse_runtime_args_config_dir_then_positional() {
-        // --config-dir foo bar: bar 是多余位置参数
-        let result = parse_runtime_args(&[
-            "--config-dir".to_string(),
-            "/tmp/cfg".to_string(),
-            "extra".to_string(),
-        ]);
-        assert!(result.is_err(), "多余位置参数应返回错误");
-    }
-
-    #[test]
-    fn test_parse_runtime_args_dot_as_config_dir() {
-        let result = parse_runtime_args(&[".".to_string()]);
-        let path = result.expect(".");
-        assert_eq!(path, PathBuf::from("."));
+    fn test_parse_runtime_args_positional_config_dir_is_rejected() {
+        let result = parse_runtime_args(&["/tmp/my-config".to_string()]);
+        assert!(result.is_err(), "配置目录必须显式使用 --config-dir");
     }
 }

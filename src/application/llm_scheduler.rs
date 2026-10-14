@@ -3,10 +3,10 @@
 //! 核心/应用层不得直接调用 [`crate::infrastructure::llm::LlmProvider`]，
 //! 必须统一经由本调度器。调度器负责：
 //! - 用信号量做背压，限制并发请求数；
-//! - 按优先级排队：P0 不被阻塞，P3 在满载时丢弃。
+//! - 按优先级排队：所有请求遵守并发上限，后台请求在满载时延后。
 //!
 //! LLM 是能力不是生命线：调度器内部委托给内层 Provider，但上层在使用时
-//! 随时可以因为没有可用 Provider（`enabled=false`）而选择确定性回复。
+//! 没有可用 Provider（`enabled=false`）时保留消息并跳过生成。
 
 use std::sync::Arc;
 
@@ -22,6 +22,14 @@ use crate::infrastructure::llm::{LlmProvider, LlmRequest, LlmResponse};
 pub trait LlmScheduler: Send + Sync {
     /// 提交一个 LLM 请求并获得响应。
     async fn submit(&self, request: LlmRequest) -> Result<LlmResponse, RuntimeError>;
+
+    /// 返回实际任务路由的模型能力；未提供能力信息时不猜测。
+    fn capabilities_for(
+        &self,
+        _role: &str,
+    ) -> Option<crate::infrastructure::llm::FixedModelCapabilities> {
+        None
+    }
 }
 
 /// Embedding 调度器 trait —— 所有 embedding 调用的统一抽象。
@@ -37,7 +45,7 @@ pub trait EmbeddingScheduler: Send + Sync {
 ///
 /// 内部使用 `tokio::sync::Semaphore` 限制并发请求数（`pending_limit`，默认 4）。
 /// 优先级映射：
-/// - priority == 0 → P0：用 `try_acquire` 抢占；若信号量已满**也直接执行**，不被 P3 阻塞；
+/// - priority == 0 → P0：等待许可；
 /// - 1 → P1、2 → P2：正常获取信号量（排队）；
 /// - ≥3 → P3：满载时丢弃并记录日志。
 ///
@@ -47,41 +55,47 @@ pub trait EmbeddingScheduler: Send + Sync {
 /// - 路由成功后从 ModelInstanceConfig.model 注入 `request.model`；
 /// - **所有路由失败均返回明确错误**，不再 fallback 到 inner。
 ///
-/// Legacy 模式（无 `providers`/`role_mis`）：
-/// - 适用于单 Provider 场景（tests / 旧格式配置）；
+/// 单 Provider 模式（无 `providers`/`role_mis`）：
+/// - 适用于首次发布的单 Provider 场景和测试；
 /// - 所有 generation 请求直接发送到 inner Provider。
 pub struct DefaultLlmScheduler {
-    /// 【保留用于 embedding】当前激活的 LLM Provider（legacy / single-provider 模式）。
+    /// 【保留用于 embedding】当前激活的 LLM Provider（single-provider 模式）。
     inner: Arc<dyn LlmProvider>,
     semaphore: Arc<Semaphore>,
     /// embedding 专用信号量（默认 4）。
     embedding_semaphore: Arc<Semaphore>,
     /// 【可选】Provider 注册表（当使用 `with_providers` 时填充）。
     providers: Option<std::collections::HashMap<String, Arc<dyn LlmProvider>>>,
-    /// 【可选】Role → ModelInstance 配置映射（当使用 `with_providers` 时填充）。
-    role_mis: Option<
-        std::collections::HashMap<String, crate::application::config::LlmModelInstanceConfig>,
-    >,
+    /// 【可选】Role → 主模型及备用模型链。
+    routes: Option<std::collections::HashMap<String, LlmRouteConfig>>,
+}
+
+/// 调度器使用的已解析任务路由。
+#[derive(Debug, Clone)]
+pub struct LlmRouteConfig {
+    pub models: Vec<crate::application::config::LlmModelInstanceConfig>,
+    pub max_attempts: usize,
+    pub budget_tokens: Option<u32>,
 }
 
 impl DefaultLlmScheduler {
     /// 创建一个默认调度器（pending_limit 默认 4，embedding_limit 默认 4）。
     ///
-    /// 这是 legacy 单 Provider 模式，所有 generation 请求直接发送到 inner。
+    /// 这是 单 Provider 模式，所有 generation 请求直接发送到 inner。
     pub fn new(inner: Arc<dyn LlmProvider>) -> Self {
         Self::with_limits(inner, 4, 4)
     }
 
     /// 创建一个可配置并发上限的调度器（embedding 使用相同上限）。
     ///
-    /// 这是 legacy 单 Provider 模式。
+    /// 这是 单 Provider 模式。
     pub fn with_limit(inner: Arc<dyn LlmProvider>, pending_limit: usize) -> Self {
         Self::with_limits(inner, pending_limit, pending_limit)
     }
 
     /// 创建一个可分别配置 LLM 和 embedding 并发上限的调度器。
     ///
-    /// 这是 legacy 单 Provider 模式（无角色路由）。
+    /// 这是 单 Provider 模式（无角色路由）。
     pub fn with_limits(
         inner: Arc<dyn LlmProvider>,
         pending_limit: usize,
@@ -92,7 +106,7 @@ impl DefaultLlmScheduler {
             semaphore: Arc::new(Semaphore::new(pending_limit.max(1))),
             embedding_semaphore: Arc::new(Semaphore::new(embedding_limit.max(1))),
             providers: None,
-            role_mis: None,
+            routes: None,
         }
     }
 
@@ -115,16 +129,40 @@ impl DefaultLlmScheduler {
             crate::application::config::LlmModelInstanceConfig,
         >,
     ) -> Self {
+        let routes = role_mis
+            .into_iter()
+            .map(|(role, model)| {
+                (
+                    role,
+                    LlmRouteConfig {
+                        models: vec![model],
+                        max_attempts: 1,
+                        budget_tokens: None,
+                    },
+                )
+            })
+            .collect();
+        Self::with_provider_routes(inner, pending_limit, embedding_limit, providers, routes)
+    }
+
+    /// 创建带有主模型、备用模型和单次预算的调度器。
+    pub fn with_provider_routes(
+        inner: Arc<dyn LlmProvider>,
+        pending_limit: usize,
+        embedding_limit: usize,
+        providers: std::collections::HashMap<String, Arc<dyn LlmProvider>>,
+        routes: std::collections::HashMap<String, LlmRouteConfig>,
+    ) -> Self {
         Self {
             inner,
             semaphore: Arc::new(Semaphore::new(pending_limit.max(1))),
             embedding_semaphore: Arc::new(Semaphore::new(embedding_limit.max(1))),
             providers: Some(providers),
-            role_mis: Some(role_mis),
+            routes: Some(routes),
         }
     }
 
-    /// 按优先级分发：P0 直通（抢占，不被阻塞），P3 满即弃，其余排队。
+    /// 按优先级分发：实时请求等待许可，后台请求满载时延后。
     ///
     /// 当配置了 `providers`/`role_mis` 时，先进行角色路由：
     /// - 从 `request.metadata["llm_role"]` 提取 role 名称；
@@ -149,34 +187,25 @@ impl DefaultLlmScheduler {
             .await
             .map_err(|e| RuntimeError::Llm(format!("信号量已关闭: {e}")))?;
 
-        // 角色路由（失败则返回错误，不 fallback）
-        let (provider, modeled_request) = self.route_request(request)?;
-        provider.generate(modeled_request).await
+        self.generate_with_route(request).await
     }
 
-    /// P0：优先尝试获取许可；无论信号量是否已满都直接执行（绝不被 P3 阻塞）。
+    /// P0 同样等待全局许可，不能绕过并发上限。
     async fn dispatch_p0(&self, request: LlmRequest) -> Result<LlmResponse, RuntimeError> {
-        // 角色路由
-        let (provider, modeled_request) = self.route_request(request)?;
-
-        match self.semaphore.clone().try_acquire_owned() {
-            Ok(permit) => {
-                let result = provider.generate(modeled_request).await;
-                drop(permit);
-                result
-            }
-            Err(_) => provider.generate(modeled_request).await,
-        }
+        let _permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| RuntimeError::Llm(format!("信号量已关闭: {e}")))?;
+        self.generate_with_route(request).await
     }
 
     /// P3：信号量满载时丢弃并记录日志。
     async fn dispatch_p3(&self, request: LlmRequest) -> Result<LlmResponse, RuntimeError> {
-        // 角色路由
-        let (provider, modeled_request) = self.route_request(request)?;
-
         match self.semaphore.clone().try_acquire_owned() {
             Ok(permit) => {
-                let result = provider.generate(modeled_request).await;
+                let result = self.generate_with_route(request).await;
                 drop(permit);
                 result
             }
@@ -187,40 +216,31 @@ impl DefaultLlmScheduler {
         }
     }
 
-    /// 根据 `metadata["llm_role"]` 进行角色路由。
+    /// 根据 `metadata["llm_role"]` 解析主模型和备用模型链。
     ///
     /// 返回 `(目标 Provider, 注入了 model 的 request)`。
     ///
     /// **错误条件**（均返回 `RuntimeError::Config`）：
-    /// - 未配置 `providers`/`role_mis`（单 Provider legacy 模式应用 `DefaultLlmScheduler::new()`）
+    /// - 未配置 `providers`/`role_mis`（单 Provider 模式使用 `DefaultLlmScheduler::new()`）
     /// - `llm_role` 为空或缺失
     /// - `llm_role` 在 `role_mis` 中不存在（unknown role）
     /// - Role 引用的 ModelInstance 的 Provider 在 `providers` 中不存在
     ///
     /// **成功时**：Provider 和 model 均来自同一个 ModelInstance 配置，
     /// 保证 `ModelInstance.provider` 与 `ModelInstance.model` 始终保持绑定。
-    fn route_request(
-        &self,
-        mut request: LlmRequest,
-    ) -> Result<(Arc<dyn LlmProvider>, LlmRequest), RuntimeError> {
-        // 未配置 providers（legacy 单 Provider 模式）：允许无 role 的请求 fallback 到 inner
-        let (Some(role_mis), Some(providers)) = (&self.role_mis, &self.providers) else {
-            // Legacy 模式：无 role 时 fallback 到 inner（保持向后兼容）
-            let role_name = request
-                .metadata
-                .get("llm_role")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if role_name.is_empty() {
-                tracing::debug!(target = "llm", "Legacy 模式：无 role 路由，回退到 inner");
-                return Ok((Arc::clone(&self.inner), request));
-            }
-            // Legacy 模式下带 role 的请求无法路由（没有配置）
-            return Err(RuntimeError::Config(format!(
-                "LLM Scheduler 未配置多 Provider 路由，无法处理 llm_role=\"{}\"。\
-                 Legacy 单 Provider 模式下不应设置 llm_role",
-                role_name
-            )));
+    fn route_requests(&self, request: &LlmRequest) -> Result<LlmRouteConfig, RuntimeError> {
+        // 单 Provider 模式下，所有业务角色都由同一个 Provider 处理。
+        let (Some(routes), Some(providers)) = (&self.routes, &self.providers) else {
+            return Ok(LlmRouteConfig {
+                models: vec![crate::application::config::LlmModelInstanceConfig {
+                    provider: "default".into(),
+                    model: request.model.clone().unwrap_or_default(),
+                    context_window: None,
+                    max_output_tokens: request.max_tokens.map(|v| v as usize),
+                }],
+                max_attempts: 1,
+                budget_tokens: None,
+            });
         };
 
         // 从 metadata 中提取 llm_role
@@ -233,55 +253,107 @@ impl DefaultLlmScheduler {
             return Err(RuntimeError::Config(
                 "LLM 请求缺少 llm_role metadata。\
                  Conversation 应使用 llm_role=\"conversation\"，\
-                 Decision 应使用 llm_role=\"decision\"，\
+                 Decision 使用 decision.toml，\
                  Cognition 应使用 llm_role=\"cognition\""
                     .to_string(),
             ));
         }
 
         // 查找 Role 对应的 ModelInstance 配置
-        let mi_config = match role_mis.get(role_name) {
-            Some(mi) => mi,
+        let route = match routes.get(role_name) {
+            Some(route) => route.clone(),
             None => {
                 return Err(RuntimeError::Config(format!(
-                    "Role '{}' 在 LLM 配置中未注册。\
-                     请检查 llm.toml 中 [roles] 是否包含该 role",
+                    "Role '{}' 在 LLM 配置中未注册。请检查 llm.toml 或 decision.toml",
                     role_name
                 )));
             }
         };
 
-        // 查找 ModelInstance 对应的 Provider
-        let provider = match providers.get(&mi_config.provider) {
-            Some(p) => Arc::clone(p),
-            None => {
+        for model in &route.models {
+            if !providers.contains_key(&model.provider) {
                 return Err(RuntimeError::Config(format!(
-                    "Role '{}' 引用的 ModelInstance '{}' 的 Provider '{}' 在 LLM 配置中未注册。\
-                     请检查 llm.toml 中 [providers] 是否包含该 Provider",
-                    role_name, role_name, mi_config.provider
+                    "Role '{}' 引用的 ModelInstance Provider '{}' 未注册",
+                    role_name, model.provider
                 )));
             }
-        };
-
-        // 注入 model（来自 ModelInstanceConfig.model）
-        request.model = Some(mi_config.model.clone());
-
-        tracing::debug!(
-            target = "llm",
-            role = role_name,
-            provider = %mi_config.provider,
-            model = %mi_config.model,
-            "角色路由成功",
-        );
-
-        Ok((provider, request))
+        }
+        Ok(route)
     }
+
+    async fn generate_with_route(&self, request: LlmRequest) -> Result<LlmResponse, RuntimeError> {
+        let Some(_routes) = &self.routes else {
+            return self.inner.generate(request).await;
+        };
+        let Some(providers) = &self.providers else {
+            return self.inner.generate(request).await;
+        };
+        let role = request
+            .metadata
+            .get("llm_role")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let route = self.route_requests(&request)?;
+        let mut last_error = None;
+        let attempt_limit = route.max_attempts.min(route.models.len());
+        for model in route.models.iter().take(attempt_limit) {
+            let provider = providers.get(&model.provider).ok_or_else(|| {
+                RuntimeError::Config(format!("Provider '{}' 未注册", model.provider))
+            })?;
+            let mut attempt = request.clone();
+            attempt.model = Some(model.model.clone());
+            if let Some(max_output) = model.max_output_tokens {
+                let max_output = u32::try_from(max_output)
+                    .map_err(|_| RuntimeError::Config("模型输出上限超过协议支持范围".into()))?;
+                attempt.max_tokens = Some(attempt.max_tokens.unwrap_or(max_output).min(max_output));
+            }
+            if let Some(budget) = route.budget_tokens {
+                let remaining = budget;
+                if remaining == 0 {
+                    break;
+                }
+                attempt.max_tokens = Some(attempt.max_tokens.unwrap_or(remaining).min(remaining));
+            }
+            tracing::debug!(target = "llm", role, provider = %model.provider, model = %model.model, "尝试 LLM 路由");
+            match provider.generate(attempt).await {
+                Ok(response) => {
+                    return Ok(response);
+                }
+                Err(error) if is_retryable_provider_error(&error) => {
+                    tracing::warn!(target = "llm", role, provider = %model.provider, error = %error, "Provider 可重试失败，切换备用模型");
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| RuntimeError::Llm("所有 LLM Provider 均失败".into())))
+    }
+}
+
+fn is_retryable_provider_error(error: &RuntimeError) -> bool {
+    matches!(error, RuntimeError::HttpError(_))
 }
 
 #[async_trait::async_trait]
 impl LlmScheduler for DefaultLlmScheduler {
     async fn submit(&self, request: LlmRequest) -> Result<LlmResponse, RuntimeError> {
         self.dispatch(request).await
+    }
+
+    fn capabilities_for(
+        &self,
+        role: &str,
+    ) -> Option<crate::infrastructure::llm::FixedModelCapabilities> {
+        self.routes
+            .as_ref()?
+            .get(role)
+            .and_then(|route| route.models.first())
+            .map(|model| {
+                crate::infrastructure::llm::FixedModelCapabilities::new(
+                    model.context_window,
+                    model.max_output_tokens,
+                )
+            })
     }
 }
 
@@ -290,7 +362,14 @@ impl EmbeddingScheduler for DefaultLlmScheduler {
     async fn submit_embedding(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, RuntimeError> {
         // Embedding 仍然使用 inner（embedding 不需要角色路由）
         match self.embedding_semaphore.clone().try_acquire_owned() {
-            Ok(_permit) => self.inner.embed(texts).await,
+            Ok(_embedding_permit) => {
+                let _global_permit = self
+                    .semaphore
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| RuntimeError::Llm("Embedding 请求因全局满载被延后".into()))?;
+                self.inner.embed(texts).await
+            }
             Err(_) => {
                 tracing::debug!(target = "llm", "Embedding 请求在满载时被丢弃（背压保护）");
                 Err(RuntimeError::Llm("Embedding 请求因满载被丢弃".to_string()))
@@ -310,6 +389,7 @@ mod tests {
     struct FakeProvider {
         calls: AtomicUsize,
         hang: bool,
+        fail: bool,
         name: String,
         expected_model: Option<String>,
         /// 记录实际收到的 model 值
@@ -321,6 +401,7 @@ mod tests {
             Self {
                 calls: AtomicUsize::new(0),
                 hang,
+                fail: false,
                 name: name.to_string(),
                 expected_model: None,
                 captured_model: std::sync::Mutex::new(None),
@@ -329,6 +410,11 @@ mod tests {
 
         fn with_expected_model(mut self, model: &str) -> Self {
             self.expected_model = Some(model.to_string());
+            self
+        }
+
+        fn with_retryable_failure(mut self) -> Self {
+            self.fail = true;
             self
         }
 
@@ -345,6 +431,9 @@ mod tests {
     impl LlmProvider for FakeProvider {
         async fn generate(&self, request: LlmRequest) -> Result<LlmResponse, RuntimeError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(RuntimeError::HttpError("temporary provider failure".into()));
+            }
             if self.hang {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -419,18 +508,25 @@ mod tests {
     }
 
     // =============================================================================
-    // 优先级调度测试（legacy 单 Provider 模式）
+    // 优先级调度测试（单 Provider 模式）
     // =============================================================================
 
     #[tokio::test]
-    async fn p0_is_not_blocked_when_full() {
+    async fn p0_waits_when_full() {
         let provider = Arc::new(FakeProvider::new(true, "fake"));
         let scheduler = Arc::new(DefaultLlmScheduler::with_limit(provider.clone(), 1));
 
         let holder = spawn_holder(scheduler.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        let p0 = scheduler.submit(request(0)).await.unwrap();
+        let p0_request = scheduler.submit(request(0));
+        tokio::pin!(p0_request);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), &mut p0_request)
+                .await
+                .is_err()
+        );
+        let p0 = p0_request.await.unwrap();
         assert_eq!(p0.content, "prio=0");
 
         holder.await.unwrap();
@@ -482,19 +578,68 @@ mod tests {
         assert!(provider.call_count() >= 6);
     }
 
+    #[tokio::test]
+    async fn mixed_priorities_obey_global_limit() {
+        struct TrackingProvider {
+            active: AtomicUsize,
+            peak: AtomicUsize,
+        }
+        #[async_trait]
+        impl LlmProvider for TrackingProvider {
+            async fn generate(&self, _: LlmRequest) -> Result<LlmResponse, RuntimeError> {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(LlmResponse {
+                    content: "回复".into(),
+                    model: "测试".into(),
+                    usage: TokenUsage {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                    },
+                    truncated: false,
+                })
+            }
+            async fn health_check(&self) -> Result<bool, RuntimeError> {
+                Ok(true)
+            }
+            fn name(&self) -> &str {
+                "测试"
+            }
+        }
+        let provider = Arc::new(TrackingProvider {
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let scheduler = Arc::new(DefaultLlmScheduler::with_limit(provider.clone(), 4));
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..24 {
+            let scheduler = scheduler.clone();
+            tasks.spawn(async move { scheduler.submit(request(i % 3)).await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+        assert_eq!(provider.peak.load(Ordering::SeqCst), 4);
+    }
+
     // =============================================================================
     // Test helper: 构建两个隔离的 Provider
     // =============================================================================
 
+    type IsolatedProviders = (
+        std::collections::HashMap<String, Arc<dyn LlmProvider>>,
+        std::collections::HashMap<String, crate::application::config::LlmModelInstanceConfig>,
+        Arc<FakeProvider>,
+        Arc<FakeProvider>,
+    );
+
     /// 构建隔离的测试 Provider：
     /// - provider_a: zhipu / model-a
     /// - provider_b: minimax / model-b
-    fn make_isolated_providers() -> (
-        std::collections::HashMap<String, Arc<dyn LlmProvider>>,
-        std::collections::HashMap<String, crate::application::config::LlmModelInstanceConfig>,
-        Arc<FakeProvider>, // a_provider（用于捕获）
-        Arc<FakeProvider>, // b_provider（用于捕获）
-    ) {
+    fn make_isolated_providers() -> IsolatedProviders {
         let a_provider =
             Arc::new(FakeProvider::new(false, "provider_a").with_expected_model("model-a"));
         let b_provider =
@@ -746,25 +891,25 @@ mod tests {
     }
 
     // =============================================================================
-    // Test 8：Legacy 单 Provider 模式（无 role routing）
+    // Test 8：单 Provider 模式（无 role routing）
     // =============================================================================
 
     #[tokio::test]
-    async fn legacy_single_provider_mode_works() {
+    async fn single_provider_mode_works() {
         // 使用 with_limit，不配置 providers/role_mis
         let provider = Arc::new(FakeProvider::new(false, "fake"));
         let scheduler = Arc::new(DefaultLlmScheduler::with_limit(provider.clone(), 4));
 
-        // 带 role 的请求在 legacy 模式下仍会尝试路由，但会返回错误（因为无 providers）
+        // 单 Provider 模式允许调用方继续携带业务角色元数据。
         let req = request_with_role(1, "conversation");
         let result = scheduler.submit(req).await;
-        assert!(result.is_err(), "无 providers 配置时应返回 Config 错误");
+        assert!(result.is_ok(), "单 Provider 模式应接受业务角色元数据");
 
-        // 不带 role 的请求在 legacy 模式下直接发送到 inner
+        // 不带 role 的请求直接发送到默认 Provider。
         let req_no_role = request(1);
         let resp = scheduler.submit(req_no_role).await.unwrap();
         assert_eq!(resp.content, "prio=1");
-        assert_eq!(provider.call_count(), 1);
+        assert_eq!(provider.call_count(), 2);
     }
 
     // =============================================================================
@@ -822,5 +967,48 @@ mod tests {
 
         let captured = a_provider.take_captured_model();
         assert_eq!(captured, Some(Some("model-a".to_string())));
+    }
+
+    #[tokio::test]
+    async fn retryable_provider_error_uses_fallback_model() {
+        let primary = Arc::new(FakeProvider::new(false, "primary").with_retryable_failure());
+        let backup =
+            Arc::new(FakeProvider::new(false, "backup").with_expected_model("backup-model"));
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "primary".to_string(),
+            primary.clone() as Arc<dyn LlmProvider>,
+        );
+        providers.insert("backup".to_string(), backup.clone() as Arc<dyn LlmProvider>);
+        let routes = std::collections::HashMap::from([(
+            "conversation".to_string(),
+            LlmRouteConfig {
+                models: vec![
+                    crate::application::config::LlmModelInstanceConfig {
+                        provider: "primary".into(),
+                        model: "primary-model".into(),
+                        context_window: Some(8192),
+                        max_output_tokens: Some(256),
+                    },
+                    crate::application::config::LlmModelInstanceConfig {
+                        provider: "backup".into(),
+                        model: "backup-model".into(),
+                        context_window: Some(8192),
+                        max_output_tokens: Some(256),
+                    },
+                ],
+                max_attempts: 2,
+                budget_tokens: Some(512),
+            },
+        )]);
+        let scheduler =
+            DefaultLlmScheduler::with_provider_routes(primary.clone(), 2, 2, providers, routes);
+        let response = scheduler
+            .submit(request_with_role(1, "conversation"))
+            .await
+            .unwrap();
+        assert_eq!(response.content, "prio=1");
+        assert_eq!(primary.call_count(), 1);
+        assert_eq!(backup.call_count(), 1);
     }
 }

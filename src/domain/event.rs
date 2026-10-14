@@ -49,7 +49,7 @@ pub enum CoreEvent {
 
     /// 一条消息已被持久化并分配了 canonical identity 和 ingress order。
     ///
-    /// 在 `MessagePersistence` 完成 commit 后发布。
+    /// 在 `MessageAcceptanceService` 完成 commit 后发布。
     /// 用于替代 `MessageReceived` 触发下游处理（ReplyProcessor）。
     MessageAccepted(MessageAcceptedEvent),
 }
@@ -81,6 +81,9 @@ pub struct MessageAcceptedEvent {
     pub platform_message_id: Option<i64>,
     /// QQBOT 接受该消息的时间（来自 accept_message 事务内生成）。
     pub ingested_at: DateTime<Utc>,
+    /// 入站附加信息：作者类型、平台作者 ID、显示名、提及、引用和绑定版本等。
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 /// 从用户处收到了一条消息。
@@ -106,6 +109,9 @@ pub struct MessageReceivedEvent {
     pub platform_message_id: Option<i64>,
     /// QQBOT Application 接受该消息的时间。
     pub ingested_at: DateTime<Utc>,
+    /// 与消息一同接受的结构化附加信息，不能在 Outbox 转换时丢失。
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 /// 一条消息被发出。

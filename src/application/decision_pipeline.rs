@@ -21,6 +21,8 @@ pub struct DecisionLlmPipeline {
     backup: Option<Arc<dyn DecisionLlmService>>,
     validator: DecisionResultValidator,
     policy: Arc<dyn DecisionOverridePolicy>,
+    #[cfg(test)]
+    override_result: Option<DecisionResult>,
 }
 
 impl std::fmt::Debug for DecisionLlmPipeline {
@@ -45,7 +47,15 @@ impl DecisionLlmPipeline {
             backup,
             validator,
             policy,
+            #[cfg(test)]
+            override_result: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_override_result(mut self, result: DecisionResult) -> Self {
+        self.override_result = Some(result);
+        self
     }
 
     /// 执行 Pipeline：Primary → Backup → Built-in Fallback。
@@ -57,6 +67,10 @@ impl DecisionLlmPipeline {
         ctx: &DecisionContext,
         built_in: &BuiltInDecision,
     ) -> Result<DecisionResult, DecisionFailure> {
+        #[cfg(test)]
+        if let Some(result) = &self.override_result {
+            return Ok(result.clone());
+        }
         // 1. 尝试 Primary
         match self.primary.call(ctx, built_in).await {
             Ok(result) => {

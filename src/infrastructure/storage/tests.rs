@@ -9,6 +9,7 @@ mod storage_tests {
     use crate::domain::relationship::*;
     use crate::domain::repository::*;
     use crate::infrastructure::storage::SqliteStorage;
+    use std::sync::Arc;
 
     async fn setup_storage() -> SqliteStorage {
         let storage = SqliteStorage::open_in_memory()
@@ -43,17 +44,6 @@ mod storage_tests {
             occurred_at: None,
             ingested_at: None,
         }
-    }
-
-    /// 构造测试用消息的简写版本
-    fn msg(conv_id: i64, sender_id: i64, text: &str, char_id: Option<i64>) -> Message {
-        make_test_message(
-            conv_id,
-            sender_id,
-            MessageContent::Text(text.to_string()),
-            chrono::Utc::now(),
-            char_id,
-        )
     }
 
     #[tokio::test]
@@ -139,6 +129,171 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn test_accept_message_is_idempotent_by_platform_identity() {
+        let storage = setup_storage().await;
+        let conv_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let msg_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        sqlx::query("INSERT INTO characters(name) VALUES('测试角色')")
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        let conversation_id = conv_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Group,
+                external_id: "dedup-group".into(),
+                name: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO participants(conversation_id,external_id,display_name,role,metadata) VALUES(?,?,?,?,?)")
+            .bind(conversation_id).bind("1").bind("测试用户").bind("user").bind("{}")
+            .execute(storage.pool()).await.unwrap();
+        let now = chrono::Utc::now();
+        let payload = serde_json::json!({"event_uuid":"dedup-event","conversation_id":conversation_id,"sender_id":1,"message_id":0,"content":"同一条","timestamp":now,"is_mentioned":false,"character_id":1,"conversation_sequence":0,"platform_message_id":Some(42i64),"ingested_at":now});
+        let first = msg_repo
+            .accept_message(&crate::domain::repository::AcceptedMessageInput {
+                conversation_id,
+                sender_id: 1,
+                content_json: serde_json::json!({"Text":"同一条"}).to_string(),
+                timestamp: now.to_rfc3339(),
+                platform_message_id: Some(42),
+                character_id: 1,
+                event_uuid: "dedup-event".to_string(),
+                outbox_payload: payload.to_string(),
+            })
+            .await
+            .unwrap();
+        let second = msg_repo
+            .accept_message(&crate::domain::repository::AcceptedMessageInput {
+                conversation_id,
+                sender_id: 1,
+                content_json: serde_json::json!({"Text":"同一条"}).to_string(),
+                timestamp: now.to_rfc3339(),
+                platform_message_id: Some(42),
+                character_id: 1,
+                event_uuid: "dedup-event-duplicate".to_string(),
+                outbox_payload: payload.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.0, second.0);
+        assert_eq!(first.1, second.1);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id=?")
+                .bind(conversation_id)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM outbox_events WHERE ordering_key=?")
+                .bind(conversation_id.to_string())
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(events, 1);
+    }
+
+    #[tokio::test]
+    async fn message_acceptance_publishes_one_canonical_event_for_duplicate_delivery() {
+        let storage = setup_storage().await;
+        let conv_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let msg_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let character_id: i64 =
+            sqlx::query_scalar("INSERT INTO characters(name) VALUES('事件角色') RETURNING id")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let conversation_id = conv_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Private,
+                external_id: "canonical-event".into(),
+                name: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let participant_id: i64 = sqlx::query_scalar("INSERT INTO participants(conversation_id,external_id,display_name,role,metadata) VALUES(?,?,?,?,?) RETURNING id")
+            .bind(conversation_id)
+            .bind("user-1")
+            .bind("用户")
+            .bind("user")
+            .bind("{}")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+
+        let bus = crate::application::event_bus::EventBus::new();
+        let mut subscription = bus.subscribe();
+        let service = crate::application::message_acceptance::MessageAcceptanceService::new(
+            std::sync::Arc::new(msg_repo),
+            bus,
+        );
+        let timestamp = chrono::Utc::now();
+        let metadata = serde_json::json!({
+            "author_kind": "user",
+            "external_sender_id": "user-1",
+            "display_name": "用户",
+        });
+
+        service
+            .accept_inbound(
+                conversation_id,
+                participant_id,
+                "你好".into(),
+                timestamp,
+                Some(9001),
+                character_id,
+                false,
+                metadata.clone(),
+            )
+            .await
+            .unwrap();
+        service
+            .accept_inbound(
+                conversation_id,
+                participant_id,
+                "你好".into(),
+                timestamp,
+                Some(9001),
+                character_id,
+                false,
+                metadata,
+            )
+            .await
+            .unwrap();
+
+        let event = subscription.recv().await.expect("首次接受应发布事件");
+        match event {
+            crate::domain::event::CoreEvent::MessageAccepted(event) => {
+                assert!(event.message_id > 0);
+                assert_eq!(event.conversation_sequence, 1);
+                assert_eq!(event.content, "你好");
+            }
+            other => panic!("应发布 MessageAccepted，实际 {other:?}"),
+        }
+        assert!(
+            subscription.try_recv().is_none(),
+            "重复投递不得再次发布事件"
+        );
+    }
+
+    #[tokio::test]
     async fn test_message_crud() {
         let storage = setup_storage().await;
         let conv_repo =
@@ -198,6 +353,294 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn test_reply_task_unknown_preserves_content_and_error() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let conv_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let msg_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let character_id = char_repo
+            .insert(&Character {
+                id: 0,
+                definition: CharacterDefinition {
+                    name: "ReplyTask".into(),
+                    description: None,
+                    personality: None,
+                    scenario: None,
+                    style: None,
+                    background: None,
+                    greetings: vec![],
+                    example_messages: vec![],
+                    system_prompt: None,
+                    post_history_instructions: None,
+                    lorebook: vec![],
+                    metadata: serde_json::json!({}),
+                },
+                enabled: true,
+                state: CharacterState::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let conversation_id = conv_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Private,
+                external_id: "reply-task-test".into(),
+                name: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let sender_id: i64 = sqlx::query_scalar("INSERT INTO participants(conversation_id,external_id,display_name,role,metadata) VALUES(?,?,?,?,?) RETURNING id")
+            .bind(conversation_id).bind("u1").bind("用户").bind("user").bind("{}").fetch_one(storage.pool()).await.unwrap();
+        let message_id = msg_repo
+            .insert(&make_test_message(
+                conversation_id,
+                sender_id,
+                MessageContent::Text("hello".into()),
+                chrono::Utc::now(),
+                Some(character_id),
+            ))
+            .await
+            .unwrap();
+        msg_repo
+            .save_reply_task_error(
+                message_id,
+                character_id,
+                ReplyTaskStatus::Unknown,
+                Some("reply"),
+                Some("发送结果未知"),
+            )
+            .await
+            .unwrap();
+        let task = msg_repo.reply_task(message_id).await.unwrap().unwrap();
+        assert_eq!(task.status, ReplyTaskStatus::Unknown);
+        assert_eq!(task.content.as_deref(), Some("reply"));
+        assert_eq!(task.error.as_deref(), Some("发送结果未知"));
+    }
+
+    #[tokio::test]
+    async fn test_reply_task_sending_recovery_is_atomic_and_preserves_content() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let conv_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let msg_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let character_id = char_repo
+            .insert(&Character {
+                id: 0,
+                definition: CharacterDefinition {
+                    name: "SendingRecovery".into(),
+                    description: None,
+                    personality: None,
+                    scenario: None,
+                    style: None,
+                    background: None,
+                    greetings: vec![],
+                    example_messages: vec![],
+                    system_prompt: None,
+                    post_history_instructions: None,
+                    lorebook: vec![],
+                    metadata: serde_json::json!({}),
+                },
+                enabled: true,
+                state: CharacterState::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let conversation_id = conv_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Private,
+                external_id: "sending-recovery-test".into(),
+                name: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let sender_id: i64 = sqlx::query_scalar("INSERT INTO participants(conversation_id,external_id,display_name,role,metadata) VALUES(?,?,?,?,?) RETURNING id")
+            .bind(conversation_id)
+            .bind("u1")
+            .bind("用户")
+            .bind("user")
+            .bind("{}")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        let message_id = msg_repo
+            .insert(&make_test_message(
+                conversation_id,
+                sender_id,
+                MessageContent::Text("hello".into()),
+                chrono::Utc::now(),
+                Some(character_id),
+            ))
+            .await
+            .unwrap();
+        msg_repo
+            .save_reply_task(
+                message_id,
+                character_id,
+                ReplyTaskStatus::Sending,
+                Some("已经生成的回复"),
+            )
+            .await
+            .unwrap();
+
+        assert!(msg_repo
+            .mark_reply_task_unknown_if_sending(
+                message_id,
+                character_id,
+                "进程在发送平台回执前退出，发送结果未知，需要核查",
+            )
+            .await
+            .unwrap());
+        assert!(!msg_repo
+            .mark_reply_task_unknown_if_sending(message_id, character_id, "不应覆盖")
+            .await
+            .unwrap());
+
+        let task = msg_repo.reply_task(message_id).await.unwrap().unwrap();
+        assert_eq!(task.status, ReplyTaskStatus::Unknown);
+        assert_eq!(task.content.as_deref(), Some("已经生成的回复"));
+        assert_eq!(
+            task.error.as_deref(),
+            Some("进程在发送平台回执前退出，发送结果未知，需要核查")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_requeue_unknown_reply_task_requires_unknown_and_requeues_event() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let conv_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let msg_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let character_id = char_repo
+            .insert(&Character {
+                id: 0,
+                definition: CharacterDefinition {
+                    name: "RetryTask".into(),
+                    description: None,
+                    personality: None,
+                    scenario: None,
+                    style: None,
+                    background: None,
+                    greetings: vec![],
+                    example_messages: vec![],
+                    system_prompt: None,
+                    post_history_instructions: None,
+                    lorebook: vec![],
+                    metadata: serde_json::json!({}),
+                },
+                enabled: true,
+                state: CharacterState::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let conversation_id = conv_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Private,
+                external_id: "retry-task-test".into(),
+                name: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let sender_id: i64 = sqlx::query_scalar("INSERT INTO participants(conversation_id,external_id,display_name,role,metadata) VALUES(?,?,?,?,?) RETURNING id")
+            .bind(conversation_id).bind("u2").bind("用户").bind("user").bind("{}").fetch_one(storage.pool()).await.unwrap();
+        let message_id = msg_repo
+            .insert(&make_test_message(
+                conversation_id,
+                sender_id,
+                MessageContent::Text("retry".into()),
+                chrono::Utc::now(),
+                Some(character_id),
+            ))
+            .await
+            .unwrap();
+        msg_repo
+            .save_reply_task_error(
+                message_id,
+                character_id,
+                ReplyTaskStatus::Unknown,
+                Some("reply"),
+                Some("超时"),
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query("INSERT INTO outbox_events(event_uuid,entity_id,entity_type,event_type,event_version,payload,ordering_key,ordering_seq,created_at,available_at,status,attempts,last_error,locked_until,processed_at,lease_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind("retry-task-event")
+            .bind(message_id)
+            .bind("messages")
+            .bind("MessageAccepted")
+            .bind(1i32)
+            .bind("{}")
+            .bind(format!("conversation:{conversation_id}"))
+            .bind(1i64)
+            .bind(&now)
+            .bind(&now)
+            .bind("completed")
+            .bind(3i32)
+            .bind("unknown")
+            .bind(Option::<String>::None)
+            .bind(&now)
+            .bind(Option::<String>::None)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+
+        assert!(msg_repo
+            .requeue_unknown_reply_task(message_id)
+            .await
+            .unwrap());
+        let task = msg_repo.reply_task(message_id).await.unwrap().unwrap();
+        assert_eq!(task.status, ReplyTaskStatus::Generated);
+        assert_eq!(task.content.as_deref(), Some("reply"));
+        let (status, attempts): (String, i32) = sqlx::query_as(
+            "SELECT status, attempts FROM outbox_events WHERE event_uuid='retry-task-event'",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(attempts, 0);
+        assert!(!msg_repo
+            .requeue_unknown_reply_task(message_id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn test_memory_crud() {
         let storage = setup_storage().await;
         let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
@@ -252,6 +695,90 @@ mod storage_tests {
             .expect("find memories failed");
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].content, "User likes cats");
+    }
+
+    #[tokio::test]
+    async fn test_candidate_memory_is_idempotent_and_hidden_from_normal_reads() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let memory_repo = Arc::new(
+            crate::infrastructure::storage::repository::SqliteMemoryRepository::new(
+                storage.pool().clone(),
+            ),
+        );
+        let character = Character {
+            id: 0,
+            definition: CharacterDefinition {
+                name: "CandidateTest".to_string(),
+                description: None,
+                personality: None,
+                scenario: None,
+                style: None,
+                background: None,
+                greetings: vec![],
+                example_messages: vec![],
+                system_prompt: None,
+                post_history_instructions: None,
+                lorebook: vec![],
+                metadata: serde_json::json!({}),
+            },
+            enabled: true,
+            state: CharacterState::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let character_id = char_repo.insert(&character).await.unwrap();
+        let service = crate::application::memory_service::MemoryService::new(memory_repo.clone());
+        let occurred_at = chrono::Utc::now();
+
+        assert_eq!(
+            service
+                .extract_and_store(
+                    character_id,
+                    None,
+                    7,
+                    "我喜欢喝咖啡，每天都要来一杯",
+                    9001,
+                    occurred_at,
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            service
+                .extract_and_store(
+                    character_id,
+                    None,
+                    7,
+                    "我喜欢喝咖啡，每天都要来一杯",
+                    9001,
+                    occurred_at,
+                )
+                .await
+                .unwrap(),
+            0,
+            "同一来源消息重试不得重复生成候选"
+        );
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memories WHERE character_id = ? AND json_extract(metadata, '$.status') = 'candidate'",
+        )
+        .bind(character_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            memory_repo
+                .find_by_character_id(character_id, None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "候选记忆不得进入普通读取路径"
+        );
     }
 
     #[tokio::test]
@@ -410,6 +937,205 @@ mod storage_tests {
 
         let found2 = rel_repo.find(char_id, part_id).await.unwrap().unwrap();
         assert_eq!(found2.interaction_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_relationship_interaction_is_idempotent_by_source_message() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let conv_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let part_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+        let msg_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let rel_repo =
+            crate::infrastructure::storage::repository::SqliteRelationshipRepository::new(
+                storage.pool().clone(),
+            );
+        let character = Character {
+            id: 0,
+            definition: CharacterDefinition {
+                name: "Idempotent".to_string(),
+                description: None,
+                personality: None,
+                scenario: None,
+                style: None,
+                background: None,
+                greetings: vec![],
+                example_messages: vec![],
+                system_prompt: None,
+                post_history_instructions: None,
+                lorebook: vec![],
+                metadata: serde_json::json!({}),
+            },
+            enabled: true,
+            state: CharacterState::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let character_id = char_repo.insert(&character).await.unwrap();
+        let conversation_id = conv_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Private,
+                external_id: "idempotent-user".to_string(),
+                name: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let participant_id = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id,
+                external_id: "idempotent-user".to_string(),
+                display_name: "用户".to_string(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let message_id = msg_repo
+            .insert(&make_test_message(
+                conversation_id,
+                participant_id,
+                MessageContent::Text("你好".to_string()),
+                chrono::Utc::now(),
+                Some(character_id),
+            ))
+            .await
+            .unwrap();
+
+        assert!(rel_repo
+            .record_interaction_once(character_id, participant_id, message_id)
+            .await
+            .unwrap());
+        assert!(!rel_repo
+            .record_interaction_once(character_id, participant_id, message_id)
+            .await
+            .unwrap());
+        assert_eq!(
+            rel_repo
+                .find(character_id, participant_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .interaction_count,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_relationship_lookup_by_stable_user_key_across_conversations() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let conv_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let part_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+        let rel_repo =
+            crate::infrastructure::storage::repository::SqliteRelationshipRepository::new(
+                storage.pool().clone(),
+            );
+        let character = Character {
+            id: 0,
+            definition: CharacterDefinition {
+                name: "StableUserChar".to_string(),
+                description: None,
+                personality: None,
+                scenario: None,
+                style: None,
+                background: None,
+                greetings: vec![],
+                example_messages: vec![],
+                system_prompt: None,
+                post_history_instructions: None,
+                lorebook: vec![],
+                metadata: serde_json::json!({}),
+            },
+            enabled: true,
+            state: CharacterState::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let character_id = char_repo.insert(&character).await.unwrap();
+        let conversation_a = conv_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Group,
+                external_id: "group-a".to_string(),
+                name: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let participant_a = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id: conversation_a,
+                external_id: "900001".to_string(),
+                display_name: "小明".to_string(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"stable_user_key":"900001"}),
+            })
+            .await
+            .unwrap();
+        rel_repo
+            .upsert(&Relationship::new(character_id, participant_a))
+            .await
+            .unwrap();
+        let conversation_b = conv_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Group,
+                external_id: "group-b".to_string(),
+                name: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let participant_b = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id: conversation_b,
+                external_id: "900001".to_string(),
+                display_name: "小明（群B）".to_string(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"stable_user_key":"900001"}),
+            })
+            .await
+            .unwrap();
+        let found = rel_repo
+            .find_by_stable_user_key(character_id, "900001")
+            .await
+            .unwrap()
+            .expect("同一平台用户应找到跨会话关系");
+        assert_eq!(found.participant_id, participant_a);
+        assert_ne!(participant_a, participant_b);
+
+        // 首次通过稳定键归并时，即使当前会话的 participant 不同，也必须复用已有关系归属。
+        let canonical = rel_repo
+            .ensure_stable_relationship_participant(character_id, participant_b, "900001")
+            .await
+            .unwrap();
+        assert_eq!(canonical, participant_a);
     }
 
     #[tokio::test]
@@ -974,6 +1700,8 @@ mod storage_tests {
                 conv_id,
                 &crate::domain::character::BehaviorState {
                     last_proactive_at: Some(t),
+                    proactive_count_date: Some(chrono::Utc::now().date_naive()),
+                    proactive_count: 3,
                     last_updated: chrono::Utc::now(),
                 },
             )
@@ -986,6 +1714,7 @@ mod storage_tests {
             .unwrap();
         let saved = loaded2.last_proactive_at.expect("应能读回主动时间");
         assert!((saved - t).num_seconds().abs() <= 1, "主动时间应接近写入值");
+        assert_eq!(loaded2.proactive_count, 3);
     }
 
     #[tokio::test]

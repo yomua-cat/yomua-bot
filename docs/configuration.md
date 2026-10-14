@@ -4,13 +4,15 @@
 
 ## 路径与首次启动
 
-`--config-dir` 指定配置文件目录，默认进程工作目录；兼容把配置目录作为位置参数。该目录包含 `runtime.toml`、`onebot.toml` 和 `llm.toml`。
+`--config-dir` 指定配置文件目录，省略时使用启动目录下的 `config/`。配置目录包含 `runtime.toml`、`onebot.toml`、`llm.toml` 和 `decision.toml`；裸位置参数会被拒绝。部署时建议把服务工作目录设为项目/服务根目录，或者显式传入绝对路径。
 
-`runtime.toml` 不存在时，常驻入口尝试生成三个模板，然后以退出码 1 退出。模板中的 `admin_users = []` 必须修改。此流程只由缺失 `runtime.toml` 触发；其已存在时，不会自动补齐其他模板。OneBot 和 LLM 文件缺失时分别使用默认配置和关闭 LLM 的默认值。
+任一配置文件不存在时，常驻入口会在配置目录补齐缺失模板，然后以退出码 1 退出。模板中的 `admin_users = []` 必须修改；启用 OneBot 鉴权或 LLM 时也必须替换占位字段。配置文件全部存在后才会进行完整校验，不会因为缺少某一份文件而悄悄使用不完整默认值。
 
 文件存在时直接反序列化，缺少必要字段会报错，不是按字段逐项合并默认值。`llm.toml` 应保留 `[options]`，即使关闭 LLM 或使用多模型格式。
 
 `data_dir` 和 `plugins_dir` 的相对路径基于进程工作目录，不基于配置目录。部署时建议使用绝对路径。控制客户端不读取 TOML，需要独立传入 `--data-dir` 或 `--socket`。
+
+根目录中可能已有旧的本地 `runtime.toml`、`onebot.toml`、`llm.toml`。它们不会被删除或覆盖；首次发布的标准位置是 `config/`，需要继续使用旧位置时请显式传入 `--config-dir .`。
 
 ## runtime.toml
 
@@ -32,7 +34,7 @@ admin_users = ["REPLACE_WITH_ADMIN_ID"]
 | --- | --- |
 | `data_dir` | SQLite、控制及插件 socket 的目录；缺失整个文件时默认 `data` |
 | `log_level` | `trace/debug/info/warn/error`；初始化时 `RUST_LOG` 优先 |
-| `shutdown_timeout_secs` | 必须大于 0；尚未用于限制整个运行时关停时间 |
+| `shutdown_timeout_secs` | 必须大于 0；限制适配器、后台任务、插件和存储关闭的整体等待时间，超时后取消剩余任务 |
 | `admin_users` | 必须非空，否则常驻启动校验失败；不用于控制 socket 身份认证 |
 | `plugins_dir` | 省略时不启动插件；不存在或无效清单会记录日志 |
 | `broadcast_capacity` | 可选正数；默认 256；广播消费滞后可能丢事件 |
@@ -61,7 +63,7 @@ enabled = false
 [options]
 ```
 
-LLM 关闭时使用确定性回复，不发起模型请求。回复仍受角色绑定、参与者记录与行为判断约束。
+LLM 关闭时保留入站消息，但不会伪造固定回复，也不发起模型请求。回复仍受角色绑定、参与者记录与行为判断约束。
 
 ## llm.toml：单模型
 
@@ -84,7 +86,7 @@ output_reservation = 1024
 
 `context_window` 必须已知才能组装对话；`output_reservation` 默认 512，必须留出可用输入空间。服务端可用性、凭据及上下文窗口真实性需要单独验证。
 
-## llm.toml：多模型路由
+## llm.toml：Provider 与对话模型
 
 ```toml
 enabled = true
@@ -101,25 +103,69 @@ base_url = "https://llm.example.invalid/v1"
 api_key = "REPLACE_WITH_LLM_KEY"
 timeout_secs = 60
 
+[providers.backup]
+provider_type = "openai-compatible"
+base_url = "https://backup.example.invalid/v1"
+api_key = "REPLACE_WITH_BACKUP_KEY"
+timeout_secs = 60
+
 [model_instances.dialogue]
 provider = "primary"
 model = "REPLACE_WITH_MODEL_NAME"
 context_window = 8192
 max_output_tokens = 1024
 
+[model_instances.dialogue_backup]
+provider = "backup"
+model = "REPLACE_WITH_BACKUP_MODEL_NAME"
+context_window = 8192
+max_output_tokens = 1024
+
 [roles.conversation]
 model_instance = "dialogue"
+fallback_model_instances = ["dialogue_backup"]
+max_attempts = 2
+budget_tokens = 4096
 
 [roles.cognition]
 model_instance = "dialogue"
 ```
 
-Provider 注册连接参数，model instance 指定服务、模型及能力，role 引用 model instance。`providers` 非空时主程序选择多模型模式，要求非空 `roles`，并验证引用存在。对话和插件聊天使用 `conversation`；后台认知使用 `cognition`。只配置 `decision` 不能让实际对话工作，且当前主程序没有接入决策 LLM。
+Provider 只登记连接地址、密钥和超时；同一个 Provider 可以被多个 model instance 复用。model instance 只填写模型名和能力，URL 不重复写。对话和插件聊天使用 `conversation`；后台认知使用 `cognition`。
 
-model instance 中的能力字段不自动替代 `[options]` 的上下文预算；两处应保持与实际模型一致，不能据此认为已实现按模型动态预算。
+`fallback_model_instances` 按顺序尝试，`max_attempts` 限制本次请求最多尝试的模型数，`budget_tokens` 是主模型与备用模型共享的本次请求 token 上限。只有网络错误、超时、HTTP 429 或 5xx 会切换备用模型；认证失败、参数错误和响应格式错误会立即返回。每次请求只生成一次，备用模型只在尚未得到有效响应时使用。
+
+Grok 不需要专用代码。把 xAI 的 OpenAI-compatible 地址配置成一个 Provider，再为不同 Grok 模型各建一个 model instance 即可。
+
+model instance 中的能力字段用于该任务的上下文和输出限制；单 Provider 模式仍从 `[options]` 读取能力。不同任务使用不同模型时，应分别填写各 model instance 的能力，不要把决策模型的窗口当成对话模型窗口。
+
+## decision.toml：独立决策模型
+
+决策模型不与对话模型混在同一个任务表中。Provider 名称必须已经在 `llm.toml` 的 `[providers.*]` 注册；本文件只选择决策模型和备用模型。
+
+```toml
+enabled = true
+
+[primary]
+provider = "primary"
+model = "REPLACE_WITH_DECISION_MODEL"
+context_window = 8192
+max_output_tokens = 256
+
+[[fallbacks]]
+provider = "backup"
+model = "REPLACE_WITH_DECISION_BACKUP_MODEL"
+context_window = 8192
+max_output_tokens = 256
+
+max_attempts = 2
+budget_tokens = 1024
+```
+
+`decision.toml` 的备用链同样只在网络错误、超时、HTTP 429 或 5xx 时切换。决策模型只返回结构化建议，规则引擎和程序校验仍拥有最终裁决权。
 
 ## 修改与重载
 
-`reload-config` 当前只读取并校验 `runtime.toml`，返回部分配置值。它不会重建 Provider、适配器、日志过滤器或修改运行中配置，也不读取另外两个文件。需要生效的修改应通过受控关停和重启应用。
+`reload-config` 会读取并校验 `runtime.toml`、`onebot.toml`、`llm.toml` 和 `decision.toml` 四份配置。只有运行时可热更新字段会整体替换当前运行设置，并同步更新日志过滤器；数据目录、插件目录、OneBot 连接、LLM Provider/模型和决策模型等启动装配项会返回 `restart_required`，当前配置保持不变，需要受控关停后重启。
 
 配置文件可能包含令牌和密钥，全部 TOML 默认忽略，只有根 `Cargo.toml` 入库。提交问题时使用占位值，不粘贴真实配置。

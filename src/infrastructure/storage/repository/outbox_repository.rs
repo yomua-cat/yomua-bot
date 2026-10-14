@@ -82,6 +82,17 @@ fn parse_outbox_row(row: OutboxRow) -> Result<OutboxEvent, RepositoryError> {
 
 #[async_trait]
 impl OutboxRepository for SqliteOutboxRepository {
+    async fn renew_lease(
+        &self,
+        event_uuid: &str,
+        token: &str,
+        duration_secs: i64,
+    ) -> Result<bool, RepositoryError> {
+        let now = Utc::now();
+        let result=sqlx::query("UPDATE outbox_events SET locked_until=? WHERE event_uuid=? AND status='processing' AND lease_token=? AND locked_until > ?")
+          .bind((now+Duration::seconds(duration_secs.max(1))).to_rfc3339()).bind(event_uuid).bind(token).bind(now.to_rfc3339()).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
     async fn claim_next_event(
         &self,
         lease_duration_secs: i64,
@@ -116,13 +127,13 @@ impl OutboxRepository for SqliteOutboxRepository {
             WHERE o.status IN ('pending', 'retry_wait')
               AND o.available_at <= ?
               AND (o.locked_until IS NULL OR o.locked_until <= ?)
-              AND o.ordering_seq = (
-                  SELECT COALESCE(MAX(ordering_seq), 0) + 1
-                  FROM outbox_events
-                  WHERE ordering_key = o.ordering_key
-                    AND status IN ('completed', 'dead_letter')
+              AND NOT EXISTS (
+                  SELECT 1 FROM outbox_events earlier
+                  WHERE earlier.ordering_key=o.ordering_key
+                  AND earlier.ordering_seq < o.ordering_seq
+                  AND earlier.status NOT IN ('completed','dead_letter')
               )
-            ORDER BY o.ordering_key, o.ordering_seq
+            ORDER BY o.available_at, o.id
             LIMIT 1
             "#,
         )
@@ -456,7 +467,7 @@ impl OutboxRepository for SqliteOutboxRepository {
         .bind(event.status.to_string())
         .bind(event.attempts)
         .bind(&event.last_error)
-        .bind(&event.locked_until.map(|dt| dt.to_rfc3339()))
+        .bind(event.locked_until.map(|dt| dt.to_rfc3339()))
         .bind(&processed_at)
         .bind(&event.lease_token)
         .execute(&self.pool)

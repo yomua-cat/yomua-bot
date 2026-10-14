@@ -1,6 +1,6 @@
 //! 记忆服务 —— 长期记忆的提取与持久化。
 //!
-//! 遵循 docs/05 的记忆生命周期：
+//! 候选记忆的基本生命周期：
 //! `消息 → MemoryCandidate → 重要度评估 → 持久化记忆`。
 //!
 //! MVP 使用**确定性启发式**提取：不要求每条消息都成为记忆，
@@ -8,6 +8,8 @@
 //! 但 LLM 必须经调度器、且与这里是可选叠加关系。
 
 use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
 
 use crate::domain::memory::{Memory, MemoryType};
 use crate::domain::repository::MemoryRepository;
@@ -102,20 +104,40 @@ impl MemoryService {
         conversation_id: Option<i64>,
         participant_id: i64,
         message_text: &str,
+        source_message_id: i64,
+        source_occurred_at: DateTime<Utc>,
     ) -> Result<usize, RuntimeError> {
         let Some(candidate) = self.evaluate(message_text, participant_id) else {
             return Ok(0);
         };
 
-        let memory = Memory::new(
+        let mut memory = Memory::new(
             character_id,
             conversation_id,
             candidate.memory_type,
             candidate.content,
             candidate.importance,
         );
-        let _ = self.memory_repo.insert(&memory).await?;
-        Ok(1)
+        memory.metadata = serde_json::json!({
+            "participant_ids": [candidate.participant_id],
+            "source_message_id": source_message_id,
+            "source_participant_id": participant_id,
+            "source_conversation_id": conversation_id,
+            "source_occurred_at": source_occurred_at,
+            "keywords": candidate.keywords,
+            "kind": "statement",
+            "status": "candidate",
+            "verification": "pending",
+            "candidate_reason": "确定性规则命中，等待后台确认",
+            "visibility": if candidate.memory_type == MemoryType::Episodic { "conversation" } else { "shared" },
+            "shared": candidate.memory_type != MemoryType::Episodic,
+        });
+        Ok(self
+            .memory_repo
+            .insert_candidate_once(&memory)
+            .await?
+            .map(|_| 1)
+            .unwrap_or(0))
     }
 
     /// 对消息做确定性重要度评估，返回候选；不足阈值时返回 `None`。
@@ -324,13 +346,20 @@ mod tests {
         let (svc, repo) = service();
         // 值得记忆的消息 → 落库 1 条。
         let n = svc
-            .extract_and_store(1, Some(10), 99, "我今天考试考砸了，心情不太好")
+            .extract_and_store(
+                1,
+                Some(10),
+                99,
+                "我今天考试考砸了，心情不太好",
+                100,
+                Utc::now(),
+            )
             .await
             .expect("提取应成功");
         assert_eq!(n, 1);
         // 无关紧要的短消息 → 不落库。
         let n = svc
-            .extract_and_store(1, Some(10), 99, "哈哈")
+            .extract_and_store(1, Some(10), 99, "哈哈", 101, Utc::now())
             .await
             .expect("提取应成功");
         assert_eq!(n, 0);

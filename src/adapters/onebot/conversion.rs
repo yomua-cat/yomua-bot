@@ -46,6 +46,10 @@ pub struct InboundMessage {
     pub unix_time: i64,
     /// 消息中是否包含「at」段（即 @ 了某个对象，很可能是角色）。
     pub is_mentioned: bool,
+    pub mention_targets: Vec<i64>,
+    pub reply_to: Option<i64>,
+    /// 非文本段的结构化摘要；不代表模型已经理解了媒体内容。
+    pub content_metadata: serde_json::Value,
 }
 
 /// 一次解析完成的出站发信请求的 OneBot API 描述。
@@ -115,10 +119,19 @@ pub fn onebot_event_to_inbound(event: &OneBotEvent) -> Result<InboundMessage, Ru
         .to_string();
 
     // 提取消息内容（支持 CQ 码字符串或消息分段数组）。
-    let content = extract_text_content(data.get("message"))?;
+    let mut content = extract_text_content(data.get("message"))?;
+    let content_metadata = message_content_metadata(data.get("message"));
+    if content.trim().is_empty() {
+        content = content_metadata
+            .get("summary")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+    }
 
     // 检测是否包含「at」段（即 @ 了某个对象）。
-    let is_mentioned = contains_at_segment(data.get("message"));
+    let (mention_targets, reply_to) = message_references(data.get("message"));
+    let is_mentioned = mention_targets.contains(&event.self_id);
 
     Ok(InboundMessage {
         conversation_type,
@@ -129,6 +142,60 @@ pub fn onebot_event_to_inbound(event: &OneBotEvent) -> Result<InboundMessage, Ru
         content,
         unix_time: event.time,
         is_mentioned,
+        mention_targets,
+        reply_to,
+        content_metadata,
+    })
+}
+
+/// 保存媒体段的类型、平台数据和一个明确的不可理解提示。
+fn message_content_metadata(message: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut segments = Vec::new();
+    let mut kinds = Vec::new();
+    let mut accept = |kind: &str, data: &serde_json::Value| {
+        if kind == "text" || kind == "at" || kind == "reply" {
+            return;
+        }
+        kinds.push(kind.to_string());
+        segments.push(serde_json::json!({"type": kind, "data": data}));
+    };
+    match message {
+        Some(serde_json::Value::Array(parts)) => {
+            for part in parts {
+                if let Some(kind) = part.get("type").and_then(|value| value.as_str()) {
+                    accept(kind, part.get("data").unwrap_or(&serde_json::Value::Null));
+                }
+            }
+        }
+        Some(serde_json::Value::String(text)) => {
+            let mut rest = text.as_str();
+            while let Some(start) = rest.find("[CQ:") {
+                let after = &rest[start + 4..];
+                let Some(end) = after.find(']') else { break };
+                let mut tokens = after[..end].split(',');
+                let kind = tokens.next().unwrap_or("");
+                let mut data = serde_json::Map::new();
+                for token in tokens {
+                    if let Some((key, value)) = token.split_once('=') {
+                        data.insert(key.to_string(), serde_json::json!(value));
+                    }
+                }
+                accept(kind, &serde_json::Value::Object(data));
+                rest = &after[end + 1..];
+            }
+        }
+        _ => {}
+    }
+    let summary = if kinds.is_empty() {
+        String::new()
+    } else {
+        format!("[收到{}消息，当前没有媒体识别能力]", kinds.join("、"))
+    };
+    serde_json::json!({
+        "has_unreadable_media": !segments.is_empty(),
+        "types": kinds,
+        "segments": segments,
+        "summary": summary,
     })
 }
 
@@ -163,26 +230,55 @@ fn extract_text_content(message: Option<&serde_json::Value>) -> Result<String, R
     }
 }
 
-/// 判断消息分段中是否包含「at」段（即 @ 了某个对象）。
-///
-/// CQ 码字符串（例如 `[CQ:at,qq=...]`）中的 at 不被解析为分段，
-/// 仅针对 OneBot 分段数组形式；对纯 CQ 码字符串的 at 检测可留待后续阶段。
-fn contains_at_segment(message: Option<&serde_json::Value>) -> bool {
-    let Some(message) = message else {
-        return false;
+/// 提取提及对象和引用平台消息，兼容数组与 CQ 字符串。
+fn message_references(message: Option<&serde_json::Value>) -> (Vec<i64>, Option<i64>) {
+    let mut mentions = Vec::new();
+    let mut reply = None;
+    let mut accept = |kind: &str, data: &serde_json::Value| {
+        let id = |key: &str| {
+            data.get(key).and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+        };
+        match kind {
+            "at" => {
+                if let Some(id) = id("qq") {
+                    mentions.push(id)
+                }
+            }
+            "reply" => reply = id("id"),
+            _ => {}
+        }
     };
-
     match message {
-        serde_json::Value::Array(segments) => segments.iter().any(|segment| {
-            segment
-                .get("type")
-                .and_then(|v| v.as_str())
-                .map(|t| t == "at")
-                .unwrap_or(false)
-        }),
-        // 字符串形式的 CQ 码：本阶段视作未提及（atom 片段暂未解析）。
-        _ => false,
+        Some(serde_json::Value::Array(parts)) => {
+            for p in parts {
+                if let Some(kind) = p.get("type").and_then(|v| v.as_str()) {
+                    accept(kind, &p["data"]);
+                }
+            }
+        }
+        Some(serde_json::Value::String(text)) => {
+            let mut rest = text.as_str();
+            while let Some(start) = rest.find("[CQ:") {
+                let after = &rest[start + 4..];
+                let Some(end) = after.find(']') else { break };
+                let mut tokens = after[..end].split(',');
+                let kind = tokens.next().unwrap_or("");
+                let mut data = serde_json::Map::new();
+                for token in tokens {
+                    if let Some((k, v)) = token.split_once('=') {
+                        data.insert(k.to_string(), serde_json::json!(v));
+                    }
+                }
+                accept(kind, &serde_json::Value::Object(data));
+                rest = &after[end + 1..];
+            }
+        }
+        _ => {}
     }
+    (mentions, reply)
 }
 
 /// 简单移除 CQ 码（例如 `[CQ:image,file=...]`），仅保留其中的纯文本。
@@ -228,6 +324,14 @@ pub fn build_private_send_request(user_id: &str, content: &str) -> OutgoingReque
             "user_id": parse_qq_id(user_id),
             "message": content,
         }),
+    }
+}
+
+/// 构建查询单条 OneBot 平台消息的请求。
+pub fn build_get_message_request(message_id: i64) -> OutgoingRequest {
+    OutgoingRequest {
+        action: "get_msg".to_string(),
+        params: serde_json::json!({ "message_id": message_id }),
     }
 }
 
@@ -301,12 +405,35 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_media_keeps_type_and_uses_explicit_summary() {
+        let event = OneBotEvent {
+            post_type: "message".to_string(),
+            time: 100,
+            self_id: 1,
+            data: json!({
+                "message_type": "private",
+                "message_id": 8,
+                "user_id": 555,
+                "message": [{"type": "image", "data": {"file": "photo.jpg", "url": "https://example.invalid/photo.jpg"}}],
+                "sender": {"user_id": 555, "nickname": "小红"}
+            }),
+        };
+        let inbound = onebot_event_to_inbound(&event).unwrap();
+        assert_eq!(inbound.content, "[收到image消息，当前没有媒体识别能力]");
+        assert_eq!(inbound.content_metadata["types"], json!(["image"]));
+        assert_eq!(
+            inbound.content_metadata["segments"][0]["data"]["file"],
+            "photo.jpg"
+        );
+    }
+
+    #[test]
     fn at_segment_sets_is_mentioned() {
         // 消息分段数组中出现 "at" 段 → 视为被提及（@）。
         let event = OneBotEvent {
             post_type: "message".to_string(),
             time: 1,
-            self_id: 1,
+            self_id: 123456,
             data: json!({
                 "message_type": "group",
                 "message_id": 1,
@@ -391,5 +518,12 @@ mod tests {
         assert_eq!(req.action, "send_private_msg");
         assert_eq!(req.params["user_id"], 555);
         assert_eq!(req.params["message"], "私聊回复");
+    }
+
+    #[test]
+    fn build_get_message_request_uses_platform_id() {
+        let req = build_get_message_request(9876);
+        assert_eq!(req.action, "get_msg");
+        assert_eq!(req.params["message_id"], 9876);
     }
 }

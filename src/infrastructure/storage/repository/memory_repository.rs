@@ -19,6 +19,130 @@ impl SqliteMemoryRepository {
 
 #[async_trait]
 impl MemoryRepository for SqliteMemoryRepository {
+    async fn candidate_exists_for_source(
+        &self,
+        character_id: i64,
+        conversation_id: Option<i64>,
+        source_message_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        let exists: i64 = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                SELECT 1 FROM memories
+                WHERE character_id = ?
+                  AND ((conversation_id = ?) OR (conversation_id IS NULL AND ? IS NULL))
+                  AND COALESCE(json_extract(metadata, '$.status'), 'formal') = 'candidate'
+                  AND json_extract(metadata, '$.source_message_id') = ?
+            )"#,
+        )
+        .bind(character_id)
+        .bind(conversation_id)
+        .bind(conversation_id)
+        .bind(source_message_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists != 0)
+    }
+
+    async fn insert_candidate_once(&self, memory: &Memory) -> Result<Option<i64>, RepositoryError> {
+        let Some(source_message_id) = memory
+            .metadata
+            .get("source_message_id")
+            .and_then(|value| value.as_i64())
+        else {
+            return Ok(Some(self.insert(memory).await?));
+        };
+        let mut tx = self.pool.begin().await?;
+        let exists: i64 = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                SELECT 1 FROM memories
+                WHERE character_id = ?
+                  AND ((conversation_id = ?) OR (conversation_id IS NULL AND ? IS NULL))
+                  AND COALESCE(json_extract(metadata, '$.status'), 'formal') = 'candidate'
+                  AND json_extract(metadata, '$.source_message_id') = ?
+            )"#,
+        )
+        .bind(memory.character_id)
+        .bind(memory.conversation_id)
+        .bind(memory.conversation_id)
+        .bind(source_message_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists != 0 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let metadata = serde_json::to_string(&memory.metadata)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let result = sqlx::query(
+            r#"INSERT INTO memories
+                (character_id, conversation_id, memory_type, content, importance,
+                 created_at, last_accessed, metadata, embedding)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(memory.character_id)
+        .bind(memory.conversation_id)
+        .bind(memory_type_name(memory.memory_type))
+        .bind(&memory.content)
+        .bind(memory.importance)
+        .bind(memory.created_at.to_rfc3339())
+        .bind(memory.last_accessed.to_rfc3339())
+        .bind(metadata)
+        .bind(&memory.embedding)
+        .execute(&mut *tx)
+        .await?;
+        let id = result.last_insert_rowid();
+        tx.commit().await?;
+        Ok(Some(id))
+    }
+
+    async fn cognition_progress(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+    ) -> Result<i64, RepositoryError> {
+        Ok(sqlx::query_scalar("SELECT last_message_id FROM cognition_progress WHERE character_id=? AND conversation_id=?").bind(character_id).bind(conversation_id).fetch_optional(&self.pool).await?.unwrap_or(0))
+    }
+    async fn commit_cognition_batch(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        expected_progress: i64,
+        new_progress: i64,
+        memories: &[Memory],
+    ) -> Result<bool, RepositoryError> {
+        if new_progress <= expected_progress {
+            return Err(RepositoryError::Internal("认知进度必须前进".into()));
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO cognition_progress(character_id,conversation_id,last_message_id) VALUES(?,?,0)").bind(character_id).bind(conversation_id).execute(&mut *tx).await?;
+        let result=sqlx::query("UPDATE cognition_progress SET last_message_id=? WHERE character_id=? AND conversation_id=? AND last_message_id=?").bind(new_progress).bind(character_id).bind(conversation_id).bind(expected_progress).execute(&mut *tx).await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        for memory in memories {
+            if memory.character_id != character_id
+                || memory.conversation_id != Some(conversation_id)
+            {
+                return Err(RepositoryError::Internal("认知记忆来源范围不一致".into()));
+            }
+            let kind = memory_type_name(memory.memory_type);
+            sqlx::query("INSERT INTO memories(character_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(character_id).bind(conversation_id).bind(kind).bind(&memory.content).bind(memory.importance).bind(memory.created_at.to_rfc3339()).bind(memory.last_accessed.to_rfc3339()).bind(memory.metadata.to_string()).bind(&memory.embedding).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+    async fn find_visible(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        limit: i64,
+    ) -> Result<Vec<Memory>, RepositoryError> {
+        let rows:Vec<MemoryRow>=sqlx::query_as("SELECT id,character_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding FROM memories WHERE character_id=? AND COALESCE(json_extract(metadata,'$.status'),'formal') != 'candidate' AND (conversation_id=? OR json_extract(metadata,'$.shared')=1) ORDER BY importance DESC,created_at DESC,id DESC LIMIT ?")
+            .bind(character_id).bind(conversation_id).bind(limit.max(0)).fetch_all(&self.pool).await?;
+        rows.into_iter().map(parse_memory_row).collect()
+    }
     async fn find_by_id(&self, id: i64) -> Result<Option<Memory>, RepositoryError> {
         let rows: Vec<MemoryRow> = sqlx::query_as(
             r#"SELECT id, character_id, conversation_id, memory_type, content,
@@ -56,6 +180,7 @@ impl MemoryRepository for SqliteMemoryRepository {
                 r#"SELECT id, character_id, conversation_id, memory_type, content,
                         importance, created_at, last_accessed, metadata, embedding
                      FROM memories WHERE character_id = ? AND memory_type = ?
+                       AND COALESCE(json_extract(metadata, '$.status'), 'formal') != 'candidate'
                      ORDER BY importance DESC, created_at DESC LIMIT ?"#,
             )
             .bind(character_id)
@@ -68,6 +193,7 @@ impl MemoryRepository for SqliteMemoryRepository {
                 r#"SELECT id, character_id, conversation_id, memory_type, content,
                         importance, created_at, last_accessed, metadata, embedding
                      FROM memories WHERE character_id = ?
+                       AND COALESCE(json_extract(metadata, '$.status'), 'formal') != 'candidate'
                      ORDER BY importance DESC, created_at DESC LIMIT ?"#,
             )
             .bind(character_id)
@@ -106,7 +232,9 @@ impl MemoryRepository for SqliteMemoryRepository {
              FROM memories WHERE character_id = ",
         );
         builder.push_bind(character_id);
-        builder.push(" AND (");
+        builder.push(
+            " AND COALESCE(json_extract(metadata, '$.status'), 'formal') != 'candidate' AND (",
+        );
         let mut first = true;
         for kw in &unique {
             if !first {
@@ -128,12 +256,7 @@ impl MemoryRepository for SqliteMemoryRepository {
     }
 
     async fn insert(&self, memory: &Memory) -> Result<i64, RepositoryError> {
-        let memory_type_str = match memory.memory_type {
-            MemoryType::Episodic => "episodic",
-            MemoryType::Semantic => "semantic",
-            MemoryType::Relationship => "relationship",
-            MemoryType::System => "system",
-        };
+        let memory_type_str = memory_type_name(memory.memory_type);
         let metadata = serde_json::to_string(&memory.metadata)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -160,7 +283,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         let metadata = serde_json::to_string(&memory.metadata)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"UPDATE memories SET
                 content = ?, importance = ?, last_accessed = ?, metadata = ?
              WHERE id = ?"#,
@@ -174,15 +297,24 @@ impl MemoryRepository for SqliteMemoryRepository {
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::NotFound(format!(
+                "memory {} not found",
+                memory.id
+            )));
+        }
         Ok(())
     }
 
     async fn delete(&self, id: i64) -> Result<(), RepositoryError> {
-        sqlx::query("DELETE FROM memories WHERE id = ?")
+        let result = sqlx::query("DELETE FROM memories WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
             .await
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::NotFound(format!("memory {id} not found")));
+        }
         Ok(())
     }
 
@@ -191,6 +323,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             r#"SELECT id, character_id, conversation_id, memory_type, content,
                       importance, created_at, last_accessed, metadata, embedding
                FROM memories
+               WHERE COALESCE(json_extract(metadata, '$.status'), 'formal') != 'candidate'
                ORDER BY importance DESC, created_at DESC, id DESC
                LIMIT ?"#,
         )
@@ -210,6 +343,7 @@ impl MemoryRepository for SqliteMemoryRepository {
                       importance, created_at, last_accessed, metadata, embedding
                FROM memories
                WHERE conversation_id = ?
+                 AND COALESCE(json_extract(metadata, '$.status'), 'formal') != 'candidate'
                ORDER BY importance DESC, created_at DESC, id DESC
                LIMIT ?"#,
         )
@@ -238,7 +372,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         let mut query = String::from(
             r#"SELECT id, character_id, conversation_id, memory_type, content,
                       importance, created_at, last_accessed, metadata, embedding
-               FROM memories WHERE 1=1"#,
+               FROM memories WHERE COALESCE(json_extract(metadata, '$.status'), 'formal') != 'candidate'"#,
         );
         let mut builder = sqlx::QueryBuilder::new(&query);
 
@@ -272,29 +406,12 @@ impl MemoryRepository for SqliteMemoryRepository {
         memory_type: Option<&str>,
         limit: i64,
     ) -> Result<Vec<SemanticMatchResult>, RepositoryError> {
-        // 从 semantic_memories 表读取同角色、同类型的全部记录。
-        let type_filter = memory_type.map(|t| format!("AND memory_type = '{}'", t));
-        let query = if let Some(tf) = &type_filter {
-            format!(
-                r#"SELECT id, character_id, conversation_id, memory_type, content,
-                          importance, created_at, last_accessed, metadata, embedding
-                   FROM semantic_memories
-                   WHERE character_id = {} {}
-                   ORDER BY importance DESC, created_at DESC"#,
-                character_id, tf
-            )
-        } else {
-            format!(
-                r#"SELECT id, character_id, conversation_id, memory_type, content,
-                          importance, created_at, last_accessed, metadata, embedding
-                   FROM semantic_memories
-                   WHERE character_id = {}
-                   ORDER BY importance DESC, created_at DESC"#,
-                character_id
-            )
-        };
-
-        let rows: Vec<MemoryRow> = sqlx::query_as(&query)
+        // 向量记忆仍使用独立表；当前对话上下文不主动调用该接口，避免把可选增强误当成默认 RAG。
+        let query = "SELECT id,character_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding FROM semantic_memories WHERE character_id=? AND (? IS NULL OR memory_type=?)";
+        let rows: Vec<MemoryRow> = sqlx::query_as(query)
+            .bind(character_id)
+            .bind(memory_type)
+            .bind(memory_type)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -367,6 +484,15 @@ type MemoryRow = (
     String,
     Option<String>,
 );
+
+fn memory_type_name(memory_type: MemoryType) -> &'static str {
+    match memory_type {
+        MemoryType::Episodic => "episodic",
+        MemoryType::Semantic => "semantic",
+        MemoryType::Relationship => "relationship",
+        MemoryType::System => "system",
+    }
+}
 
 fn parse_memory_row(row: MemoryRow) -> Result<Memory, RepositoryError> {
     let (

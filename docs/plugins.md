@@ -57,16 +57,20 @@ RPC 请求使用 `id`、`method`、`params`，响应使用相同 `id`、`ok`、`
 
 | 方法 | 清单权限 |
 | --- | --- |
-| `message.send` / `message.read` | 同名权限 |
+| `message.read` | 同名权限 |
+| `message.send` | 当前拒绝；插件不能代表角色发言 |
 | `character.read` | 同名权限 |
-| `character.state.read` / `character.state.write` | 同名权限 |
+| `character.state.read` | 同名权限 |
+| `character.state.write` | 当前拒绝；插件不能直接修改核心状态 |
 | `binding.read` | 同名权限 |
-| `memory.read` / `memory.write` | 同名权限 |
-| `relationship.read` / `relationship.write` | 同名权限 |
+| `memory.read` | 同名权限 |
+| `memory.write` | 当前拒绝；记忆由核心流程整理 |
+| `relationship.read` | 同名权限 |
+| `relationship.write` | 当前拒绝；关系变化由核心事件驱动 |
 | `llm.call` | 同名权限 |
 | `plugin_data.get/set/delete/list` | 无需声明；宿主按插件名隔离 |
 | `scheduler.create` | 当前拒绝，即使声明权限 |
 
 例如 `permissions = ["message.read", "character.read"]`。权限名必须使用清单支持的 dotted 名称。`message.read` 当前有实际处理器；参数、返回值和作用域应按[PluginApi](../src/application/plugin_api.rs)核对，授权规则见[权限模块](../src/infrastructure/plugin/permissions.rs)。
 
-当前角色状态 API 面向全局精力、压力和活动；不能据此假定具备全部会话状态管理。插件 LLM 请求仍受 LLM 开关与 `conversation` 路由约束。权限授权范围较宽，细粒度会话限制尚未验收。
+当前角色状态 API 面向全局精力、压力和活动；不能据此假定具备全部会话状态管理。插件 LLM 请求仍受 LLM 开关与 `conversation` 路由约束。`memory.read` 必须提供当前 `conversation_id`，核心先按会话可见范围排除候选和其他会话记忆；默认返回脱敏摘要，只有显式 `raw: true` 才返回原文。

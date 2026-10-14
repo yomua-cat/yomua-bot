@@ -599,6 +599,7 @@ mod tests {
                 conversation_sequence: 0,
                 platform_message_id: None,
                 ingested_at: chrono::Utc::now(),
+                metadata: serde_json::json!({}),
             }),
             CoreEvent::MessageSent(MessageSentEvent {
                 conversation_id: 1,

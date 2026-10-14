@@ -96,6 +96,12 @@ impl ConversationManager {
             .find_by_external_id(conversation_id, external_id)
             .await?
         {
+            let mut participant = participant;
+            if participant.display_name != display_name {
+                participant.display_name = display_name.to_string();
+                participant.metadata["display_name_updated_at"] = serde_json::json!(Utc::now());
+                self.participant_repo.update(&participant).await?;
+            }
             return Ok(participant.id);
         }
 
@@ -105,7 +111,10 @@ impl ConversationManager {
             external_id: external_id.to_string(),
             display_name: display_name.to_string(),
             role: ParticipantRole::User,
-            metadata: serde_json::json!({}),
+            metadata: serde_json::json!({
+                "stable_user_key": external_id,
+                "display_name_updated_at": Utc::now(),
+            }),
         };
         let id = self.participant_repo.insert(&participant).await?;
         Ok(id)

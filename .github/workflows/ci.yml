@@ -100,6 +100,8 @@ jobs:
             command: cargo fmt --all -- --check
           - name: 严格 Clippy
             command: cargo clippy --locked --all-targets -- -D warnings
+          - name: 插件 Unix socket
+            command: cargo test --locked --lib infrastructure::plugin::transport::tests -- --ignored --test-threads=1
     steps:
       - name: 获取代码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

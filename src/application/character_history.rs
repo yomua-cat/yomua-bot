@@ -184,14 +184,7 @@ mod tests {
 
         async fn accept_message(
             &self,
-            _conversation_id: i64,
-            _sender_id: i64,
-            _content_json: &str,
-            _timestamp: &str,
-            _platform_message_id: Option<i64>,
-            _character_id: i64,
-            _event_uuid: &str,
-            _outbox_payload: &str,
+            _input: &crate::domain::repository::AcceptedMessageInput,
         ) -> Result<(i64, i64, chrono::DateTime<chrono::Utc>), RepositoryError> {
             Err(RepositoryError::NotImplemented(
                 "not implemented".to_string(),

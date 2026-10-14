@@ -34,8 +34,8 @@ const DEFAULT_COOLDOWN: Duration = Duration::from_secs(600);
 /// 认知驱动的默认 idle 阈值（5 分钟无新消息则视为 idle）。
 const DEFAULT_IDLE_THRESHOLD: Duration = Duration::from_secs(300);
 
-/// 冷却时间映射 —— 防止同一角色在冷却期内被重复触发。
-type CooldownMap = RwLock<HashMap<i64, DateTime<Utc>>>;
+/// 冷却时间映射 —— 冷却边界是“角色 × 会话”，避免一个会话阻塞同角色的其他会话。
+type CooldownMap = RwLock<HashMap<(i64, i64), DateTime<Utc>>>;
 
 /// 后台认知驱动。
 ///
@@ -168,7 +168,10 @@ impl CognitionDriver {
     /// 处理单个绑定：冷却检查 → idle 检查 → 执行认知。
     async fn process_binding(&self, binding: &CharacterBinding) -> Result<(), RuntimeError> {
         // 冷却检查：距上次认知不足冷却时长则跳过。
-        if self.is_in_cooldown(binding.character_id).await? {
+        if self
+            .is_in_cooldown(binding.character_id, binding.conversation_id)
+            .await?
+        {
             return Ok(());
         }
 
@@ -182,15 +185,19 @@ impl CognitionDriver {
         // 更新冷却时间。
         let now = self.clock.now();
         let mut map = self.last_cognition.write().await;
-        map.insert(binding.character_id, now);
+        map.insert((binding.character_id, binding.conversation_id), now);
 
         Ok(())
     }
 
-    /// 检查某角色是否处于冷却期。
-    async fn is_in_cooldown(&self, character_id: i64) -> Result<bool, RuntimeError> {
+    /// 检查某角色在指定会话是否处于冷却期。
+    async fn is_in_cooldown(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+    ) -> Result<bool, RuntimeError> {
         let map = self.last_cognition.read().await;
-        if let Some(last) = map.get(&character_id) {
+        if let Some(last) = map.get(&(character_id, conversation_id)) {
             let cooldown = chrono::Duration::from_std(self.cooldown)
                 .map_err(|e| RuntimeError::Internal(format!("冷却时长无效: {e}")))?;
             return Ok(self.clock.now().signed_duration_since(*last) < cooldown);
@@ -231,12 +238,43 @@ impl CognitionDriver {
                 ))
             })?;
 
-        // 获取最近消息作为上下文（已通过 CharacterHistoryProvider 完成 attribution 过滤）。
-        // C2-3: cognition 不需要 sequence-based filtering（它只用最近消息作为 prompt）
-        let recent_messages = self
-            .character_history
-            .get_recent(binding.conversation_id, binding.character_id, 20, None)
-            .await?;
+        let watermark = match self
+            .memory_repo
+            .cognition_progress(binding.character_id, binding.conversation_id)
+            .await
+        {
+            Ok(value) => value,
+            Err(crate::error::RepositoryError::NotImplemented(_)) => {
+                tracing::debug!(
+                    character_id = binding.character_id,
+                    conversation_id = binding.conversation_id,
+                    "认知仓储未提供持久进度，跳过"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(RuntimeError::Repository(e)),
+        };
+        let recent_messages = match self
+            .message_repo
+            .find_cognition_batch(binding.character_id, binding.conversation_id, watermark, 40)
+            .await
+        {
+            Ok(messages) => messages,
+            Err(crate::error::RepositoryError::NotImplemented(_)) => {
+                self.character_history
+                    .get_recent(
+                        binding.conversation_id,
+                        binding.character_id,
+                        20,
+                        Some(watermark),
+                    )
+                    .await?
+            }
+            Err(e) => return Err(RuntimeError::Repository(e)),
+        };
+        let Some(last_message) = recent_messages.last() else {
+            return Ok(());
+        };
 
         let prompt = self.build_cognition_prompt(&character, &recent_messages);
 
@@ -272,32 +310,63 @@ impl CognitionDriver {
                 conversation_id = binding.conversation_id,
                 "LLM 返回空内容，跳过存储"
             );
+            let _ = self
+                .memory_repo
+                .commit_cognition_batch(
+                    binding.character_id,
+                    binding.conversation_id,
+                    watermark,
+                    last_message.id,
+                    &[],
+                )
+                .await
+                .map_err(RuntimeError::Repository)?;
             return Ok(());
         }
 
-        // 生成 embedding。
-        let embeddings = self
+        let embedding = self
             .embedding_scheduler
             .submit_embedding(vec![content.to_string()])
             .await
-            .map_err(|e| RuntimeError::Llm(e.to_string()))?;
-        let embedding = embeddings
-            .first()
-            .ok_or_else(|| RuntimeError::Internal("Embedding 返回为空".to_string()))?;
-
-        // 存储为语义记忆。
-        self.memory_repo
-            .insert_semantic(
+            .ok()
+            .and_then(|items| items.into_iter().next());
+        let mut memory = crate::domain::memory::Memory::new(
+            binding.character_id,
+            Some(binding.conversation_id),
+            crate::domain::memory::MemoryType::Semantic,
+            content.to_string(),
+            0.7,
+        );
+        memory.embedding = embedding.and_then(|v| serde_json::to_string(&v).ok());
+        memory.metadata = serde_json::json!({
+            "source_message_ids": recent_messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            "source_participant_ids": recent_messages.iter().map(|m| m.sender_id).collect::<Vec<_>>(),
+            "source_conversation_id": binding.conversation_id,
+            "source_occurred_at": recent_messages
+                .iter()
+                .filter_map(|m| m.occurred_at.or(Some(m.timestamp)))
+                .next(),
+            "visibility": "conversation",
+            "shared": false,
+            "status": "candidate",
+            "verification": "pending",
+            "kind": "inference",
+            "derived_at": self.clock.now()
+        });
+        let committed = self
+            .memory_repo
+            .commit_cognition_batch(
                 binding.character_id,
-                Some(binding.conversation_id),
-                "semantic",
-                content,
-                embedding,
-                0.7, // importance
-                "{}",
+                binding.conversation_id,
+                watermark,
+                last_message.id,
+                &[memory],
             )
             .await
             .map_err(RuntimeError::Repository)?;
+        if !committed {
+            return Ok(());
+        }
 
         tracing::info!(
             target: "runtime",
@@ -320,10 +389,18 @@ impl CognitionDriver {
         let dialogue = recent_messages
             .iter()
             .map(|m| {
-                let sender = if m.sender_id == 0 {
-                    String::from("用户")
-                } else {
-                    format!("角色{}", m.sender_id)
+                let sender = match m.metadata.get("author_kind").and_then(|v| v.as_str()) {
+                    Some("assistant") if m.active_character_id == Some(character.id) => {
+                        character.definition.name.clone()
+                    }
+                    Some("system") => "系统".to_string(),
+                    Some("other_bot") => "其他 Bot".to_string(),
+                    _ => m
+                        .metadata
+                        .get("display_name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("参与者{}", m.sender_id)),
                 };
                 let text = match &m.content {
                     crate::domain::message::MessageContent::Text(t) => t.clone(),

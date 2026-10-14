@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 
 use crate::domain::message::{Attachment, Message, MessageContent};
-use crate::domain::repository::MessageRepository;
+use crate::domain::repository::{AcceptedMessageInput, AcceptedMessageResult, MessageRepository};
 use crate::error::RepositoryError;
 
 pub struct SqliteMessageRepository {
@@ -95,6 +95,213 @@ fn parse_message_row(row: MessageRow) -> Result<Message, RepositoryError> {
 
 #[async_trait]
 impl MessageRepository for SqliteMessageRepository {
+    async fn find_cognition_batch(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        after_message_id: i64,
+        limit: i64,
+    ) -> Result<Vec<Message>, RepositoryError> {
+        let rows:Vec<MessageRow>=sqlx::query_as("SELECT id,conversation_id,sender_id,content,timestamp,reply_to,mentions,attachments,metadata,active_character_id,platform_message_id,conversation_sequence,occurred_at,ingested_at FROM messages WHERE active_character_id=? AND conversation_id=? AND id>? AND COALESCE(json_extract(metadata,'$.proactive'),0)!=1 ORDER BY id LIMIT ?")
+        .bind(character_id).bind(conversation_id).bind(after_message_id).bind(limit.max(0)).fetch_all(&self.pool).await?;
+        rows.into_iter().map(parse_message_row).collect()
+    }
+    async fn owns_outbox_lease(
+        &self,
+        message_id: i64,
+        token: &str,
+    ) -> Result<bool, RepositoryError> {
+        let found:i64=sqlx::query_scalar("SELECT COUNT(*) FROM outbox_events WHERE entity_id=? AND status='processing' AND lease_token=? AND locked_until > ?")
+            .bind(message_id).bind(token).bind(chrono::Utc::now().to_rfc3339()).fetch_one(&self.pool).await?;
+        Ok(found > 0)
+    }
+    async fn reply_task(
+        &self,
+        message_id: i64,
+    ) -> Result<Option<crate::domain::message::ReplyTask>, RepositoryError> {
+        let row: Option<(String, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT status,content,error FROM reply_tasks WHERE message_id=?")
+                .bind(message_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(|(status, content, error)| {
+            let status = serde_json::from_value(serde_json::json!(status))
+                .map_err(|e| RepositoryError::Internal(format!("回复任务状态无效：{e}")))?;
+            Ok(crate::domain::message::ReplyTask {
+                status,
+                content,
+                error,
+            })
+        })
+        .transpose()
+    }
+    async fn find_unknown_reply_tasks(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::domain::message::UnknownReplyTask>, RepositoryError> {
+        let rows: Vec<(i64, i64, Option<String>, Option<String>, Option<i64>, String)> = sqlx::query_as(
+            "SELECT message_id,character_id,content,error,platform_message_id,updated_at FROM reply_tasks WHERE status='unknown' ORDER BY updated_at ASC,message_id ASC LIMIT ?",
+        )
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(message_id, character_id, content, error, platform_message_id, updated_at)| {
+                    let updated_at = super::timestamp::parse_timestamp(&updated_at)?;
+                    Ok(crate::domain::message::UnknownReplyTask {
+                        message_id,
+                        character_id,
+                        platform_message_id,
+                        content,
+                        error,
+                        updated_at,
+                    })
+                },
+            )
+            .collect()
+    }
+    async fn find_unknown_reply_task(
+        &self,
+        message_id: i64,
+    ) -> Result<Option<crate::domain::message::UnknownReplyTask>, RepositoryError> {
+        let row: Option<(i64, i64, Option<String>, Option<String>, Option<i64>, String)> =
+            sqlx::query_as(
+                "SELECT message_id,character_id,content,error,platform_message_id,updated_at FROM reply_tasks WHERE message_id=? AND status='unknown'",
+            )
+            .bind(message_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(
+            |(message_id, character_id, content, error, platform_message_id, updated_at)| {
+                let updated_at = super::timestamp::parse_timestamp(&updated_at)?;
+                Ok(crate::domain::message::UnknownReplyTask {
+                    message_id,
+                    character_id,
+                    platform_message_id,
+                    content,
+                    error,
+                    updated_at,
+                })
+            },
+        )
+        .transpose()
+    }
+    async fn save_reply_task(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        status: crate::domain::message::ReplyTaskStatus,
+        content: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query("INSERT INTO reply_tasks(message_id,character_id,status,content,error,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET status=excluded.status,content=COALESCE(excluded.content,reply_tasks.content),error=COALESCE(excluded.error,reply_tasks.error),updated_at=excluded.updated_at")
+            .bind(message_id).bind(character_id).bind(status.to_string()).bind(content).bind(None::<&str>).bind(chrono::Utc::now().to_rfc3339()).execute(&self.pool).await?;
+        Ok(())
+    }
+    async fn save_reply_task_error(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        status: crate::domain::message::ReplyTaskStatus,
+        content: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query("INSERT INTO reply_tasks(message_id,character_id,status,content,error,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET status=excluded.status,content=COALESCE(excluded.content,reply_tasks.content),error=excluded.error,updated_at=excluded.updated_at")
+            .bind(message_id).bind(character_id).bind(status.to_string()).bind(content).bind(error).bind(chrono::Utc::now().to_rfc3339()).execute(&self.pool).await?;
+        Ok(())
+    }
+    async fn mark_reply_task_unknown_if_sending(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        error: &str,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            r#"UPDATE reply_tasks
+               SET status = 'unknown', error = ?, updated_at = ?
+               WHERE message_id = ? AND character_id = ? AND status = 'sending'"#,
+        )
+        .bind(error)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(message_id)
+        .bind(character_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+    async fn save_reply_task_delivery(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        status: crate::domain::message::ReplyTaskStatus,
+        content: Option<&str>,
+        error: Option<&str>,
+        platform_message_id: Option<i64>,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query("INSERT INTO reply_tasks(message_id,character_id,status,content,error,platform_message_id,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET status=excluded.status,content=COALESCE(excluded.content,reply_tasks.content),error=excluded.error,platform_message_id=COALESCE(excluded.platform_message_id,reply_tasks.platform_message_id),updated_at=excluded.updated_at")
+            .bind(message_id).bind(character_id).bind(status.to_string()).bind(content).bind(error).bind(platform_message_id).bind(chrono::Utc::now().to_rfc3339()).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn requeue_unknown_reply_task(&self, message_id: i64) -> Result<bool, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            r#"UPDATE reply_tasks
+               SET status = 'generated', error = NULL, updated_at = ?
+               WHERE message_id = ? AND status = 'unknown'"#,
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        let outbox = sqlx::query(
+            r#"UPDATE outbox_events
+               SET status = 'pending', available_at = ?, locked_until = NULL,
+                   lease_token = NULL, processed_at = NULL, last_error = NULL,
+                   attempts = 0
+               WHERE entity_type = 'messages'
+                 AND entity_id = ?
+                 AND event_type = 'MessageAccepted'
+                 AND status IN ('completed', 'dead_letter')"#,
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+        if outbox.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(RepositoryError::Database(
+                "未知回复任务缺少可重试的 MessageAccepted 事件".into(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn confirm_unknown_reply_task(
+        &self,
+        message_id: i64,
+        platform_message_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            r#"UPDATE reply_tasks
+               SET status = 'sent', platform_message_id = ?, error = NULL,
+                   updated_at = ?
+               WHERE message_id = ? AND status = 'unknown'"#,
+        )
+        .bind(platform_message_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(message_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn find_by_id(&self, id: i64) -> Result<Option<Message>, RepositoryError> {
         let row: Option<MessageRow> = sqlx::query_as(
             r#"SELECT id, conversation_id, sender_id, content, timestamp,
@@ -121,7 +328,7 @@ impl MessageRepository for SqliteMessageRepository {
                     platform_message_id, conversation_sequence,
                     occurred_at, ingested_at
                FROM messages WHERE conversation_id = ?
-               ORDER BY timestamp DESC LIMIT ?"#,
+               ORDER BY timestamp DESC, id DESC LIMIT ?"#,
         )
         .bind(conversation_id)
         .bind(limit)
@@ -284,7 +491,7 @@ impl MessageRepository for SqliteMessageRepository {
                WHERE conversation_id = ?
                  AND active_character_id = ?
                  AND conversation_sequence < ?
-               ORDER BY conversation_sequence ASC
+               ORDER BY conversation_sequence DESC
                LIMIT ?"#,
         )
         .bind(conversation_id)
@@ -294,11 +501,12 @@ impl MessageRepository for SqliteMessageRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        let messages: Vec<Message> = rows
+        let mut messages: Vec<Message> = rows
             .into_iter()
             .map(parse_message_row)
             .collect::<Result<Vec<_>, _>>()?;
 
+        messages.reverse();
         Ok(messages)
     }
 
@@ -334,43 +542,55 @@ impl MessageRepository for SqliteMessageRepository {
 
     async fn accept_message(
         &self,
-        conversation_id: i64,
-        sender_id: i64,
-        content_json: &str,
-        timestamp: &str,
-        platform_message_id: Option<i64>,
-        character_id: i64,
-        event_uuid: &str,
-        outbox_payload: &str,
+        input: &AcceptedMessageInput,
     ) -> Result<(i64, i64, chrono::DateTime<chrono::Utc>), RepositoryError> {
-        // 使用排他事务，保证 sequence allocation 和 insert 原子性
-        let mut tx = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        let mut tx = sqlx::Acquire::begin(&mut *tx)
-            .await
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let result = self.accept_message_with_status(input).await?;
+        Ok((
+            result.message_id,
+            result.conversation_sequence,
+            result.ingested_at,
+        ))
+    }
 
-        // 1. 原子分配 sequence（在同一个事务内）
-        let row: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(sequence_counter, 0) + 1 FROM conversations WHERE id = ?",
-        )
-        .bind(conversation_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        let conversation_sequence = row.0;
-
-        // 2. 更新 sequence_counter
-        sqlx::query("UPDATE conversations SET sequence_counter = ? WHERE id = ?")
-            .bind(conversation_sequence)
+    async fn accept_message_with_status(
+        &self,
+        input: &AcceptedMessageInput,
+    ) -> Result<AcceptedMessageResult, RepositoryError> {
+        let conversation_id = input.conversation_id;
+        let sender_id = input.sender_id;
+        let content_json = &input.content_json;
+        let timestamp = &input.timestamp;
+        let platform_message_id = input.platform_message_id;
+        let character_id = input.character_id;
+        let event_uuid = &input.event_uuid;
+        let outbox_payload = &input.outbox_payload;
+        let mut tx = self.pool.begin().await?;
+        // 先取得写锁再读取去重记录，避免延迟事务升级时竞争。
+        sqlx::query("UPDATE conversations SET sequence_counter = sequence_counter WHERE id = ?")
             .bind(conversation_id)
             .execute(&mut *tx)
-            .await
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
+            .await?;
+        if let Some(platform_id) = platform_message_id {
+            let existing: Option<(i64,i64,String)> = sqlx::query_as("SELECT id, conversation_sequence, ingested_at FROM messages WHERE conversation_id = ? AND platform_message_id = ? ORDER BY id LIMIT 1")
+                .bind(conversation_id).bind(platform_id).fetch_optional(&mut *tx).await?;
+            if let Some((id, seq, at)) = existing {
+                tx.commit().await?;
+                return Ok(AcceptedMessageResult {
+                    message_id: id,
+                    conversation_sequence: seq,
+                    ingested_at: super::timestamp::parse_timestamp(&at)?,
+                    created: false,
+                });
+            }
+        }
+        let conversation_sequence: i64 = sqlx::query_scalar("UPDATE conversations SET sequence_counter = COALESCE(sequence_counter,0) + 1 WHERE id = ? RETURNING sequence_counter")
+            .bind(conversation_id).fetch_one(&mut *tx).await?;
+        let mut payload: serde_json::Value = serde_json::from_str(outbox_payload)
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        let metadata = payload
+            .get("metadata")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"author_kind":"user"}));
         // 3. 生成 ingested_at（事务内的 authoritative timestamp）
         let ingested_at = chrono::Utc::now();
 
@@ -380,12 +600,21 @@ impl MessageRepository for SqliteMessageRepository {
                 (conversation_id, sender_id, content, timestamp, reply_to, mentions,
                  attachments, metadata, active_character_id,
                  platform_message_id, conversation_sequence, occurred_at, ingested_at)
-              VALUES (?, ?, ?, ?, NULL, '[]', '[]', '{}', ?, ?, ?, ?, ?)"#,
+              VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(conversation_id)
         .bind(sender_id)
         .bind(content_json)
         .bind(timestamp)
+        .bind(metadata.get("reply_to").and_then(|v| v.as_i64()))
+        .bind(
+            metadata
+                .get("mentions")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]))
+                .to_string(),
+        )
+        .bind(metadata.to_string())
         .bind(character_id)
         .bind(platform_message_id)
         .bind(conversation_sequence)
@@ -397,7 +626,10 @@ impl MessageRepository for SqliteMessageRepository {
 
         let message_id = result.last_insert_rowid();
 
-        // 5. C2-4: 插入 durable outbox event（与 message 在同一事务中）
+        payload["message_id"] = serde_json::json!(message_id);
+        payload["conversation_sequence"] = serde_json::json!(conversation_sequence);
+        payload["ingested_at"] = serde_json::json!(ingested_at);
+        // 完整事件与消息在同一事务中提交。（与 message 在同一事务中）
         sqlx::query(
             r#"INSERT INTO outbox_events
                 (event_uuid, entity_id, entity_type, event_type, event_version,
@@ -406,7 +638,7 @@ impl MessageRepository for SqliteMessageRepository {
         )
         .bind(event_uuid)
         .bind(message_id)
-        .bind(outbox_payload)
+        .bind(payload.to_string())
         .bind(conversation_id.to_string())
         .bind(conversation_sequence)
         .execute(&mut *tx)
@@ -418,6 +650,11 @@ impl MessageRepository for SqliteMessageRepository {
             .await
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        Ok((message_id, conversation_sequence, ingested_at))
+        Ok(AcceptedMessageResult {
+            message_id,
+            conversation_sequence,
+            ingested_at,
+            created: true,
+        })
     }
 }

@@ -95,6 +95,9 @@ impl CharacterRuntime {
         // 串行化同一角色的状态初始化，避免并发下重复写入默认状态与重复发布事件。
         let lock = self.character_lock(id).await;
         let _guard = lock.lock().await;
+        if let Some(character) = self.cache.read().await.get(&id).cloned() {
+            return Ok(character);
+        }
         self.load_character_unlocked(id).await
     }
 
@@ -142,6 +145,13 @@ impl CharacterRuntime {
             .clone()
     }
 
+    /// 强制回读角色和状态，管理变更后同步缓存。
+    pub async fn refresh_character(&self, id: i64) -> Result<Character, RuntimeError> {
+        let lock = self.character_lock(id).await;
+        let _guard = lock.lock().await;
+        self.load_character_unlocked(id).await
+    }
+
     /// 仅从缓存获取角色（不访问数据库）。
     pub async fn get_cached(&self, id: i64) -> Option<Character> {
         let cache = self.cache.read().await;
@@ -154,8 +164,11 @@ impl CharacterRuntime {
         character_id: i64,
         state: &CharacterState,
     ) -> Result<(), RuntimeError> {
-        // 先持久化到数据库
-        self.state_repo.upsert(character_id, state).await?;
+        let lock = self.character_lock(character_id).await;
+        let _guard = lock.lock().await;
+        self.state_repo
+            .upsert(character_id, &state.clone().clamped())
+            .await?;
 
         // 再更新缓存
         let mut cache = self.cache.write().await;

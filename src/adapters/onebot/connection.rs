@@ -54,7 +54,7 @@ pub struct ActionResponse {
 impl ActionResponse {
     /// 是否表示成功。
     pub fn is_ok(&self) -> bool {
-        self.retcode == Some(0)
+        self.status.eq_ignore_ascii_case("ok") && self.retcode == Some(0)
     }
 
     /// 将错误信息格式化为字符串。
@@ -591,6 +591,24 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn action_response_requires_ok_status_and_zero_retcode() {
+        let mut response = ActionResponse {
+            id: 1,
+            action: "send_group_msg".into(),
+            status: "ok".into(),
+            retcode: Some(0),
+            data: None,
+            error: None,
+        };
+        assert!(response.is_ok());
+        response.status = "failed".into();
+        assert!(!response.is_ok());
+        response.status = "ok".into();
+        response.retcode = Some(1);
+        assert!(!response.is_ok());
+    }
 
     // ------------------------------------------------------------------
     // 测试用：脚本化连接器（可控的假连接）

@@ -3,15 +3,6 @@
 //! 本模块实现方法权限校验（`plugin_data.*` 免权限但强制插件命名空间）、
 //! 参数解析与各 API 方法的处理逻辑。错误统一返回中文 `String`，wire 直传。
 
-// TODO(AUDIT-006): PluginApi 直接持有 repos、cognition、dispatcher 的 Arc<dyn Trait> 指针，
-//   插件通过 PluginApi 可间接调用 Core 内部任意能力（如直接调用 ActionDispatcher）。
-//   建议 Phase 9 重构为窄接口：只暴露插件真正需要的最小方法集（如 SendMessage、QueryMemory 等），
-//   将 repos/cognition/dispatcher 替换为具体的能力抽象，防止插件越权访问核心结构。
-
-// TODO(AUDIT-036): 当前权限模型依赖简单的 `require_permission` 函数，按方法名匹配权限枚举。
-//   建议 Phase 9 实现细粒度权限检查：按资源类型（character、memory、relationship 等）+ 操作类型（read、write）
-//   拆分为独立权限节点，允许插件声明具体需要的权限子集，而非"能调用某方法即拥有全部相关权限"。
-
 use std::sync::Arc;
 
 #[allow(unused_imports)]
@@ -41,6 +32,7 @@ pub struct PluginApi {
     dispatcher: Arc<ActionDispatcher>,
     cognition: Arc<CognitionLayer>,
     registry: Arc<PluginRegistry>,
+    runtime: Option<Arc<crate::application::runtime::CharacterRuntime>>,
 }
 
 impl PluginApi {
@@ -71,7 +63,16 @@ impl PluginApi {
             dispatcher,
             cognition,
             registry,
+            runtime: None,
         }
+    }
+
+    pub fn with_runtime(
+        mut self,
+        runtime: Arc<crate::application::runtime::CharacterRuntime>,
+    ) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 
     /// 分发一个插件方法调用。
@@ -93,6 +94,13 @@ impl PluginApi {
         // 2. `plugin_data.*` 免权限（数据自作用域），其余方法走权限判定。
         if !method.starts_with("plugin_data.") {
             check_permission(method, &granted)?;
+        }
+
+        if matches!(
+            method,
+            "message.send" | "character.state.write" | "memory.write" | "relationship.write"
+        ) {
+            return Err(format!("插件方法 {method} 当前禁止直接修改核心运行状态"));
         }
 
         // 3. 方法分发。
@@ -227,6 +235,24 @@ impl PluginApi {
             .and_then(|v| v.as_object())
             .ok_or_else(|| "缺少参数：state（或 state 必须是对象）".to_string())?;
 
+        for (key, value) in patch {
+            let valid = match key.as_str() {
+                "energy" | "stress" => value.is_number(),
+                "current_activity" => value.is_null() || value.is_string(),
+                _ => false,
+            };
+            if !valid {
+                return Err(format!("非法状态字段或类型：{key}"));
+            }
+        }
+        if let Some(runtime) = &self.runtime {
+            return to_json(
+                &runtime
+                    .apply_state_patch(character_id, &serde_json::Value::Object(patch.clone()))
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+        }
         // 读现有状态；无则用默认状态，再逐字段覆盖。
         let mut state = self
             .state_repo
@@ -288,6 +314,11 @@ impl PluginApi {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let character_id = require_i64(&params, "character_id")?;
+        let conversation_id = require_i64(&params, "conversation_id")?;
+        let raw = params
+            .get("raw")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
 
         // limit：默认 20，封顶 500。
         let limit = optional_i64(&params, "limit")?.unwrap_or(20).clamp(1, 500);
@@ -322,18 +353,53 @@ impl PluginApi {
             }
         };
 
-        let memories = if let Some(kws) = keywords {
-            self.memory_repo
-                .search_by_keywords(character_id, &kws, limit)
-                .await
-                .map_err(|e| e.to_string())?
-        } else {
-            self.memory_repo
-                .find_by_character_id(character_id, memory_type, limit)
-                .await
-                .map_err(|e| e.to_string())?
-        };
-        to_json(&memories)
+        // 插件只能读取当前会话可见的正式记忆，先由仓储按范围筛选。
+        let mut memories = self
+            .memory_repo
+            .find_visible(character_id, conversation_id, 500)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(memory_type) = memory_type {
+            memories.retain(|memory| memory.memory_type == memory_type);
+        }
+        if let Some(keywords) = keywords {
+            let keywords = keywords
+                .into_iter()
+                .map(|keyword| keyword.trim().to_lowercase())
+                .filter(|keyword| !keyword.is_empty())
+                .collect::<Vec<_>>();
+            memories.retain(|memory| {
+                keywords
+                    .iter()
+                    .any(|keyword| memory.content.to_lowercase().contains(keyword))
+            });
+        }
+        memories.truncate(limit as usize);
+        if raw {
+            return to_json(&memories);
+        }
+        let redacted = memories
+            .into_iter()
+            .map(|memory| {
+                let fingerprint = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    memory.content.hash(&mut hasher);
+                    format!("{:016x}", hasher.finish())
+                };
+                serde_json::json!({
+                    "id": memory.id,
+                    "character_id": memory.character_id,
+                    "conversation_id": memory.conversation_id,
+                    "memory_type": memory.memory_type,
+                    "importance": memory.importance,
+                    "metadata": memory.metadata,
+                    "content_available": false,
+                    "content_fingerprint": fingerprint,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::Value::Array(redacted))
     }
 
     async fn api_memory_write(
@@ -1331,7 +1397,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn message_send_via_group_conversation() {
+    async fn message_send_is_rejected_for_plugins() {
         let h = build_harness(true).await;
         h.conv_repo
             .convs
@@ -1339,7 +1405,7 @@ mod tests {
             .unwrap()
             .push(group_conversation(1, "12345"));
 
-        let result = h
+        let err = h
             .api
             .dispatch(
                 "alpha",
@@ -1347,12 +1413,9 @@ mod tests {
                 serde_json::json!({ "conversation_id": 1, "content": "你好，插件消息" }),
             )
             .await
-            .expect("发送应成功");
-        assert_eq!(result, serde_json::json!({}));
-        assert_eq!(
-            *h.adapter.sent_group.lock().unwrap(),
-            vec![("12345".to_string(), "你好，插件消息".to_string())]
-        );
+            .unwrap_err();
+        assert!(err.contains("禁止直接修改核心运行状态"));
+        assert!(h.adapter.sent_group.lock().unwrap().is_empty());
         assert!(h.adapter.sent_private.lock().unwrap().is_empty());
     }
 
@@ -1368,7 +1431,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.contains("会话未找到"), "错误信息：{err}");
+        assert!(err.contains("禁止直接修改核心运行状态"), "错误信息：{err}");
     }
 
     // -----------------------------------------------------------------------
@@ -1427,7 +1490,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.contains("缺少参数"), "错误信息：{err}");
+        assert!(err.contains("禁止直接修改核心运行状态"), "错误信息：{err}");
         // 参数类型错误。
         let err = h
             .api
@@ -1438,7 +1501,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.contains("必须是整数"), "错误信息：{err}");
+        assert!(err.contains("禁止直接修改核心运行状态"), "错误信息：{err}");
         // state 非对象。
         h.character_repo
             .insert(&sample_character(1, "Alice"))
@@ -1453,7 +1516,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.contains("必须是对象"), "错误信息：{err}");
+        assert!(err.contains("禁止直接修改核心运行状态"), "错误信息：{err}");
         // 非对象 params 不 panic（当作空对象 → 缺少必填参数）。
         let err = h
             .api
@@ -1550,25 +1613,15 @@ mod tests {
             .unwrap();
         assert!(none.is_null(), "尚未写入状态应返回 null");
 
-        h.api
+        let err = h.api
             .dispatch(
                 "alpha",
                 "character.state.write",
                 serde_json::json!({ "character_id": 1, "state": { "energy": 80.0, "stress": 20.0 } }),
             )
             .await
-            .unwrap();
-        let got = h
-            .api
-            .dispatch(
-                "alpha",
-                "character.state.read",
-                serde_json::json!({ "character_id": 1 }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(got["energy"], 80.0);
-        assert_eq!(got["stress"], 20.0);
+            .unwrap_err();
+        assert!(err.contains("禁止直接修改核心运行状态"));
     }
 
     #[tokio::test]
@@ -1579,8 +1632,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 首次写入仅一个字段：其余取默认，超上限被 clamp。
-        let merged = h
+        let err = h
             .api
             .dispatch(
                 "alpha",
@@ -1588,38 +1640,8 @@ mod tests {
                 serde_json::json!({ "character_id": 1, "state": { "energy": 250.0 } }),
             )
             .await
-            .unwrap();
-        assert_eq!(merged["energy"], 100.0, "超上限应被 clamped");
-        assert_eq!(
-            merged["stress"],
-            CharacterState::default().stress,
-            "未提供的字段保留默认"
-        );
-
-        // 部分补丁：只改 stress，energy 保留上次合并值。
-        let merged2 = h
-            .api
-            .dispatch(
-                "alpha",
-                "character.state.write",
-                serde_json::json!({ "character_id": 1, "state": { "stress": 60.0 } }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(merged2["energy"], 100.0);
-        assert_eq!(merged2["stress"], 60.0);
-
-        // 角色不存在 → 拒绝。
-        let err = h
-            .api
-            .dispatch(
-                "alpha",
-                "character.state.write",
-                serde_json::json!({ "character_id": 99, "state": { "energy": 10.0 } }),
-            )
-            .await
             .unwrap_err();
-        assert!(err.contains("角色不存在"), "错误信息：{err}");
+        assert!(err.contains("禁止直接修改核心运行状态"));
     }
 
     // -----------------------------------------------------------------------
@@ -1632,7 +1654,7 @@ mod tests {
         h.memory_repo
             .insert(&Memory::new(
                 1,
-                None,
+                Some(1),
                 MemoryType::Semantic,
                 "用户喜欢猫".to_string(),
                 0.8,
@@ -1642,13 +1664,22 @@ mod tests {
         h.memory_repo
             .insert(&Memory::new(
                 1,
-                None,
+                Some(1),
                 MemoryType::Episodic,
                 "用户今天散步".to_string(),
                 0.6,
             ))
             .await
             .unwrap();
+        let mut hidden = Memory::new(
+            1,
+            Some(2),
+            MemoryType::Episodic,
+            "另一个会话的私密经历".to_string(),
+            1.0,
+        );
+        hidden.metadata["status"] = serde_json::Value::String("candidate".to_string());
+        h.memory_repo.insert(&hidden).await.unwrap();
 
         // 按类型过滤（大小写不敏感）。
         let semantic = h
@@ -1656,7 +1687,7 @@ mod tests {
             .dispatch(
                 "alpha",
                 "memory.read",
-                serde_json::json!({ "character_id": 1, "memory_type": "SEMANTIC" }),
+                serde_json::json!({ "character_id": 1, "conversation_id": 1, "memory_type": "SEMANTIC" }),
             )
             .await
             .unwrap();
@@ -1664,13 +1695,29 @@ mod tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["memory_type"], "Semantic");
 
+        let visible = h
+            .api
+            .dispatch(
+                "alpha",
+                "memory.read",
+                serde_json::json!({ "character_id": 1, "conversation_id": 1 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible.as_array().unwrap().len(), 2);
+        assert!(visible
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["content_available"] == false));
+
         // 按关键词走 search_by_keywords。
         let hits = h
             .api
             .dispatch(
                 "alpha",
                 "memory.read",
-                serde_json::json!({ "character_id": 1, "keywords": ["猫"] }),
+                serde_json::json!({ "character_id": 1, "conversation_id": 1, "keywords": ["猫"], "raw": true }),
             )
             .await
             .unwrap();
@@ -1684,7 +1731,7 @@ mod tests {
             .dispatch(
                 "alpha",
                 "memory.read",
-                serde_json::json!({ "character_id": 1, "memory_type": "bogus" }),
+                serde_json::json!({ "character_id": 1, "conversation_id": 1, "memory_type": "bogus" }),
             )
             .await
             .unwrap_err();
@@ -1699,14 +1746,14 @@ mod tests {
             .dispatch(
                 "alpha",
                 "memory.read",
-                serde_json::json!({ "character_id": 1 }),
+                serde_json::json!({ "character_id": 1, "conversation_id": 1 }),
             )
             .await
             .unwrap();
         assert_eq!(
             *h.memory_repo.last_limit.lock().unwrap(),
-            Some(20),
-            "默认 limit 应为 20"
+            Some(i64::MAX),
+            "默认读取仍先按仓储可见范围过滤"
         );
 
         let _ = h
@@ -1714,21 +1761,21 @@ mod tests {
             .dispatch(
                 "alpha",
                 "memory.read",
-                serde_json::json!({ "character_id": 1, "limit": 9999 }),
+                serde_json::json!({ "character_id": 1, "conversation_id": 1, "limit": 9999 }),
             )
             .await
             .unwrap();
         assert_eq!(
             *h.memory_repo.last_limit.lock().unwrap(),
-            Some(500),
-            "limit 应封顶 500"
+            Some(i64::MAX),
+            "可见范围过滤在默认仓储实现中先读取角色范围再截断"
         );
     }
 
     #[tokio::test]
-    async fn memory_write_defaults_and_returns_id() {
+    async fn memory_write_is_rejected_for_plugins() {
         let h = build_harness(true).await;
-        let r = h
+        let err = h
             .api
             .dispatch(
                 "alpha",
@@ -1736,35 +1783,9 @@ mod tests {
                 serde_json::json!({ "character_id": 1, "content": "用户喜欢茶" }),
             )
             .await
-            .unwrap();
-        assert_eq!(r["memory_id"], 1);
-
-        let stored = h.memory_repo.memories.lock().unwrap()[0].clone();
-        assert_eq!(stored.memory_type, MemoryType::Episodic, "默认 episodic");
-        assert_eq!(stored.importance, 0.5, "默认 importance 0.5");
-        assert_eq!(stored.conversation_id, None);
-
-        // 显式类型 + 超界 importance 被 clamp。
-        let r2 = h
-            .api
-            .dispatch(
-                "alpha",
-                "memory.write",
-                serde_json::json!({
-                    "character_id": 1,
-                    "content": "重要记忆",
-                    "memory_type": "system",
-                    "importance": 5.0,
-                    "conversation_id": 7,
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(r2["memory_id"], 2);
-        let stored2 = h.memory_repo.memories.lock().unwrap()[1].clone();
-        assert_eq!(stored2.memory_type, MemoryType::System);
-        assert_eq!(stored2.importance, 1.0);
-        assert_eq!(stored2.conversation_id, Some(7));
+            .unwrap_err();
+        assert!(err.contains("禁止直接修改核心运行状态"));
+        assert!(h.memory_repo.memories.lock().unwrap().is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1820,10 +1841,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relationship_write_partial_update() {
+    async fn relationship_write_is_rejected_for_plugins() {
         let h = build_harness(true).await;
-        // 新建：只写 familiarity，其余用它方默认。
-        let r = h
+        let err = h
             .api
             .dispatch(
                 "alpha",
@@ -1831,24 +1851,8 @@ mod tests {
                 serde_json::json!({ "character_id": 1, "participant_id": 10, "familiarity": 0.5 }),
             )
             .await
-            .unwrap();
-        assert_eq!(r["familiarity"], 0.5);
-        assert_eq!(r["affection"], 0.2, "默认好感 0.2");
-        assert_eq!(r["annoyance"], 0.0, "默认厌烦 0.0");
-
-        // 再更新：只写 affection，familiarity 保留。
-        let r2 = h
-            .api
-            .dispatch(
-                "alpha",
-                "relationship.write",
-                serde_json::json!({ "character_id": 1, "participant_id": 10, "affection": 0.9 }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(r2["familiarity"], 0.5);
-        assert_eq!(r2["affection"], 0.9);
-        assert_eq!(r2["trust"], 0.1, "未提供的维度保留既有值");
+            .unwrap_err();
+        assert!(err.contains("禁止直接修改核心运行状态"));
     }
 
     // -----------------------------------------------------------------------

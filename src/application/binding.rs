@@ -3,9 +3,11 @@
 //! 依赖底层的 `CharacterBindingRepository` trait（而非具体 SQLite 实现），
 //! 因此本模块可在测试中用内存实现替换存储层。
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::domain::character::{CharacterBinding, ReplyMode};
 use crate::domain::repository::{
@@ -18,6 +20,8 @@ pub struct BindingManager {
     binding_repo: Arc<dyn CharacterBindingRepository>,
     character_repo: Arc<dyn CharacterRepository>,
     conversation_repo: Arc<dyn ConversationRepository>,
+    /// 同一会话的绑定变更与发送前复核共用锁，避免切换在复核后、发送前插入。
+    conversation_gates: Arc<Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>>,
 }
 
 impl BindingManager {
@@ -31,7 +35,24 @@ impl BindingManager {
             binding_repo,
             character_repo,
             conversation_repo,
+            conversation_gates: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn gate_for(&self, conversation_id: i64) -> Arc<AsyncMutex<()>> {
+        let mut gates = self
+            .conversation_gates
+            .lock()
+            .expect("会话绑定锁表不应中毒");
+        gates
+            .entry(conversation_id)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    /// 获取会话绑定锁。回复发送前和角色切换必须持有同一把锁。
+    pub async fn acquire_conversation_lock(&self, conversation_id: i64) -> OwnedMutexGuard<()> {
+        self.gate_for(conversation_id).lock_owned().await
     }
 
     /// 为一个角色与会话创建绑定。
@@ -152,6 +173,7 @@ impl BindingManager {
         conversation_id: i64,
         new_character_id: i64,
     ) -> Result<CharacterBinding, RuntimeError> {
+        let _gate = self.acquire_conversation_lock(conversation_id).await;
         // 校验新角色存在。
         self.character_repo
             .find_by_id(new_character_id)
@@ -166,39 +188,14 @@ impl BindingManager {
             .find_by_conversation_id(conversation_id)
             .await?;
 
-        // 如果没有绑定，返回错误（无法切换不存在的绑定）。
-        let Some(current) = bindings.pop() else {
+        bindings.sort_by_key(|b| std::cmp::Reverse((b.switched_at, b.id)));
+        let Some(current) = bindings.first().cloned() else {
             return Err(RuntimeError::Domain(DomainError::InvalidState(format!(
                 "会话 {conversation_id} 未绑定角色，无法换角色"
             ))));
         };
-
-        // P1-3 修复：如果存在多绑定脏数据，删除多余的绑定（保留一个），
-        // 维护"一会话一绑定"不变量。删除时按 switched_at 倒序，保留最新的。
-        if bindings.len() > 1 {
-            // 按 switched_at 降序排序（最新的在前）
-            bindings.sort_by_key(|a| std::cmp::Reverse(a.switched_at));
-            // 保留第一个（switched_at 最新的），删除其余的
-            for old in bindings.into_iter().skip(1) {
-                self.binding_repo.delete(old.id).await?;
-                tracing::warn!(
-                    target: "runtime",
-                    binding_id = old.id,
-                    conversation_id,
-                    "检测到多绑定脏数据，已清理多余绑定"
-                );
-            }
-        } else if bindings.len() == 1 {
-            // 有一条多余的绑定，删除它
-            for old in bindings {
-                self.binding_repo.delete(old.id).await?;
-                tracing::warn!(
-                    target: "runtime",
-                    binding_id = old.id,
-                    conversation_id,
-                    "检测到多绑定脏数据，已清理多余绑定"
-                );
-            }
+        for old in bindings.into_iter().skip(1) {
+            self.binding_repo.delete(old.id).await?;
         }
 
         // 构造更新后的绑定：保留会话配置字段，仅换角色并记录生效时间。

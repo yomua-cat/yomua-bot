@@ -486,6 +486,121 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
         .map_err(|e| StorageError::Migration(format!("migration 014 index failed: {e}")))?;
     }
 
+    sqlx::query("DROP INDEX IF EXISTS idx_messages_dedup")
+        .execute(pool)
+        .await
+        .map_err(|e| StorageError::Migration(e.to_string()))?;
+    sqlx::query(r#"
+      CREATE INDEX IF NOT EXISTS idx_messages_platform ON messages(conversation_id, platform_message_id);
+      CREATE TABLE IF NOT EXISTS reply_tasks (
+        message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+        character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+        content TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        error TEXT,
+        platform_message_id INTEGER,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS cognition_progress (
+        character_id INTEGER NOT NULL, conversation_id INTEGER NOT NULL,
+        last_message_id INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(character_id,conversation_id)
+      );
+    "#).execute(pool).await.map_err(|e|StorageError::Migration(e.to_string()))?;
+
+    let has_reply_platform_id: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('reply_tasks') WHERE name='platform_message_id'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("reply task delivery probe failed: {e}")))?;
+    if has_reply_platform_id == 0 {
+        sqlx::query("ALTER TABLE reply_tasks ADD COLUMN platform_message_id INTEGER")
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                StorageError::Migration(format!("reply task delivery migration failed: {e}"))
+            })?;
+    }
+
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS relationship_interactions (
+            character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+            participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+            source_message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (character_id, participant_id, source_message_id)
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 014 interaction table failed: {e}")))?;
+
+    // 稳定用户身份过渡：历史参与者以会话内 participant_id 建立，但平台外部 ID
+    // 才是跨会话稳定身份。把现有 user participant 的 external_id 回填到 metadata，
+    // 供关系查询按稳定键归并；不覆盖已有显式键。
+    sqlx::query(
+        r#"UPDATE participants
+              SET metadata = json_set(CASE
+                    WHEN json_valid(metadata) THEN metadata ELSE '{}'
+                  END, '$.stable_user_key', external_id)
+            WHERE role = 'user'
+              AND json_extract(metadata, '$.stable_user_key') IS NULL"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("stable user metadata backfill failed: {e}")))?;
+
+    // 关系归并索引：稳定用户键在角色范围内只能指向一个关系归属。
+    // participant 仍按会话保存，映射表只负责跨会话关系的唯一归属。
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS relationship_stable_users (
+            character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+            stable_user_key TEXT NOT NULL,
+            participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (character_id, stable_user_key),
+            UNIQUE (character_id, participant_id)
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("stable relationship table failed: {e}")))?;
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO relationship_stable_users(character_id, stable_user_key, participant_id)
+           SELECT r.character_id,
+                  json_extract(p.metadata, '$.stable_user_key'),
+                  MIN(r.participant_id)
+             FROM relationships r
+             JOIN participants p ON p.id = r.participant_id
+            WHERE p.role = 'user'
+              AND json_extract(p.metadata, '$.stable_user_key') IS NOT NULL
+            GROUP BY r.character_id, json_extract(p.metadata, '$.stable_user_key')"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("stable relationship backfill failed: {e}")))?;
+
+    // 迁移 015：持久化每个会话的主动发言日额度，避免进程重启绕过每日上限。
+    for (column, definition) in [
+        ("proactive_count_date", "TEXT"),
+        ("proactive_count", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let exists: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM pragma_table_info('behavior_states') WHERE name = '{column}'"
+        ))
+        .fetch_one(pool)
+        .await
+        .map_err(|e| StorageError::Migration(format!("migration 015 probe failed: {e}")))?;
+        if exists == 0 {
+            sqlx::query(&format!(
+                "ALTER TABLE behavior_states ADD COLUMN {column} {definition}"
+            ))
+            .execute(pool)
+            .await
+            .map_err(|e| StorageError::Migration(format!("migration 015 {column} failed: {e}")))?;
+        }
+    }
     Ok(())
 }
 
@@ -632,6 +747,8 @@ CREATE TABLE IF NOT EXISTS behavior_states (
     character_id    INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
     conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     last_proactive_at TEXT,
+    proactive_count_date TEXT,
+    proactive_count INTEGER NOT NULL DEFAULT 0,
     last_updated    TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (character_id, conversation_id)
 );
@@ -737,6 +854,8 @@ CREATE TABLE IF NOT EXISTS behavior_states (
     character_id    INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
     conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     last_proactive_at TEXT,
+    proactive_count_date TEXT,
+    proactive_count INTEGER NOT NULL DEFAULT 0,
     last_updated    TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (character_id, conversation_id)
 );

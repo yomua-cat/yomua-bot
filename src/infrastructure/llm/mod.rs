@@ -33,19 +33,21 @@ pub trait TokenEstimator: Send + Sync {
     fn estimate_message_content(&self, message: &LlmMessage) -> usize;
 }
 
-/// 默认估算器：按字符数 / 4 近似（保守下限）。
+/// 默认估算器：ASCII 每四字符近似一 token，非 ASCII 字符近似两 token。
 ///
 /// 注意：
-/// - 中文、日文等语言的 token 与字符比值远高于英语
+/// - 中日韩文本使用更保守的估算，仍与实际 tokenizer 存在差异
 /// - 本估算器不能保证模型上下文不超限
 /// - 未来应替换为 provider tokenizer 或 embedding-count 策略
 pub struct ApproximateTokenEstimator;
 
 impl TokenEstimator for ApproximateTokenEstimator {
     fn estimate_text(&self, text: &str) -> usize {
-        // 近似：4 字符约等于 1 token（英文的粗略下限）
-        // 中文等语言会严重低估，但不会高估
-        text.chars().count() / 4
+        // ASCII 采用常见的四字符近似；非 ASCII 保留更宽裕的预算。
+        let ascii = text.chars().filter(char::is_ascii).count();
+        ascii
+            .div_ceil(4)
+            .saturating_add((text.chars().count() - ascii).saturating_mul(2))
     }
 
     fn estimate_message_content(&self, message: &LlmMessage) -> usize {
@@ -253,7 +255,7 @@ pub trait LlmProvider: Send + Sync {
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, RuntimeError> {
         let _ = texts;
         Err(RuntimeError::Llm(
-            "embed not implemented for this provider".to_string(),
+            "当前模型 Provider 未实现向量生成".to_string(),
         ))
     }
 

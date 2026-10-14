@@ -1,4 +1,4 @@
-//! QQBot Character Runtime 的错误类型。
+//! yomua-bot 角色运行时的错误类型。
 
 /// 运行时顶层错误类型。
 #[derive(Debug, thiserror::Error)]
@@ -20,6 +20,12 @@ pub enum RuntimeError {
 
     #[error("插件错误：{0}")]
     Plugin(String),
+
+    #[error("发送明确失败：{0}")]
+    SendRejected(String),
+
+    #[error("发送结果待核查：{0}")]
+    SendUnknown(String),
 
     #[error("LLM 错误：{0}")]
     Llm(String),
@@ -132,7 +138,7 @@ pub enum RepositoryError {
 impl From<sqlx::Error> for RepositoryError {
     fn from(err: sqlx::Error) -> Self {
         match err {
-            sqlx::Error::RowNotFound => RepositoryError::NotFound("row not found".to_string()),
+            sqlx::Error::RowNotFound => RepositoryError::NotFound("数据库记录不存在".to_string()),
             other => RepositoryError::Database(other.to_string()),
         }
     }

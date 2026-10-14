@@ -13,7 +13,7 @@
 
 [主程序](../src/main.rs)负责装配具体实现。Domain 通过仓储接口表达持久化需求；实际装配中 Application 也直接引用部分适配器和基础设施类型，不能把分层目标当成已验证的严格依赖隔离。
 
-`yomua-bot` 是常驻程序及角色卡管理工具；`yomua-bot-ctl` 是 Unix socket 控制客户端；`yomua-audit-harness` 是源码中保留的开发验证工具。它们共享[库入口](../src/lib.rs)。
+`yomua-bot` 是常驻程序及角色卡管理工具；`yomua-bot-ctl` 是 Unix socket 控制客户端。它们共享[库入口](../src/lib.rs)。
 
 ## 启动与消息链路
 
@@ -39,9 +39,9 @@ flowchart TD
 
 入站实现见[OneBot 适配器](../src/adapters/onebot/mod.rs)。系统指令先截流，管理员身份依据 `admin_users`；普通消息无角色绑定时不进入消息落库及回复流程，但会话与发送者可能已经创建。
 
-[消息接受服务](../src/application/message_acceptance.rs)调用[消息仓储](../src/infrastructure/storage/repository/message_repository.rs)，在同一事务内递增会话序号并写入消息和 Outbox 行。广播事件保留给插件和观察者；[EventProcessor](../src/application/event_processor.rs)不再承担普通消息回复路由。
+[消息接受服务](../src/application/message_acceptance.rs)调用[消息仓储](../src/infrastructure/storage/repository/message_repository.rs)，在同一事务内递增会话序号并写入消息和 Outbox 行。广播事件保留给插件和观察者；普通消息回复只由 Outbox Dispatcher/Processor 链路处理。
 
-[OutboxDispatcher](../src/application/outbox_dispatcher.rs)轮询、领取租约并等待消费者应答；[OutboxProcessor](../src/application/outbox_processor.rs)把 payload 转交[回复处理器](../src/application/reply_processor.rs)。默认租约 30 秒、轮询间隔 100 毫秒、最大重试次数 5，属于代码默认值，当前没有对应 TOML 字段。消费者成功后标记完成，失败可转入等待重试或死信。
+[OutboxDispatcher](../src/application/outbox_dispatcher.rs)轮询、领取租约并等待消费者应答；[OutboxProcessor](../src/application/outbox_processor.rs)把 payload 转交[回复处理器](../src/application/reply_processor.rs)。租约、轮询和最大重试次数是代码默认值，当前没有对应 TOML 字段。消费者成功后标记完成，失败可转入等待重试或死信；永久失败事件记录后不会阻塞同一会话后续事件。
 
 这条链路不构成端到端可靠投递保证：当前 payload、错误传播、角色归属和外部回执仍有明确缺口。完成状态只能按实际实现解释，不能据此推断 QQ 用户已收到消息。
 
@@ -64,11 +64,11 @@ flowchart TD
 
 ## 决策、上下文与模型
 
-[规则行为引擎](../src/application/behavior_engine.rs)结合回复模式、提及、静默时段、状态和关系决定是否回复及延迟。[决策编排器](../src/application/decision_orchestrator.rs)在主程序使用 `NoOpTrigger`，没有接入决策 LLM pipeline。
+[规则行为引擎](../src/application/behavior_engine.rs)结合回复模式、提及、静默时段、状态和关系决定是否回复及延迟。[决策编排器](../src/application/decision_orchestrator.rs)以规则结果为基线；`decision.toml` 启用后接入 advisory 决策模型，模型输出必须经过验证器和硬约束策略。
 
 [ContextBuilder](../src/application/context.rs)加载角色归属的历史、Lorebook、记忆、关系及会话情绪；[CharacterHistoryProvider](../src/application/character_history.rs)负责历史归属和序号边界。[ContextAssembler](../src/application/context_assembler.rs)估算 token、预留输出空间并按层降级，需要已知的 `context_window`。主程序从 `llm.toml` 的 `[options]` 读取预算，即使使用多模型配置也是如此。
 
-[认知层](../src/application/cognition.rs)通过[调度器](../src/application/llm_scheduler.rs)发起请求，HTTP 实现在[OpenAI-compatible Provider](../src/infrastructure/llm/openai_compatible.rs)。LLM 关闭时使用确定性回复；启用后出现模型或上下文错误，并不保证自动生成确定性备用回复。
+[认知层](../src/application/cognition.rs)通过[调度器](../src/application/llm_scheduler.rs)发起请求，HTTP 实现在[OpenAI-compatible Provider](../src/infrastructure/llm/openai_compatible.rs)。Provider 连接与对话模型来自 `llm.toml`，独立决策模型来自 `decision.toml`，同一 Provider 可复用多个模型。LLM 关闭时保留消息并跳过生成，不发送伪造回复；启用后模型或上下文错误会按 Outbox 失败路径处理。
 
 主程序没有给 ContextBuilder 注入 embedding scheduler，因此当前对话上下文使用关键词 Lorebook 与记忆检索。存在语义存储或混合检索接口不代表对话已经使用 RAG。
 
@@ -76,6 +76,6 @@ flowchart TD
 
 - 常驻任务：事件观察、系统指令处理、主动行为评估、Outbox 调度和消费、控制服务、适配器连接与入站处理。
 - LLM 启用后启动后台认知任务，使用 `cognition` role；插件启用后增加事件桥接、传输和进程监督任务。
-- 主动行为当前只维护状态与冷却，不发送主动消息；调度器 trait 不代表已有通用定时任务服务。
+- 主动行为驱动会在已有话题依据、冷却、静默和每日上限通过后创建持久回复任务，复用普通回复发送链路；没有已有话题依据时不会发言。
 - SQLite 使用 WAL、外键约束和连接池。[迁移](../src/infrastructure/storage/migrations.rs)在代码中执行并探测已有表列，没有独立迁移文件或自动回滚机制。
-- 控制关停会发广播信号、停止插件与适配器、关闭存储；后台任务尚未统一等待退出，详见[部署运维](deployment.md)。
+- 控制关停会发广播信号、停止插件与适配器、等待后台任务并关闭存储；超出 `shutdown_timeout_secs` 后取消剩余任务，保留未完成回复供核查，详见[部署运维](deployment.md)。

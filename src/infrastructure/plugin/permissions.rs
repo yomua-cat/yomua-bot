@@ -63,6 +63,25 @@ pub fn check_permission(method: &str, granted: &[PluginPermission]) -> Result<()
     }
 }
 
+/// 事件载荷与读取 API 使用相同权限，订阅不能绕过权限检查。
+pub fn permission_for_event(
+    event: crate::infrastructure::plugin::protocol::EventType,
+) -> Option<PluginPermission> {
+    use crate::infrastructure::plugin::protocol::EventType;
+    match event {
+        EventType::MessageReceived | EventType::MessageSent | EventType::ResponseGenerated => {
+            Some(PluginPermission::MessageRead)
+        }
+        EventType::CharacterStateChanged
+        | EventType::EmotionChanged
+        | EventType::BehaviorDecided => Some(PluginPermission::CharacterStateRead),
+        EventType::RelationshipChanged => Some(PluginPermission::RelationshipRead),
+        EventType::MemoryCreated => Some(PluginPermission::MemoryRead),
+        EventType::ScheduledTaskTriggered => Some(PluginPermission::ScheduleCreate),
+        EventType::AdapterConnected | EventType::AdapterDisconnected => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

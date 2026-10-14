@@ -2,8 +2,7 @@
 //!
 //! 每个 tick 枚举所有绑定上的角色，仅在满足以下全部条件时询问行为引擎
 //! `decide_proactive`：启用主动、与上次主动间隔超过冷却、不处于静默时段。
-//! MVP 阶段主动动作仅更新内部状态（写回 `BehaviorState.last_proactive_at`），
-//! 不发送消息、不调用 LLM。
+//! 通过统一回复任务发送消息；状态只记录冷却和每日额度，内容仍由回复链生成。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,11 +19,21 @@ use crate::domain::repository::{
 };
 use crate::error::DomainError;
 
+#[async_trait::async_trait]
+pub trait ProactiveReplyScheduler: Send + Sync {
+    async fn enqueue_proactive(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        reason: &str,
+    ) -> Result<(), crate::error::RuntimeError>;
+}
+
 /// 主动行为驱动的固定 TICK 间隔（60 秒）。
 pub const PROACTIVE_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
-/// 主动行为的固定冷却时长（30 分钟）。
-pub const PROACTIVE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+/// 主动行为的默认冷却时长（10 分钟）。
+pub const PROACTIVE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
 /// 主动行为驱动。
 ///
@@ -39,6 +48,8 @@ pub struct ProactiveDriver {
     clock: Arc<dyn Clock>,
     tick_interval: Duration,
     cooldown: Duration,
+    reply_scheduler: Option<Arc<dyn ProactiveReplyScheduler>>,
+    daily_limit: u32,
 }
 
 impl ProactiveDriver {
@@ -61,7 +72,15 @@ impl ProactiveDriver {
             clock,
             tick_interval: PROACTIVE_TICK_INTERVAL,
             cooldown: PROACTIVE_COOLDOWN,
+            reply_scheduler: None,
+            daily_limit: 10,
         }
+    }
+
+    /// 注入持久回复任务调度器；未注入时主动评估不会产生消息。
+    pub fn with_reply_scheduler(mut self, scheduler: Arc<dyn ProactiveReplyScheduler>) -> Self {
+        self.reply_scheduler = Some(scheduler);
+        self
     }
 
     /// 以固定间隔循环运行（常驻后台任务）。
@@ -70,6 +89,24 @@ impl ProactiveDriver {
         loop {
             self.tick().await;
             tokio::time::sleep(self.tick_interval).await;
+        }
+    }
+
+    /// 接受统一关停信号的常驻循环。
+    pub async fn run_until_stopped(self, mut stop: tokio::sync::watch::Receiver<bool>) {
+        tracing::info!(target: "runtime", "主动行为驱动已启动");
+        loop {
+            if *stop.borrow() {
+                break;
+            }
+            tokio::select! {
+                result = stop.changed() => {
+                    if result.is_err() || *stop.borrow() { break; }
+                }
+                _ = tokio::time::sleep(self.tick_interval) => {
+                    self.tick().await;
+                }
+            }
         }
     }
 
@@ -137,23 +174,41 @@ impl ProactiveDriver {
             .decide_proactive(binding.character_id, binding.conversation_id)
             .await?;
 
-        // MVP：仅处理状态更新类动作。
-        if decision.action != BehaviorAction::UpdateState {
+        if decision.action != BehaviorAction::InitiateProactive {
             return Ok(());
         }
-
-        // 写回维护后的行为状态：更新主动时间戳（Character × Conversation 范围）。
-        let mut new_behavior_state = behavior_state.unwrap_or_default();
-        new_behavior_state.last_proactive_at = Some(now);
-        new_behavior_state.last_updated = now;
-        self.behavior_state_repo
-            .upsert(
-                binding.character_id,
-                binding.conversation_id,
-                &new_behavior_state,
-            )
-            .await
-            .map_err(|e| DomainError::Internal(format!("主动状态落库失败: {e}")))?;
+        if let Some(scheduler) = &self.reply_scheduler {
+            let today = now.date_naive();
+            let mut new_behavior_state = behavior_state.unwrap_or_default();
+            if new_behavior_state.proactive_count_date != Some(today) {
+                new_behavior_state.proactive_count_date = Some(today);
+                new_behavior_state.proactive_count = 0;
+            }
+            if new_behavior_state.proactive_count >= self.daily_limit {
+                return Ok(());
+            }
+            scheduler
+                .enqueue_proactive(
+                    binding.character_id,
+                    binding.conversation_id,
+                    &decision.reason,
+                )
+                .await
+                .map_err(|e| DomainError::Internal(e.to_string()))?;
+            new_behavior_state.proactive_count += 1;
+            new_behavior_state.last_proactive_at = Some(now);
+            new_behavior_state.last_updated = now;
+            self.behavior_state_repo
+                .upsert(
+                    binding.character_id,
+                    binding.conversation_id,
+                    &new_behavior_state,
+                )
+                .await
+                .map_err(|e| DomainError::Internal(format!("主动状态落库失败: {e}")))?;
+        } else {
+            return Ok(());
+        }
 
         // 同时维护全局角色状态（刷新最后更新时间）。
         let mut new_state = self
@@ -583,67 +638,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cooldown_blocks_trigger_within_window() {
+    async fn no_scheduler_does_not_emit_proactive_messages() {
         let h = harness(true, None, true);
-        // 首个 tick（10:00）触发并写入 last_proactive_at（BehaviorState）。
+        // 没有持久回复调度器时，程序不能凭空发言，也不消耗冷却配额。
         h.driver.tick().await;
-        let after_first = h
-            .behavior_state_repo
-            .states
-            .lock()
-            .unwrap()
-            .get(&(2, 20))
-            .cloned()
-            .expect("首轮应落库行为状态");
-
-        // 5 分钟后仍在冷却内：last_proactive_at 不变。
-        h.clock.advance_minutes(5);
-        h.driver.tick().await;
-        let after_second = h
-            .behavior_state_repo
-            .states
-            .lock()
-            .unwrap()
-            .get(&(2, 20))
-            .cloned()
-            .unwrap();
-        assert_eq!(
-            after_first.last_proactive_at,
-            after_second.last_proactive_at
-        );
+        assert!(h.behavior_state_repo.states.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn after_cooldown_triggers_and_updates_timestamp() {
+    async fn no_scheduler_preserves_state_across_ticks() {
         let h = harness(true, None, true);
-        // 首轮触发写入初始时间。
         h.driver.tick().await;
-        let first = h
-            .behavior_state_repo
-            .states
-            .lock()
-            .unwrap()
-            .get(&(2, 20))
-            .cloned()
-            .unwrap();
-        let first_time = first.last_proactive_at.expect("首轮应写入主动时间");
-
-        // 31 分钟后冷却已过 → 再次触发并更新时间。
         h.clock.advance_minutes(31);
         h.driver.tick().await;
-        let second = h
-            .behavior_state_repo
-            .states
-            .lock()
-            .unwrap()
-            .get(&(2, 20))
-            .cloned()
-            .unwrap();
-        let second_time = second.last_proactive_at.expect("过冷却后应再次写入");
-        assert!(
-            second_time > first_time,
-            "过冷却后主动时间应更新（{second_time} > {first_time}）"
-        );
+        assert!(h.behavior_state_repo.states.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

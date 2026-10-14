@@ -172,6 +172,8 @@ pub struct OutboxMessageAcceptedPayload {
     pub conversation_sequence: i64,
     pub platform_message_id: Option<i64>,
     pub ingested_at: DateTime<Utc>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 #[cfg(test)]

@@ -181,6 +181,25 @@ impl PluginRegistry {
         }
     }
 
+    /// 只摘除本连接拥有的句柄，旧连接退出不能清除新连接。
+    pub fn clear_conn_owned(&self, name: &str, owner: &mpsc::Sender<WireMessage>) -> bool {
+        let mut map = self.inner.lock().unwrap();
+        let Some(record) = map.get_mut(name) else {
+            return false;
+        };
+        if record
+            .conn
+            .as_ref()
+            .is_some_and(|current| current.same_channel(owner))
+        {
+            record.conn = None;
+            record.subscriptions.clear();
+            true
+        } else {
+            false
+        }
+    }
+
     /// 返回插件当前连接的写通道发送端；未连接返回 `None`。
     pub fn connected_plugin(&self, name: &str) -> Option<mpsc::Sender<WireMessage>> {
         self.inner.lock().unwrap().get(name)?.conn.clone()

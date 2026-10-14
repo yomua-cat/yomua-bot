@@ -119,6 +119,7 @@ struct Core {
     api: Arc<PluginApi>,
     stopping: Arc<Mutex<HashSet<String>>>,
     handles: Arc<Mutex<HashMap<String, ChildHandle>>>,
+    tasks: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
 }
 
 /// 插件监督器 —— 具体的 [`PluginHost`] 实现。
@@ -136,6 +137,7 @@ impl PluginSupervisor {
                 api,
                 stopping: Arc::new(Mutex::new(HashSet::new())),
                 handles: Arc::new(Mutex::new(HashMap::new())),
+                tasks: Arc::new(Mutex::new(HashMap::new())),
             },
         }
     }
@@ -227,8 +229,32 @@ impl PluginSupervisor {
             .into_iter()
             .map(|r| r.manifest.name)
             .collect();
+        let mut stops = tokio::task::JoinSet::new();
         for name in names {
-            let _ = self.stop(&name).await;
+            let supervisor = Self {
+                core: self.core.clone(),
+            };
+            stops.spawn(async move {
+                let _ = supervisor.stop(&name).await;
+            });
+        }
+        while stops.join_next().await.is_some() {}
+        let handles: Vec<_> = self
+            .core
+            .tasks
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect();
+        for mut handle in handles {
+            if tokio::time::timeout(self.core.cfg.shutdown_timeout, &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+                let _ = handle.await;
+            }
         }
         // 兜底清理所有 .sock 文件。
         if let Ok(entries) = std::fs::read_dir(self.sockets_dir()) {
@@ -240,6 +266,35 @@ impl PluginSupervisor {
             }
         }
         Ok(())
+    }
+
+    /// 整体关停超时的兜底：取消生命周期任务，Child 的 kill_on_drop 清理子进程。
+    pub async fn force_shutdown(&self) {
+        let tasks: Vec<_> = self
+            .core
+            .tasks
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, task)| task)
+            .collect();
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+        for record in self.core.registry.all() {
+            self.core.registry.clear_conn(&record.manifest.name);
+            self.core.registry.set_pid(&record.manifest.name, None);
+            self.core
+                .registry
+                .set_state(&record.manifest.name, PluginState::Stopped);
+            let _ = std::fs::remove_file(
+                self.sockets_dir()
+                    .join(format!("{}.sock", record.manifest.name)),
+            );
+        }
     }
 
     /// 返回 socket 目录。
@@ -256,10 +311,19 @@ impl PluginSupervisor {
 ///
 /// 首次启动与崩溃重启共用：`run_plugin_loop` 内部还会在预算内自行重启。
 fn spawn_one(core: &Core, plugin: &PluginManifest) {
-    // 显式启动 = 新的生命周期：清除上一次生命周期可能残留的停止标志
-    // （stop() 不再自行移除标志，交由任务退出时清理）。
+    let mut tasks = core.tasks.lock().unwrap();
+    if tasks
+        .get(&plugin.name)
+        .is_some_and(|task| !task.is_finished())
+    {
+        tracing::warn!(plugin = %plugin.name, "插件生命周期已在运行，忽略重复启动");
+        return;
+    }
     core.stopping.lock().unwrap().remove(&plugin.name);
-    tokio::spawn(run_plugin_loop(core.clone(), plugin.clone()));
+    tasks.insert(
+        plugin.name.clone(),
+        tokio::spawn(run_plugin_loop(core.clone(), plugin.clone())),
+    );
 }
 
 /// 停止标志守卫：`stop()` 置位 stopping 后，由生命周期任务在**任意退出路径**
@@ -355,7 +419,13 @@ struct PluginInstance {
     handle: ChildHandle,
 }
 
-/// 创建并拉起飞一个插件实例（bind → spawn 子进程 → 挂接通知）。
+impl Drop for PluginInstance {
+    fn drop(&mut self) {
+        self.server_task.abort();
+    }
+}
+
+/// 创建并拉起一个插件实例（bind → spawn 子进程 → 挂接通知）。
 async fn spawn_instance(core: &Core, plugin: &PluginManifest) -> Result<PluginInstance, String> {
     let name = plugin.name.clone();
 
@@ -474,6 +544,7 @@ async fn finalize_stopped(core: &Core, inst: &mut PluginInstance, name: &str) {
     core.registry.set_pid(name, None);
     drop_handle(core, name);
     inst.server_task.abort();
+    let _ = (&mut inst.server_task).await;
     inst.handle.done.notify_waiters();
 }
 
@@ -544,6 +615,8 @@ async fn monitor_instance(
                             return Trigger::Stopped;
                         }
                         inst.server_task.abort();
+                        let _ = (&mut inst.server_task).await;
+                        core.registry.clear_conn(&name);
                         // 已死子进程的 pid 立即清掉（Crashed/重试前不残留）。
                         core.registry.set_pid(&name, None);
                         return Trigger::Failed(format!("进程退出（码 {}）", exit_code(&status)));
@@ -558,6 +631,8 @@ async fn monitor_instance(
                             return Trigger::Stopped;
                         }
                         inst.server_task.abort();
+                        let _ = (&mut inst.server_task).await;
+                        core.registry.clear_conn(&name);
                         core.registry.set_pid(&name, None);
                         return Trigger::Failed(format!("轮询子进程失败：{e}"));
                     }
@@ -578,6 +653,8 @@ async fn monitor_instance(
                 kill_and_reap(&mut inst.child).await;
                 core.registry.set_pid(&name, None);
                 inst.server_task.abort();
+                let _ = (&mut inst.server_task).await;
+                core.registry.clear_conn(&name);
                 return Trigger::Failed(reason);
             }
             _ = &mut inst.attached_rx, if !attached_done => {
@@ -595,6 +672,8 @@ async fn monitor_instance(
                 kill_and_reap(&mut inst.child).await;
                 core.registry.set_pid(&name, None);
                 inst.server_task.abort();
+                let _ = (&mut inst.server_task).await;
+                core.registry.clear_conn(&name);
                 return Trigger::Failed(format!(
                     "启动超时：{}ms 内未完成握手",
                     core.cfg.handshake_timeout.as_millis()

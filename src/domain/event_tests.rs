@@ -16,6 +16,7 @@ fn core_event_serialization_roundtrip() {
         conversation_sequence: 0,
         platform_message_id: None,
         ingested_at: chrono::Utc::now(),
+        metadata: serde_json::json!({}),
     });
 
     let json = serde_json::to_string(&event).unwrap();

@@ -39,16 +39,14 @@ impl OpenAiCompatibleConfig {
 
 /// Embeddings API 响应。
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct EmbeddingsResponse {
     data: Vec<EmbeddingData>,
-    model: String,
-    usage: TokenUsage,
 }
 
 /// 单个 embedding 数据项。
 #[derive(Deserialize)]
 struct EmbeddingData {
+    index: usize,
     embedding: Vec<f32>,
 }
 
@@ -175,6 +173,28 @@ impl OpenAiCompatibleProvider {
     }
 }
 
+/// 响应可能乱序；按 index 重组并验证维度，拒绝缺失、重复及非有限向量。
+fn validate_embeddings(
+    mut data: Vec<EmbeddingData>,
+    expected_count: usize,
+) -> Result<Vec<Vec<f32>>, RuntimeError> {
+    data.sort_by_key(|item| item.index);
+    let dimensions = data.first().map_or(0, |item| item.embedding.len());
+    if data.len() != expected_count
+        || dimensions == 0
+        || data.iter().enumerate().any(|(i, item)| {
+            item.index != i
+                || item.embedding.len() != dimensions
+                || item.embedding.iter().any(|v| !v.is_finite())
+        })
+    {
+        return Err(RuntimeError::ParseError(
+            "向量响应的数量、索引或维度无效".into(),
+        ));
+    }
+    Ok(data.into_iter().map(|item| item.embedding).collect())
+}
+
 /// 将角色枚举转为 OpenAI 字符串。
 fn role_str(role: LlmRole) -> &'static str {
     match role {
@@ -193,22 +213,27 @@ impl LlmProvider for OpenAiCompatibleProvider {
         );
         let body = self.build_body(&request);
 
-        let mut builder = self.client.post(&url).json(&body);
+        let mut builder = self
+            .client
+            .post(&url)
+            .timeout(self.config.timeout)
+            .json(&body);
         if let Some(key) = &self.config.api_key {
             builder = builder.bearer_auth(key);
         }
 
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| RuntimeError::Llm(format!("请求 OpenAI-compatible 服务失败: {e}")))?;
+        let resp = builder.send().await.map_err(|e| {
+            RuntimeError::HttpError(format!("请求 OpenAI-compatible 服务失败: {e}"))
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(RuntimeError::Llm(format!(
-                "OpenAI-compatible 服务返回错误 {status}: {text}"
-            )));
+            let message = format!("OpenAI-compatible 服务返回错误 {status}: {text}");
+            if status.is_server_error() || status.as_u16() == 429 {
+                return Err(RuntimeError::HttpError(message));
+            }
+            return Err(RuntimeError::Llm(message));
         }
 
         let body: serde_json::Value = resp
@@ -221,9 +246,11 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
     async fn health_check(&self) -> Result<bool, RuntimeError> {
         let url = format!("{}/models", self.config.base_url.trim_end_matches('/'));
-        let resp = self
-            .client
-            .get(&url)
+        let mut request = self.client.get(&url).timeout(self.config.timeout);
+        if let Some(key) = &self.config.api_key {
+            request = request.bearer_auth(key);
+        }
+        let resp = request
             .send()
             .await
             .map_err(|e| RuntimeError::Llm(format!("健康检查失败: {e}")))?;
@@ -231,16 +258,25 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, RuntimeError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let expected_count = texts.len();
         let url = format!("{}/embeddings", self.config.base_url.trim_end_matches('/'));
+        let model = self
+            .config
+            .model_for_embedding()
+            .ok_or_else(|| RuntimeError::Config("未配置向量模型，跳过向量增强".into()))?;
         let body = serde_json::json!({
-            "model": self
-                .config
-                .model_for_embedding()
-                .unwrap_or_else(|| "text-embedding-3-small".to_string()),
+            "model": model,
             "input": texts,
         });
 
-        let mut builder = self.client.post(&url).json(&body);
+        let mut builder = self
+            .client
+            .post(&url)
+            .timeout(self.config.timeout)
+            .json(&body);
         if let Some(key) = &self.config.api_key {
             builder = builder.bearer_auth(key);
         }
@@ -263,7 +299,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .await
             .map_err(|e| RuntimeError::ParseError(e.to_string()))?;
 
-        Ok(parsed.data.into_iter().map(|item| item.embedding).collect())
+        validate_embeddings(parsed.data, expected_count)
     }
 
     fn name(&self) -> &str {

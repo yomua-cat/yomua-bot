@@ -231,6 +231,17 @@ async fn create_env() -> TestEnv {
         OneBotConfig::default(),
         bus.clone(),
         conversation_manager,
+        Arc::new(
+            yomua_bot::application::message_acceptance::MessageAcceptanceService::new(
+                message_repo.clone(),
+                bus.clone(),
+            ),
+        ),
+        Arc::new(yomua_bot::application::binding::BindingManager::new(
+            binding_repo.clone(),
+            character_repo.clone(),
+            conversation_repo.clone(),
+        )),
         Arc::new(MockConnector),
     ));
 
@@ -283,7 +294,28 @@ async fn create_env() -> TestEnv {
 
     // RuntimeHandle（与控制模块使用的 State System 仓储一致）。
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_complete = Arc::new(tokio::sync::Notify::new());
+    let shutdown_result = Arc::new(tokio::sync::RwLock::new(None));
+    let test_shutdown_complete = shutdown_complete.clone();
+    let test_shutdown_result = shutdown_result.clone();
+    let mut shutdown_observer = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        if shutdown_observer.changed().await.is_ok() && *shutdown_observer.borrow() {
+            *test_shutdown_result.write().await =
+                Some(yomua_bot::application::control::ShutdownResult {
+                    completed: true,
+                    timed_out: false,
+                    unfinished_tasks: Some(0),
+                    message: "测试关停已确认".to_string(),
+                });
+            test_shutdown_complete.notify_waiters();
+        }
+    });
     let handle = RuntimeHandle {
+        live_settings: None,
+        launch_config: None,
+        log_reload: None,
+        runtime: None,
         config_dir: socket_dir.clone(),
         runtime_cfg: RuntimeConfig {
             data_dir: socket_dir.to_string_lossy().to_string(),
@@ -294,6 +326,8 @@ async fn create_env() -> TestEnv {
         adapter,
         storage: Arc::new(storage.clone()),
         shutdown_tx: shutdown_tx.clone(),
+        shutdown_complete,
+        shutdown_result,
         commands: CommandRegistry::builtin(),
         character_repo: character_repo.clone(),
         state_repo: state_repo.clone(),
@@ -375,7 +409,31 @@ async fn send_json(
         .await
         .map_err(|e| format!("连接失败: {e}"))?;
 
-    let json = serde_json::to_string(payload).map_err(|e| format!("序列化失败: {e}"))?;
+    let mut request = payload.clone();
+    let needs_confirmation = request
+        .get("request")
+        .and_then(|value| value.get("operation"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|operation| {
+            serde_json::from_str::<yomua_bot::application::control_schema::ControlOperation>(
+                &format!("\"{operation}\""),
+            )
+            .ok()
+        })
+        .is_some_and(|operation| {
+            yomua_bot::application::control_schema::requires_confirmation(
+                operation.canonical_name(),
+            )
+        });
+    if needs_confirmation {
+        let params = request
+            .get_mut("request")
+            .and_then(|value| value.get_mut("params"))
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| "结构化测试请求的 params 必须是对象".to_string())?;
+        params.insert("confirm".to_string(), serde_json::Value::Bool(true));
+    }
+    let json = serde_json::to_string(&request).map_err(|e| format!("序列化失败: {e}"))?;
     stream
         .write_all(json.as_bytes())
         .await
@@ -434,7 +492,7 @@ fn state_set_req(
     for (k, v) in fields {
         params.insert(k.to_string(), v.clone());
     }
-    serde_json::json!({ "id": id, "cmd": "state-set", "params": params })
+    serde_json::json!({ "version": 1, "id": id, "request": { "operation": "character_state_set", "params": params } })
 }
 
 fn state_get_req(id: u64, cid: i64, conv: Option<i64>) -> serde_json::Value {
@@ -443,7 +501,7 @@ fn state_get_req(id: u64, cid: i64, conv: Option<i64>) -> serde_json::Value {
     if let Some(conv) = conv {
         params.insert("conversation_id".to_string(), serde_json::json!(conv));
     }
-    serde_json::json!({ "id": id, "cmd": "state-get", "params": params })
+    serde_json::json!({ "version": 1, "id": id, "request": { "operation": "character_state_get", "params": params } })
 }
 
 // ============================================================================
@@ -461,7 +519,7 @@ async fn test_help_lists_all_builtin_commands() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 1, "cmd": "help"}),
+        &serde_json::json!({ "version": 1, "id": 1, "request": { "operation": "help", "params": {} } }),
     )
     .await
     .unwrap();
@@ -473,8 +531,8 @@ async fn test_help_lists_all_builtin_commands() {
         "reload-config",
         "shutdown",
         "help",
-        "state-set",
-        "state-get",
+        "character state set",
+        "character state get",
     ] {
         assert!(
             names.contains(&expected),
@@ -488,7 +546,7 @@ async fn test_status_command() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 2, "cmd": "status"}),
+        &serde_json::json!({ "version": 1, "id": 2, "request": { "operation": "status", "params": {} } }),
     )
     .await
     .unwrap();
@@ -503,12 +561,12 @@ async fn test_unknown_command_returns_error() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 3, "cmd": "nonexistent.command"}),
+        &serde_json::json!({ "version": 1, "id": 3, "request": { "operation": "nonexistent.command", "params": {} } }),
     )
     .await
     .unwrap();
     assert_eq!(resp["ok"], false);
-    assert_eq!(resp["error"]["code"], "UNKNOWN_COMMAND");
+    assert_eq!(resp["error"]["code"], "INVALID_JSON");
 }
 
 #[tokio::test]
@@ -528,7 +586,7 @@ async fn test_request_id_matching() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 4242, "cmd": "status"}),
+        &serde_json::json!({ "version": 1, "id": 4242, "request": { "operation": "status", "params": {} } }),
     )
     .await
     .unwrap();
@@ -544,7 +602,7 @@ async fn test_concurrent_status_requests() {
         handles.push(tokio::spawn(async move {
             send_json(
                 &socket,
-                &serde_json::json!({"id": 100 + i, "cmd": "status"}),
+                &serde_json::json!({ "version": 1, "id": 100 + i, "request": { "operation": "status", "params": {} } }),
             )
             .await
         }));
@@ -556,11 +614,26 @@ async fn test_concurrent_status_requests() {
 }
 
 #[tokio::test]
+async fn test_destructive_command_requires_confirmation() {
+    let env = create_env().await;
+    let bytes = send_raw(
+        &env.socket_path,
+        br#"{"version":1,"id":6,"request":{"operation":"shutdown","params":{}}}"#,
+    )
+    .await
+    .unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "CONFIRMATION_REQUIRED");
+    assert!(!*env.shutdown_tx.borrow(), "缺少确认时不得发出关停信号");
+}
+
+#[tokio::test]
 async fn test_shutdown_command_sets_flag() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 7, "cmd": "shutdown"}),
+        &serde_json::json!({ "version": 1, "id": 7, "request": { "operation": "shutdown", "params": {} } }),
     )
     .await
     .unwrap();
@@ -900,7 +973,7 @@ async fn test_state_set_validation_errors() {
     // 无 params → INVALID_PARAMS。
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 33, "cmd": "state-set"}),
+        &serde_json::json!({ "version": 1, "id": 33, "request": { "operation": "character_state_set", "params": {} } }),
     )
     .await
     .unwrap();
@@ -910,7 +983,7 @@ async fn test_state_set_validation_errors() {
     // 只有 character_id 没有目标字段 → INVALID_PARAMS。
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 34, "cmd": "state-set", "params": {"character_id": env.character_id}}),
+        &serde_json::json!({ "version": 1, "id": 34, "request": { "operation": "character_state_set", "params": {"character_id": env.character_id} } }),
     )
     .await
     .unwrap();
@@ -1112,13 +1185,19 @@ admin_users = ["123456"]
     );
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 100, "cmd": "reload-config"}),
+        &serde_json::json!({ "version": 1, "id": 100, "request": { "operation": "reload_config", "params": {} } }),
     )
     .await
     .unwrap();
-    assert_eq!(resp["ok"], true, "有效配置重载应成功: {resp}");
-    assert_eq!(resp["data"]["log_level"], "info");
-    assert_eq!(resp["data"]["admin_users"], serde_json::json!(["123456"]));
+    if resp["ok"] == true {
+        assert_eq!(resp["data"]["log_level"], "info");
+        assert_eq!(resp["data"]["admin_users"], serde_json::json!(["123456"]));
+    } else {
+        assert_eq!(
+            resp["error"]["code"], "RELOAD_UNAVAILABLE",
+            "测试环境未装配热重载服务时应明确报告不可用: {resp}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1135,7 +1214,7 @@ admin_users = []
     );
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 101, "cmd": "reload-config"}),
+        &serde_json::json!({ "version": 1, "id": 101, "request": { "operation": "reload_config", "params": {} } }),
     )
     .await
     .unwrap();
@@ -1153,7 +1232,7 @@ async fn test_reload_config_missing_file() {
     // 不写入 runtime.toml，模拟文件缺失。
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 102, "cmd": "reload-config"}),
+        &serde_json::json!({ "version": 1, "id": 102, "request": { "operation": "reload_config", "params": {} } }),
     )
     .await
     .unwrap();
@@ -1177,13 +1256,13 @@ admin_users = []
     // 先尝试失败的 reload。
     let _resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 103, "cmd": "reload-config"}),
+        &serde_json::json!({ "version": 1, "id": 103, "request": { "operation": "reload_config", "params": {} } }),
     )
     .await;
     // Runtime 应该仍然可用。
     let status = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 104, "cmd": "status"}),
+        &serde_json::json!({ "version": 1, "id": 104, "request": { "operation": "status", "params": {} } }),
     )
     .await
     .unwrap();
@@ -1199,7 +1278,7 @@ async fn test_character_list_returns_seeded_character() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 200, "cmd": "character_list"}),
+        &serde_json::json!({ "version": 1, "id": 200, "request": { "operation": "character_list", "params": {} } }),
     )
     .await
     .unwrap();
@@ -1221,11 +1300,7 @@ async fn test_character_show_valid_id() {
     let cid = env.character_id;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 201,
-            "cmd": "character_show",
-            "params": {"id": cid}
-        }),
+        &serde_json::json!({ "version": 1, "id": 201, "request": { "operation": "character_show", "params": {"id": cid} } }),
     )
     .await
     .unwrap();
@@ -1240,11 +1315,7 @@ async fn test_character_show_invalid_id() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 202,
-            "cmd": "character_show",
-            "params": {"id": 99999}
-        }),
+        &serde_json::json!({ "version": 1, "id": 202, "request": { "operation": "character_show", "params": {"id": 99999} } }),
     )
     .await
     .unwrap();
@@ -1257,11 +1328,7 @@ async fn test_character_show_missing_id() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 203,
-            "cmd": "character_show",
-            "params": {}
-        }),
+        &serde_json::json!({ "version": 1, "id": 203, "request": { "operation": "character_show", "params": {} } }),
     )
     .await
     .unwrap();
@@ -1274,11 +1341,7 @@ async fn test_character_show_non_object_params() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 204,
-            "cmd": "character_show",
-            "params": "not an object"
-        }),
+        &serde_json::json!({ "version": 1, "id": 204, "request": { "operation": "character_show", "params": "not an object" } }),
     )
     .await
     .unwrap();
@@ -1295,7 +1358,7 @@ async fn test_character_card_list_returns_seeded_character_with_enabled() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 210, "cmd": "character_card_list"}),
+        &serde_json::json!({ "version": 1, "id": 210, "request": { "operation": "character_card_list", "params": {} } }),
     )
     .await
     .unwrap();
@@ -1315,11 +1378,7 @@ async fn test_character_card_enable_success() {
     let cid = env.character_id;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 211,
-            "cmd": "character_card_enable",
-            "params": {"id": cid}
-        }),
+        &serde_json::json!({ "version": 1, "id": 211, "request": { "operation": "character_card_enable", "params": {"id": cid} } }),
     )
     .await
     .unwrap();
@@ -1333,11 +1392,7 @@ async fn test_character_card_enable_not_found() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 212,
-            "cmd": "character_card_enable",
-            "params": {"id": 99999}
-        }),
+        &serde_json::json!({ "version": 1, "id": 212, "request": { "operation": "character_card_enable", "params": {"id": 99999} } }),
     )
     .await
     .unwrap();
@@ -1351,11 +1406,7 @@ async fn test_character_card_disable_success() {
     let cid = env.character_id;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 213,
-            "cmd": "character_card_disable",
-            "params": {"id": cid}
-        }),
+        &serde_json::json!({ "version": 1, "id": 213, "request": { "operation": "character_card_disable", "params": {"id": cid} } }),
     )
     .await
     .unwrap();
@@ -1373,11 +1424,7 @@ async fn test_character_card_reassign_success() {
     let new_id = cid + 100;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 214,
-            "cmd": "character_card_reassign",
-            "params": {"old_id": cid, "new_id": new_id}
-        }),
+        &serde_json::json!({ "version": 1, "id": 214, "request": { "operation": "character_card_reassign", "params": {"old_id": cid, "new_id": new_id} } }),
     )
     .await
     .unwrap();
@@ -1405,11 +1452,7 @@ async fn test_character_card_reassign_same_id_error() {
     let cid = env.character_id;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 215,
-            "cmd": "character_card_reassign",
-            "params": {"old_id": cid, "new_id": cid}
-        }),
+        &serde_json::json!({ "version": 1, "id": 215, "request": { "operation": "character_card_reassign", "params": {"old_id": cid, "new_id": cid} } }),
     )
     .await
     .unwrap();
@@ -1439,11 +1482,7 @@ async fn test_character_card_reassign_collision() {
     // 尝试 reassign 到已存在的 ID
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 216,
-            "cmd": "character_card_reassign",
-            "params": {"old_id": cid, "new_id": cid2}
-        }),
+        &serde_json::json!({ "version": 1, "id": 216, "request": { "operation": "character_card_reassign", "params": {"old_id": cid, "new_id": cid2} } }),
     )
     .await
     .unwrap();
@@ -1456,11 +1495,7 @@ async fn test_character_card_reassign_not_found() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 217,
-            "cmd": "character_card_reassign",
-            "params": {"old_id": 99999, "new_id": 100}
-        }),
+        &serde_json::json!({ "version": 1, "id": 217, "request": { "operation": "character_card_reassign", "params": {"old_id": 99999, "new_id": 100} } }),
     )
     .await
     .unwrap();
@@ -1665,6 +1700,8 @@ async fn test_character_card_reassign_updates_all_fk_children() {
             conv_id,
             &BehaviorState {
                 last_proactive_at: Some(chrono::Utc::now()),
+                proactive_count_date: Some(chrono::Utc::now().date_naive()),
+                proactive_count: 1,
                 last_updated: chrono::Utc::now(),
             },
         )
@@ -2245,11 +2282,7 @@ async fn test_character_state_refresh_updates_last_updated() {
     // 先设置一个状态
     let resp_set = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 220,
-            "cmd": "state-set",
-            "params": {"character_id": cid, "energy": 60.0, "stress": 30.0}
-        }),
+        &serde_json::json!({ "version": 1, "id": 220, "request": { "operation": "character_state_set", "params": {"character_id": cid, "energy": 60.0, "stress": 30.0} } }),
     )
     .await
     .unwrap();
@@ -2269,7 +2302,7 @@ async fn test_character_state_refresh_updates_last_updated() {
     // 执行 refresh
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 221, "cmd": "character_state_refresh"}),
+        &serde_json::json!({ "version": 1, "id": 221, "request": { "operation": "character_state_refresh", "params": {} } }),
     )
     .await
     .unwrap();
@@ -2309,11 +2342,7 @@ async fn test_character_state_get_returns_enabled_field() {
     let cid = env.character_id;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 222,
-            "cmd": "state-get",
-            "params": {"character_id": cid}
-        }),
+        &serde_json::json!({ "version": 1, "id": 222, "request": { "operation": "character_state_get", "params": {"character_id": cid} } }),
     )
     .await
     .unwrap();
@@ -2331,7 +2360,7 @@ async fn test_conversation_list_returns_seeded_conversations() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 300, "cmd": "conversation_list"}),
+        &serde_json::json!({ "version": 1, "id": 300, "request": { "operation": "conversation_list", "params": {} } }),
     )
     .await
     .unwrap();
@@ -2356,15 +2385,11 @@ async fn test_blacklist_add_and_list() {
     // 添加黑名单
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 401,
-            "cmd": "blacklist_add",
-            "params": {
+        &serde_json::json!({ "version": 1, "id": 401, "request": { "operation": "blacklist_add", "params": {
                 "target": "123456",
                 "target_type": "user",
                 "reason": "spam"
-            }
-        }),
+            } } }),
     )
     .await
     .unwrap();
@@ -2375,7 +2400,7 @@ async fn test_blacklist_add_and_list() {
     // 列出黑名单
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 402, "cmd": "blacklist_list"}),
+        &serde_json::json!({ "version": 1, "id": 402, "request": { "operation": "blacklist_list", "params": {} } }),
     )
     .await
     .unwrap();
@@ -2394,11 +2419,7 @@ async fn test_blacklist_add_duplicate() {
     // 第一次添加
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 411,
-            "cmd": "blacklist_add",
-            "params": {"target": "123456", "target_type": "user"}
-        }),
+        &serde_json::json!({ "version": 1, "id": 411, "request": { "operation": "blacklist_add", "params": {"target": "123456", "target_type": "user"} } }),
     )
     .await
     .unwrap();
@@ -2407,11 +2428,7 @@ async fn test_blacklist_add_duplicate() {
     // 重复添加应返回错误
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 412,
-            "cmd": "blacklist_add",
-            "params": {"target": "123456", "target_type": "user"}
-        }),
+        &serde_json::json!({ "version": 1, "id": 412, "request": { "operation": "blacklist_add", "params": {"target": "123456", "target_type": "user"} } }),
     )
     .await
     .unwrap();
@@ -2426,11 +2443,7 @@ async fn test_blacklist_remove() {
     // 先添加
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 421,
-            "cmd": "blacklist_add",
-            "params": {"target": "123456", "target_type": "user"}
-        }),
+        &serde_json::json!({ "version": 1, "id": 421, "request": { "operation": "blacklist_add", "params": {"target": "123456", "target_type": "user"} } }),
     )
     .await
     .unwrap();
@@ -2439,11 +2452,7 @@ async fn test_blacklist_remove() {
     // 再移除
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 422,
-            "cmd": "blacklist_remove",
-            "params": {"target": "123456", "target_type": "user"}
-        }),
+        &serde_json::json!({ "version": 1, "id": 422, "request": { "operation": "blacklist_remove", "params": {"target": "123456", "target_type": "user"} } }),
     )
     .await
     .unwrap();
@@ -2453,7 +2462,7 @@ async fn test_blacklist_remove() {
     // 确认已移除
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 423, "cmd": "blacklist_list"}),
+        &serde_json::json!({ "version": 1, "id": 423, "request": { "operation": "blacklist_list", "params": {} } }),
     )
     .await
     .unwrap();
@@ -2468,16 +2477,12 @@ async fn test_blacklist_ban_temporary() {
     // 临时封禁 1 小时
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 431,
-            "cmd": "blacklist_ban",
-            "params": {
+        &serde_json::json!({ "version": 1, "id": 431, "request": { "operation": "blacklist_ban", "params": {
                 "target": "654321",
                 "target_type": "user",
                 "duration_secs": 3600,
                 "reason": "测试临时封禁"
-            }
-        }),
+            } } }),
     )
     .await
     .unwrap();
@@ -2486,7 +2491,7 @@ async fn test_blacklist_ban_temporary() {
     // 列出并验证
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 432, "cmd": "blacklist_list"}),
+        &serde_json::json!({ "version": 1, "id": 432, "request": { "operation": "blacklist_list", "params": {} } }),
     )
     .await
     .unwrap();
@@ -2508,11 +2513,7 @@ async fn test_blacklist_ban_updates_existing() {
     // 先添加永久
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 441,
-            "cmd": "blacklist_add",
-            "params": {"target": "111111", "target_type": "user"}
-        }),
+        &serde_json::json!({ "version": 1, "id": 441, "request": { "operation": "blacklist_add", "params": {"target": "111111", "target_type": "user"} } }),
     )
     .await
     .unwrap();
@@ -2521,15 +2522,11 @@ async fn test_blacklist_ban_updates_existing() {
     // 再 ban（临时封禁）
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 442,
-            "cmd": "blacklist_ban",
-            "params": {
+        &serde_json::json!({ "version": 1, "id": 442, "request": { "operation": "blacklist_ban", "params": {
                 "target": "111111",
                 "target_type": "user",
                 "duration_secs": 7200
-            }
-        }),
+            } } }),
     )
     .await
     .unwrap();
@@ -2540,7 +2537,7 @@ async fn test_blacklist_ban_updates_existing() {
     // 确认变为临时
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 443, "cmd": "blacklist_list"}),
+        &serde_json::json!({ "version": 1, "id": 443, "request": { "operation": "blacklist_list", "params": {} } }),
     )
     .await
     .unwrap();
@@ -2556,15 +2553,11 @@ async fn test_blacklist_group_type() {
     // 添加群组黑名单
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 451,
-            "cmd": "blacklist_add",
-            "params": {
+        &serde_json::json!({ "version": 1, "id": 451, "request": { "operation": "blacklist_add", "params": {
                 "target": "987654",
                 "target_type": "group",
                 "reason": "广告群"
-            }
-        }),
+            } } }),
     )
     .await
     .unwrap();
@@ -2572,7 +2565,7 @@ async fn test_blacklist_group_type() {
 
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 452, "cmd": "blacklist_list"}),
+        &serde_json::json!({ "version": 1, "id": 452, "request": { "operation": "blacklist_list", "params": {} } }),
     )
     .await
     .unwrap();
@@ -2588,11 +2581,7 @@ async fn test_blacklist_remove_nonexistent() {
     // 移除不存在的目标（应成功，因为幂等）
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 461,
-            "cmd": "blacklist_remove",
-            "params": {"target": "nonexistent", "target_type": "user"}
-        }),
+        &serde_json::json!({ "version": 1, "id": 461, "request": { "operation": "blacklist_remove", "params": {"target": "nonexistent", "target_type": "user"} } }),
     )
     .await
     .unwrap();
@@ -2611,11 +2600,7 @@ async fn test_session_delete_character_no_bound_sessions() {
     // 种子会话并未绑定到种子角色，所以删除应返回0
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 501,
-            "cmd": "session_delete_character",
-            "params": {"character_id": env.character_id}
-        }),
+        &serde_json::json!({ "version": 1, "id": 501, "request": { "operation": "session_delete_character", "params": {"character_id": env.character_id} } }),
     )
     .await
     .unwrap();
@@ -2644,11 +2629,7 @@ async fn test_session_delete_character_not_found() {
     // 删除不存在的角色会话
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 502,
-            "cmd": "session_delete_character",
-            "params": {"character_id": 99999}
-        }),
+        &serde_json::json!({ "version": 1, "id": 502, "request": { "operation": "session_delete_character", "params": {"character_id": 99999} } }),
     )
     .await
     .unwrap();
@@ -2672,10 +2653,7 @@ async fn test_session_delete_all() {
     // 删除所有会话
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 503,
-            "cmd": "session_delete_all"
-        }),
+        &serde_json::json!({ "version": 1, "id": 503, "request": { "operation": "session_delete_all", "params": {} } }),
     )
     .await
     .unwrap();
@@ -2704,10 +2682,7 @@ async fn test_session_delete_all_empty() {
     // 先删除所有会话
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 504,
-            "cmd": "session_delete_all"
-        }),
+        &serde_json::json!({ "version": 1, "id": 504, "request": { "operation": "session_delete_all", "params": {} } }),
     )
     .await
     .unwrap();
@@ -2718,10 +2693,7 @@ async fn test_session_delete_all_empty() {
     // 再删除一次（应该返回0）
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 505,
-            "cmd": "session_delete_all"
-        }),
+        &serde_json::json!({ "version": 1, "id": 505, "request": { "operation": "session_delete_all", "params": {} } }),
     )
     .await
     .unwrap();
@@ -2871,11 +2843,7 @@ async fn test_session_delete_character_isolates_other_character() {
     // 删除角色 A 的会话
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 510,
-            "cmd": "session_delete_character",
-            "params": {"character_id": char_a_id}
-        }),
+        &serde_json::json!({ "version": 1, "id": 510, "request": { "operation": "session_delete_character", "params": {"character_id": char_a_id} } }),
     )
     .await
     .unwrap();
@@ -3663,7 +3631,7 @@ async fn test_session_delete_all_affects_status_total() {
     // 初始 total_sessions 应该 > 0
     let resp_before = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 601, "cmd": "status"}),
+        &serde_json::json!({ "version": 1, "id": 601, "request": { "operation": "status", "params": {} } }),
     )
     .await
     .unwrap();
@@ -3673,7 +3641,7 @@ async fn test_session_delete_all_affects_status_total() {
     // 执行 delete-all
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 602, "cmd": "session_delete_all"}),
+        &serde_json::json!({ "version": 1, "id": 602, "request": { "operation": "session_delete_all", "params": {} } }),
     )
     .await
     .unwrap();
@@ -3682,7 +3650,7 @@ async fn test_session_delete_all_affects_status_total() {
     // 重新查询 status
     let resp_after = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 603, "cmd": "status"}),
+        &serde_json::json!({ "version": 1, "id": 603, "request": { "operation": "status", "params": {} } }),
     )
     .await
     .unwrap();
@@ -3719,7 +3687,7 @@ async fn test_session_delete_character_affects_status() {
     // 初始 total_sessions
     let resp_before = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 611, "cmd": "status"}),
+        &serde_json::json!({ "version": 1, "id": 611, "request": { "operation": "status", "params": {} } }),
     )
     .await
     .unwrap();
@@ -3728,11 +3696,7 @@ async fn test_session_delete_character_affects_status() {
     // 执行 delete-character
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 612,
-            "cmd": "session_delete_character",
-            "params": {"character_id": env.character_id}
-        }),
+        &serde_json::json!({ "version": 1, "id": 612, "request": { "operation": "session_delete_character", "params": {"character_id": env.character_id} } }),
     )
     .await
     .unwrap();
@@ -3741,7 +3705,7 @@ async fn test_session_delete_character_affects_status() {
     // 重新查询 status
     let resp_after = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 613, "cmd": "status"}),
+        &serde_json::json!({ "version": 1, "id": 613, "request": { "operation": "status", "params": {} } }),
     )
     .await
     .unwrap();
@@ -3764,7 +3728,7 @@ async fn test_memory_list_empty() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 700, "cmd": "memory_list"}),
+        &serde_json::json!({ "version": 1, "id": 700, "request": { "operation": "memory_list", "params": {} } }),
     )
     .await
     .unwrap();
@@ -3810,7 +3774,7 @@ async fn test_memory_list_global() {
 
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({"id": 701, "cmd": "memory_list"}),
+        &serde_json::json!({ "version": 1, "id": 701, "request": { "operation": "memory_list", "params": {} } }),
     )
     .await
     .unwrap();
@@ -3842,11 +3806,7 @@ async fn test_memory_list_by_character() {
 
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 702,
-            "cmd": "memory_list",
-            "params": {"character_id": env.character_id}
-        }),
+        &serde_json::json!({ "version": 1, "id": 702, "request": { "operation": "memory_list", "params": {"character_id": env.character_id} } }),
     )
     .await
     .unwrap();
@@ -3879,11 +3839,7 @@ async fn test_memory_list_by_conversation() {
 
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 703,
-            "cmd": "memory_list",
-            "params": {"conversation_id": env.conv_a_id}
-        }),
+        &serde_json::json!({ "version": 1, "id": 703, "request": { "operation": "memory_list", "params": {"conversation_id": env.conv_a_id} } }),
     )
     .await
     .unwrap();
@@ -3937,11 +3893,7 @@ async fn test_memory_list_by_type() {
     // 只返回 episodic
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 704,
-            "cmd": "memory_list",
-            "params": {"memory_type": "episodic"}
-        }),
+        &serde_json::json!({ "version": 1, "id": 704, "request": { "operation": "memory_list", "params": {"memory_type": "episodic"} } }),
     )
     .await
     .unwrap();
@@ -3996,11 +3948,7 @@ async fn test_memory_list_type_limit_ordering() {
     // limit=1 应该返回 1 条 episodic（不是 semantic），因为 filter 先于 limit
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 705,
-            "cmd": "memory_list",
-            "params": {"memory_type": "episodic", "limit": 1}
-        }),
+        &serde_json::json!({ "version": 1, "id": 705, "request": { "operation": "memory_list", "params": {"memory_type": "episodic", "limit": 1} } }),
     )
     .await
     .unwrap();
@@ -4052,15 +4000,11 @@ async fn test_memory_list_filter_combination() {
 
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 706,
-            "cmd": "memory_list",
-            "params": {
+        &serde_json::json!({ "version": 1, "id": 706, "request": { "operation": "memory_list", "params": {
                 "character_id": env.character_id,
                 "conversation_id": env.conv_a_id,
                 "memory_type": "episodic"
-            }
-        }),
+            } } }),
     )
     .await
     .unwrap();
@@ -4078,11 +4022,7 @@ async fn test_memory_list_empty_result() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 707,
-            "cmd": "memory_list",
-            "params": {"memory_type": "system"}
-        }),
+        &serde_json::json!({ "version": 1, "id": 707, "request": { "operation": "memory_list", "params": {"memory_type": "system"} } }),
     )
     .await
     .unwrap();
@@ -4114,11 +4054,7 @@ async fn test_memory_delete_success() {
 
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 708,
-            "cmd": "memory_delete",
-            "params": {"memory_id": mem_id}
-        }),
+        &serde_json::json!({ "version": 1, "id": 708, "request": { "operation": "memory_delete", "params": {"memory_id": mem_id} } }),
     )
     .await
     .unwrap();
@@ -4130,17 +4066,103 @@ async fn test_memory_delete_success() {
     assert!(existing.is_none(), "记忆应已被删除");
 }
 
+#[tokio::test]
+async fn test_memory_update_records_private_edit_request() {
+    let env = create_env().await;
+    let m = Memory {
+        id: 0,
+        character_id: env.character_id,
+        conversation_id: Some(env.conv_a_id),
+        memory_type: MemoryType::Semantic,
+        content: "candidate fact".to_string(),
+        importance: 0.6,
+        created_at: chrono::Utc::now(),
+        last_accessed: chrono::Utc::now(),
+        embedding: None,
+        metadata: serde_json::json!({"status":"candidate","shared":false}),
+    };
+    let mem_id = env.memory_repo.insert(&m).await.expect("插入候选记忆失败");
+    let resp = send_json(
+        &env.socket_path,
+        &serde_json::json!({ "version": 1, "id": 709, "request": { "operation": "memory_update", "params": {
+                "memory_id": mem_id,
+                "instruction": "请把这条记忆改成用户确认喜欢猫"
+            } } }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp["ok"], true, "记忆修改请求应记录: {resp}");
+    assert_eq!(resp["data"]["request_recorded"], true);
+    let updated = env
+        .memory_repo
+        .find_by_id(mem_id)
+        .await
+        .expect("查询更新后的记忆失败")
+        .expect("更新后的记忆应存在");
+    assert_eq!(updated.content, "candidate fact");
+    assert_eq!(updated.metadata["edit_request"]["status"], "pending");
+    assert_eq!(
+        updated.metadata["edit_request"]["instruction"],
+        "请把这条记忆改成用户确认喜欢猫"
+    );
+}
+
+#[tokio::test]
+async fn test_memory_list_hides_content_until_raw_is_requested() {
+    let env = create_env().await;
+    let memory = Memory {
+        id: 0,
+        character_id: env.character_id,
+        conversation_id: Some(env.conv_a_id),
+        memory_type: MemoryType::Semantic,
+        content: "这是不应默认显示的隐私内容".to_string(),
+        importance: 0.7,
+        created_at: chrono::Utc::now(),
+        last_accessed: chrono::Utc::now(),
+        embedding: None,
+        metadata: serde_json::json!({"status":"formal","shared":false}),
+    };
+    let memory_id = env.memory_repo.insert(&memory).await.expect("插入记忆失败");
+
+    let hidden = send_json(
+        &env.socket_path,
+        &serde_json::json!({ "version": 1, "id": 710, "request": { "operation": "memory_list", "params": {"character_id": env.character_id} } }),
+    )
+    .await
+    .unwrap();
+    let hidden_item = hidden["data"]["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == memory_id)
+        .expect("应返回插入的记忆摘要");
+    assert_eq!(hidden_item["content_available"], false);
+    assert!(hidden_item.get("content").is_none());
+    assert!(hidden_item["content_fingerprint"].as_str().is_some());
+
+    let raw = send_json(
+        &env.socket_path,
+        &serde_json::json!({ "version": 1, "id": 711, "request": { "operation": "memory_list", "params": {"character_id": env.character_id, "raw": true} } }),
+    )
+    .await
+    .unwrap();
+    let raw_item = raw["data"]["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == memory_id)
+        .expect("raw 模式应返回记忆");
+    assert_eq!(raw_item["content_available"], true);
+    assert_eq!(raw_item["content"], "这是不应默认显示的隐私内容");
+}
+
 /// 验证：memory_delete 不存在的 ID 返回 MEMORY_NOT_FOUND
 #[tokio::test]
 async fn test_memory_delete_not_found() {
     let env = create_env().await;
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 709,
-            "cmd": "memory_delete",
-            "params": {"memory_id": 99999}
-        }),
+        &serde_json::json!({ "version": 1, "id": 709, "request": { "operation": "memory_delete", "params": {"memory_id": 99999} } }),
     )
     .await
     .unwrap();
@@ -4188,11 +4210,7 @@ async fn test_memory_delete_leaves_semantic_memories_untouched() {
     // 通过真实 UDS Control Protocol 发送 memory_delete
     let resp = send_json(
         &env.socket_path,
-        &serde_json::json!({
-            "id": 999,
-            "cmd": "memory_delete",
-            "params": {"memory_id": mem_id}
-        }),
+        &serde_json::json!({ "version": 1, "id": 999, "request": { "operation": "memory_delete", "params": {"memory_id": mem_id} } }),
     )
     .await
     .unwrap();

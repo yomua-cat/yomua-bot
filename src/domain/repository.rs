@@ -3,10 +3,7 @@
 //! 领域代码仅依赖这些 trait。
 //! 基础设施层提供 SQLite 实现。
 
-// TODO(AUDIT-061): 所有 ID 字段（character_id、message_id 等）直接使用 i64，
-//   没有 newtype 封装，存在类型安全风险（如 character_id 和 message_id 混用）。
-//   建议 Phase 9 为每个 ID 类型创建独立 newtype（如 `CharacterId(i64)`），在 trait 签名中
-//   使用这些类型替代裸 i64，防止传错 ID 类型导致的隐性 bug。
+// 数据库主键当前统一使用 i64；跨表传递时由仓储和应用服务校验归属。
 
 use async_trait::async_trait;
 
@@ -171,15 +168,147 @@ pub trait ParticipantRepository: Send + Sync {
         conversation_id: i64,
     ) -> Result<Vec<Participant>, RepositoryError>;
     async fn insert(&self, participant: &Participant) -> Result<i64, RepositoryError>;
+    /// 更新会话内显示名和元数据；旧实现默认不支持更新。
+    async fn update(&self, _participant: &Participant) -> Result<(), RepositoryError> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 消息
 // ---------------------------------------------------------------------------
 
+/// 消息接收入库所需的完整事务输入。
+#[derive(Debug, Clone)]
+pub struct AcceptedMessageInput {
+    pub conversation_id: i64,
+    pub sender_id: i64,
+    pub content_json: String,
+    pub timestamp: String,
+    pub platform_message_id: Option<i64>,
+    pub character_id: i64,
+    pub event_uuid: String,
+    pub outbox_payload: String,
+}
+
+/// 消息接受事务的结果。
+///
+/// `created` 用于区分首次投递和平台重复投递。两者都返回同一条消息的
+/// canonical identity，但只有首次投递可以继续发布下游事件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedMessageResult {
+    pub message_id: i64,
+    pub conversation_sequence: i64,
+    pub ingested_at: chrono::DateTime<chrono::Utc>,
+    pub created: bool,
+}
+
 #[async_trait]
 pub trait MessageRepository: Send + Sync {
     async fn find_by_id(&self, id: i64) -> Result<Option<Message>, RepositoryError>;
+    /// 持久化生成内容和发送状态；未知发送结果不自动补发。
+    async fn find_cognition_batch(
+        &self,
+        _character_id: i64,
+        _conversation_id: i64,
+        _after_message_id: i64,
+        _limit: i64,
+    ) -> Result<Vec<Message>, RepositoryError> {
+        Err(RepositoryError::NotImplemented("认知消息批次".into()))
+    }
+    async fn owns_outbox_lease(
+        &self,
+        _message_id: i64,
+        _token: &str,
+    ) -> Result<bool, RepositoryError> {
+        Err(RepositoryError::NotImplemented("租约校验".into()))
+    }
+    async fn reply_task(
+        &self,
+        _message_id: i64,
+    ) -> Result<Option<crate::domain::message::ReplyTask>, RepositoryError> {
+        Err(RepositoryError::NotImplemented("回复任务存储".into()))
+    }
+    async fn find_unknown_reply_tasks(
+        &self,
+        _limit: i64,
+    ) -> Result<Vec<crate::domain::message::UnknownReplyTask>, RepositoryError> {
+        Err(RepositoryError::NotImplemented("未知发送任务查询".into()))
+    }
+    async fn find_unknown_reply_task(
+        &self,
+        _message_id: i64,
+    ) -> Result<Option<crate::domain::message::UnknownReplyTask>, RepositoryError> {
+        Err(RepositoryError::NotImplemented("未知发送任务查询".into()))
+    }
+    async fn save_reply_task(
+        &self,
+        _message_id: i64,
+        _character_id: i64,
+        _status: crate::domain::message::ReplyTaskStatus,
+        _content: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::NotImplemented("回复任务存储".into()))
+    }
+    async fn save_reply_task_error(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        status: crate::domain::message::ReplyTaskStatus,
+        content: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        let _ = error;
+        self.save_reply_task(message_id, character_id, status, content)
+            .await
+    }
+    /// 在恢复路径中把尚未确认的发送任务原子转为 unknown。
+    /// 默认实现兼容简单测试仓储；生产 SQLite 实现会限定原状态为 sending。
+    async fn mark_reply_task_unknown_if_sending(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        error: &str,
+    ) -> Result<bool, RepositoryError> {
+        self.save_reply_task_error(
+            message_id,
+            character_id,
+            crate::domain::message::ReplyTaskStatus::Unknown,
+            None,
+            Some(error),
+        )
+        .await
+        .map(|_| true)
+    }
+    async fn save_reply_task_delivery(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        status: crate::domain::message::ReplyTaskStatus,
+        content: Option<&str>,
+        error: Option<&str>,
+        platform_message_id: Option<i64>,
+    ) -> Result<(), RepositoryError> {
+        let _ = (error, platform_message_id);
+        self.save_reply_task(message_id, character_id, status, content)
+            .await
+    }
+
+    /// 在人工确认平台确实未发送后，将未知任务恢复为可安全重试状态。
+    /// 实现必须同时重置对应的 MessageAccepted outbox 事件，保证重试仍沿原有链路执行。
+    async fn requeue_unknown_reply_task(&self, _message_id: i64) -> Result<bool, RepositoryError> {
+        Err(RepositoryError::NotImplemented("未知回复任务重试".into()))
+    }
+
+    /// 平台核查确认消息已经发送后，将 unknown 任务原子标记为 sent。
+    async fn confirm_unknown_reply_task(
+        &self,
+        _message_id: i64,
+        _platform_message_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        Err(RepositoryError::NotImplemented("未知回复任务确认".into()))
+    }
+
     async fn find_recent(
         &self,
         conversation_id: i64,
@@ -292,26 +421,28 @@ pub trait MessageRepository: Send + Sync {
     /// - C2-4: outbox_payload_json 和 event_uuid 在同一事务内提交
     async fn accept_message(
         &self,
-        conversation_id: i64,
-        sender_id: i64,
-        content_json: &str,
-        timestamp: &str,
-        platform_message_id: Option<i64>,
-        character_id: i64,
-        _event_uuid: &str,
-        _outbox_payload: &str,
+        _input: &AcceptedMessageInput,
     ) -> Result<(i64, i64, chrono::DateTime<chrono::Utc>), RepositoryError> {
-        let _ = (
-            conversation_id,
-            sender_id,
-            content_json,
-            timestamp,
-            platform_message_id,
-            character_id,
-        );
         Err(RepositoryError::NotImplemented(
             "accept_message not implemented".to_string(),
         ))
+    }
+
+    /// 接受消息并返回是否创建了新记录。
+    ///
+    /// 默认实现兼容只实现基础接口的测试仓储；生产仓储应覆盖此方法，
+    /// 以便平台重复投递不会再次触发事件。
+    async fn accept_message_with_status(
+        &self,
+        input: &AcceptedMessageInput,
+    ) -> Result<AcceptedMessageResult, RepositoryError> {
+        let (message_id, conversation_sequence, ingested_at) = self.accept_message(input).await?;
+        Ok(AcceptedMessageResult {
+            message_id,
+            conversation_sequence,
+            ingested_at,
+            created: true,
+        })
     }
 }
 
@@ -322,6 +453,74 @@ pub trait MessageRepository: Send + Sync {
 #[async_trait]
 pub trait MemoryRepository: Send + Sync {
     async fn find_by_id(&self, id: i64) -> Result<Option<Memory>, RepositoryError>;
+
+    /// 判断某条来源消息是否已经生成候选记忆，抵御 Outbox 重试的重复副作用。
+    async fn candidate_exists_for_source(
+        &self,
+        _character_id: i64,
+        _conversation_id: Option<i64>,
+        _source_message_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        Ok(false)
+    }
+
+    /// 带来源的候选记忆幂等插入。已存在时返回 None。
+    async fn insert_candidate_once(&self, memory: &Memory) -> Result<Option<i64>, RepositoryError> {
+        let Some(source_message_id) = memory
+            .metadata
+            .get("source_message_id")
+            .and_then(|value| value.as_i64())
+        else {
+            return Ok(Some(self.insert(memory).await?));
+        };
+        if self
+            .candidate_exists_for_source(
+                memory.character_id,
+                memory.conversation_id,
+                source_message_id,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.insert(memory).await?))
+    }
+
+    async fn cognition_progress(
+        &self,
+        _character_id: i64,
+        _conversation_id: i64,
+    ) -> Result<i64, RepositoryError> {
+        Err(RepositoryError::NotImplemented("认知处理进度".into()))
+    }
+    async fn commit_cognition_batch(
+        &self,
+        _character_id: i64,
+        _conversation_id: i64,
+        _expected_progress: i64,
+        _new_progress: i64,
+        _memories: &[Memory],
+    ) -> Result<bool, RepositoryError> {
+        Err(RepositoryError::NotImplemented("认知事务提交".into()))
+    }
+    async fn find_visible(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        limit: i64,
+    ) -> Result<Vec<Memory>, RepositoryError> {
+        // 默认实现也必须先隔离，不能截断后才过滤。
+        let mut items = self
+            .find_by_character_id(character_id, None, i64::MAX)
+            .await?;
+        items.retain(|m| {
+            m.metadata.get("status").and_then(|value| value.as_str()) != Some("candidate")
+                && (m.conversation_id == Some(conversation_id)
+                    || m.metadata.get("shared") == Some(&serde_json::Value::Bool(true)))
+        });
+        items.truncate(limit.max(0) as usize);
+        Ok(items)
+    }
 
     async fn find_by_character_id(
         &self,
@@ -377,6 +576,7 @@ pub trait MemoryRepository: Send + Sync {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// 插入可选的向量记忆；该接口使用独立表，不代表默认上下文已启用向量检索。
     async fn insert_semantic(
         &self,
         character_id: i64,
@@ -417,7 +617,46 @@ pub trait RelationshipRepository: Send + Sync {
         &self,
         character_id: i64,
     ) -> Result<Vec<Relationship>, RepositoryError>;
+    /// 按稳定平台用户键查找跨会话关系。
+    async fn find_by_stable_user_key(
+        &self,
+        _character_id: i64,
+        _stable_user_key: &str,
+    ) -> Result<Option<Relationship>, RepositoryError> {
+        Ok(None)
+    }
+    /// 原子地解析角色与稳定用户的关系归属。
+    ///
+    /// 会话内 participant 只是展示和消息归属，关系必须通过稳定用户键归并。
+    /// 实现应在并发首次遇到同一用户时返回同一个 participant，避免产生两份关系。
+    async fn ensure_stable_relationship_participant(
+        &self,
+        character_id: i64,
+        participant_id: i64,
+        stable_user_key: &str,
+    ) -> Result<i64, RepositoryError> {
+        if let Some(existing) = self
+            .find_by_stable_user_key(character_id, stable_user_key)
+            .await?
+        {
+            return Ok(existing.participant_id);
+        }
+        if self.find(character_id, participant_id).await?.is_none() {
+            self.upsert(&Relationship::new(character_id, participant_id))
+                .await?;
+        }
+        Ok(participant_id)
+    }
     async fn upsert(&self, relationship: &Relationship) -> Result<(), RepositoryError>;
+    /// 以来源消息 ID 幂等记录一次交互，避免 Outbox 重试重复增加关系熟悉度。
+    async fn record_interaction_once(
+        &self,
+        _character_id: i64,
+        _participant_id: i64,
+        _source_message_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        Err(RepositoryError::NotImplemented("关系交互幂等记录".into()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +816,14 @@ pub trait OutboxRepository: Send + Sync {
     /// 将 locked_until <= now 的 processing 事件重置为 pending，
     /// 以便下次 poll 可以重新 claim。
     async fn recover_expired_processing(&self) -> Result<i64, RepositoryError>;
+    async fn renew_lease(
+        &self,
+        _event_uuid: &str,
+        _token: &str,
+        _duration_secs: i64,
+    ) -> Result<bool, RepositoryError> {
+        Err(RepositoryError::NotImplemented("租约续期".into()))
+    }
 
     /// 按 event_uuid 查询单个事件。
     async fn find_by_uuid(&self, event_uuid: &str) -> Result<Option<OutboxEvent>, RepositoryError>;

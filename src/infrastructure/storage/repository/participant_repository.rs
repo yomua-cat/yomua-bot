@@ -88,6 +88,19 @@ impl ParticipantRepository for SqliteParticipantRepository {
 
         Ok(result.last_insert_rowid())
     }
+
+    async fn update(&self, participant: &Participant) -> Result<(), RepositoryError> {
+        let metadata = serde_json::to_string(&participant.metadata)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        sqlx::query("UPDATE participants SET display_name = ?, metadata = ? WHERE id = ?")
+            .bind(&participant.display_name)
+            .bind(metadata)
+            .bind(participant.id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(())
+    }
 }
 
 type ParticipantRow = (i64, i64, String, String, String, String);

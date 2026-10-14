@@ -11,9 +11,6 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use async_trait::async_trait;
-
 use crate::application::llm_scheduler::LlmScheduler;
 
 use crate::domain::behavior::{BehaviorAction, BehaviorDecision};
@@ -68,7 +65,7 @@ pub enum DecisionSituation {
         is_mentioned: bool,
         participant_id: Option<i64>,
     },
-    /// 主动行为决策（当前 C2 未实现，留作 extension point）。
+    /// 主动行为决策。
     #[allow(dead_code)]
     Proactive,
 }
@@ -109,6 +106,8 @@ pub struct RuleDecisionInput {
     pub message_content: String,
     pub is_mentioned: bool,
     pub participant_id: Option<i64>,
+    /// 规则引擎已经计算出的硬静默状态，决策模型不能覆盖。
+    pub in_mute_window: bool,
     /// 决策时刻。
     pub evaluated_at: DateTime<Utc>,
 }
@@ -276,7 +275,7 @@ impl DecisionContext {
                     .as_ref()
                     .map(|b| b.proactive_enabled)
                     .unwrap_or(false),
-                in_mute_window: false, // 由 RuleBehaviorEngine 在 Built-in decision 中计算
+                in_mute_window: input.in_mute_window,
                 cross_reply_enabled: input
                     .binding
                     .as_ref()
@@ -363,6 +362,39 @@ pub struct NoOpTrigger;
 impl LlmAssistanceTrigger for NoOpTrigger {
     fn evaluate(&self, _: &DecisionContext, _: &BuiltInDecision) -> LlmAssistance {
         LlmAssistance::NotRequired
+    }
+}
+
+/// 配置启用决策模型时使用的低成本触发器。
+///
+/// 明确提及已经是程序确定的高优先级请求，不重复调用决策模型；
+/// 普通消息和规则处于边界的消息才交给决策模型做 advisory 判断。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HeuristicTrigger;
+
+impl LlmAssistanceTrigger for HeuristicTrigger {
+    fn evaluate(&self, context: &DecisionContext, built_in: &BuiltInDecision) -> LlmAssistance {
+        match &context.situation {
+            DecisionSituation::Response {
+                is_mentioned: true, ..
+            } => LlmAssistance::NotRequired,
+            DecisionSituation::Response { .. } => {
+                let borderline = built_in.behavior.action == BehaviorAction::Ignore
+                    || context.relationship_state.is_distant
+                    || context.character_state.is_low_energy
+                    || context.character_state.is_high_stress;
+                if borderline {
+                    LlmAssistance::Required {
+                        reason: "普通消息处于参与边界，需要决策模型复核".to_string(),
+                    }
+                } else {
+                    LlmAssistance::NotRequired
+                }
+            }
+            DecisionSituation::Proactive => LlmAssistance::Required {
+                reason: "主动行为需要单独的决策模型判断".to_string(),
+            },
+        }
     }
 }
 
@@ -749,57 +781,5 @@ impl DecisionLlmService for DecisionLlmServiceImpl {
 
     fn name(&self) -> &str {
         "DecisionLlmServiceImpl"
-    }
-}
-
-// ============================================================================
-// DecisionLlmPipeline — 存根（用于 C2-1 单元测试）
-// ============================================================================
-
-/// Decision LLM Pipeline（存根——C2-1 测试用）。
-///
-/// 真实实现在 `application::decision_pipeline`。
-/// 测试时可通过 `with_override_result()` 注入预设结果。
-#[derive(Debug, Clone)]
-pub struct DecisionLlmPipeline {
-    /// 测试注入：预设的 override result。
-    override_result: Option<DecisionResult>,
-}
-
-impl DecisionLlmPipeline {
-    /// 创建 Pipeline（存根版本，不执行真实 LLM）。
-    #[allow(dead_code)]
-    pub fn new(
-        _primary: Arc<dyn DecisionLlmService>,
-        _backup: Option<Arc<dyn DecisionLlmService>>,
-        _validator: DecisionResultValidator,
-        _policy: Arc<dyn DecisionOverridePolicy>,
-    ) -> Self {
-        Self {
-            override_result: None,
-        }
-    }
-
-    /// 设置测试用 override result（C2-1 单元测试专用）。
-    #[allow(dead_code)]
-    pub fn with_override_result(mut self, result: DecisionResult) -> Self {
-        self.override_result = Some(result);
-        self
-    }
-
-    /// 执行 Pipeline（存根）。
-    #[allow(dead_code)]
-    pub async fn execute(
-        &self,
-        _ctx: &DecisionContext,
-        _built_in: &BuiltInDecision,
-    ) -> Result<DecisionResult, DecisionFailure> {
-        if let Some(result) = &self.override_result {
-            return Ok(result.clone());
-        }
-        Err(DecisionFailure::Transport(
-            "DecisionLlmPipeline stub (use application::decision_pipeline for real impl)"
-                .to_string(),
-        ))
     }
 }

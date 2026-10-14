@@ -11,12 +11,30 @@
 
 use std::sync::Arc;
 
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::application::reply_processor::ReplyProcessor;
 use crate::domain::outbox::{OutboxEvent, ProcessingOutcome};
+
+/// 单个 Outbox 事件允许占用处理器的最长时间。
+///
+/// 处理器不能无限等待外部模型、数据库或 OneBot。到达截止时间后，
+/// 事件会返回可重试结果，调度器负责持久化退避状态。
+pub const DEFAULT_EVENT_PROCESSING_TIMEOUT_SECS: u64 = 120;
+
+async fn process_with_deadline<F>(future: F, timeout: std::time::Duration) -> ProcessingOutcome
+where
+    F: std::future::Future<Output = ProcessingOutcome>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .unwrap_or_else(|_| ProcessingOutcome::RetryableFailure {
+            error: format!("Outbox 事件处理超过 {} 秒截止时间", timeout.as_secs()),
+        })
+}
 
 /// Outbox 事件处理器。
 ///
@@ -46,31 +64,22 @@ impl OutboxProcessor {
     ) {
         info!(target: "outbox", "OutboxProcessor 启动");
 
+        let mut work = FuturesUnordered::new();
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        info!(target: "outbox", "OutboxProcessor 收到关停信号，正在停止...");
-                        break;
-                    }
-                }
-                item = event_rx.recv() => {
-                    match item {
-                        Some((event, response_tx)) => {
-                            let outcome = self.process_event(&event).await;
-                            if response_tx.send(outcome).is_err() {
-                                warn!(
-                                    target: "outbox",
-                                    event_uuid = %event.event_uuid,
-                                    "ACK 发送失败（dispatcher 已关闭）"
-                                );
-                            }
-                        }
-                        None => {
-                            info!(target: "outbox", "MPSC 通道已关闭，OutboxProcessor 停止");
-                            break;
-                        }
-                    }
+                biased;
+                changed=shutdown_rx.changed()=>{if changed.is_err()||*shutdown_rx.borrow(){break}},
+                Some(_)=work.next(),if !work.is_empty()=>{},
+                item=event_rx.recv(),if work.len()<16=>{
+                    let Some((event,response_tx))=item else{break};
+                    work.push(async move {
+                        let outcome = process_with_deadline(
+                            self.process_event(&event),
+                            std::time::Duration::from_secs(DEFAULT_EVENT_PROCESSING_TIMEOUT_SECS),
+                        )
+                        .await;
+                        if response_tx.send(outcome).is_err(){warn!(event_uuid=%event.event_uuid,"ACK 发送失败");}
+                    });
                 }
             }
         }
@@ -149,32 +158,39 @@ impl OutboxProcessor {
             conversation_sequence: payload.conversation_sequence,
             platform_message_id: payload.platform_message_id,
             ingested_at: payload.ingested_at,
+            metadata: payload.metadata,
         };
 
-        // 调用 ReplyProcessor（使用 outbox 专用路径）
-        match self.reply_processor.process_for_outbox(&msg_received).await {
-            Ok(outcome) => {
-                debug!(
-                    target: "outbox",
-                    event_uuid = %event_uuid,
-                    outcome = %outcome,
-                    "MessageAccepted 处理完成"
-                );
-                outcome
+        let Some(token) = event.lease_token.as_deref() else {
+            return ProcessingOutcome::PermanentFailure {
+                error: "缺少任务租约".into(),
+            };
+        };
+        self.reply_processor
+            .process_for_outbox_owned(&msg_received, token)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn processing_deadline_turns_hung_work_into_retryable_failure() {
+        let work = async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            ProcessingOutcome::Success
+        };
+        let result = process_with_deadline(work, std::time::Duration::from_secs(5));
+        tokio::pin!(result);
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+
+        assert_eq!(
+            result.await,
+            ProcessingOutcome::RetryableFailure {
+                error: "Outbox 事件处理超过 5 秒截止时间".into()
             }
-            Err(e) => {
-                // ReplyProcessor 返回错误（这不应该发生，因为它内部捕获了所有错误）
-                // 将所有错误视为永久失败
-                error!(
-                    target: "outbox",
-                    event_uuid = %event_uuid,
-                    error = %e,
-                    "ReplyProcessor 处理异常"
-                );
-                ProcessingOutcome::PermanentFailure {
-                    error: format!("ReplyProcessor 异常: {}", e),
-                }
-            }
-        }
+        );
     }
 }

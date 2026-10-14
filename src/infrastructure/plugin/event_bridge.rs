@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use crate::application::event_bus::EventSubscription;
+use crate::domain::event::{CoreEvent, MessageReceivedEvent};
 use crate::infrastructure::plugin::protocol::{EventType, WireMessage};
 use crate::infrastructure::plugin::registry::PluginRegistry;
 
@@ -30,7 +31,27 @@ impl EventBridge {
                 // 不对插件暴露的事件（如系统指令）直接跳过。
                 continue;
             };
-            let data = match serde_json::to_value(&event) {
+            // MessageAccepted 是持久化入口；插件协议仍以 message.received
+            // 表达它，避免同一条消息同时从适配器和 outbox 发出两次通知。
+            let wire_event = match &event {
+                CoreEvent::MessageAccepted(accepted) => {
+                    CoreEvent::MessageReceived(MessageReceivedEvent {
+                        conversation_id: accepted.conversation_id,
+                        sender_id: accepted.sender_id,
+                        message_id: accepted.message_id,
+                        content: accepted.content.clone(),
+                        timestamp: accepted.timestamp,
+                        is_mentioned: accepted.is_mentioned,
+                        character_id: accepted.character_id,
+                        conversation_sequence: accepted.conversation_sequence,
+                        platform_message_id: accepted.platform_message_id,
+                        ingested_at: accepted.ingested_at,
+                        metadata: accepted.metadata.clone(),
+                    })
+                }
+                _ => event.clone(),
+            };
+            let data = match serde_json::to_value(&wire_event) {
                 Ok(data) => data,
                 Err(e) => {
                     tracing::warn!("事件序列化失败（{}），跳过：{e}", event_type.name());
@@ -45,6 +66,13 @@ impl EventBridge {
     /// 把一条已序列化的事件通知给所有订阅插件。
     fn dispatch_to_subscribers(&self, event_type: EventType, data: serde_json::Value) {
         for name in self.registry.subscribed_plugins(event_type) {
+            let granted = self.registry.permissions_for(&name).unwrap_or_default();
+            if crate::infrastructure::plugin::permissions::permission_for_event(event_type)
+                .is_some_and(|required| !granted.contains(&required))
+            {
+                tracing::warn!(plugin = %name, event = %event_type.name(), "插件事件读取权限不足");
+                continue;
+            }
             match self.registry.connected_plugin(&name) {
                 Some(tx) => {
                     if let Err(e) = tx.try_send(WireMessage::Notify {
@@ -73,7 +101,9 @@ mod tests {
     use super::*;
     use crate::application::event_bus::EventBus;
     use crate::domain::event::CoreEvent;
-    use crate::domain::event::{AdapterConnectedEvent, MessageReceivedEvent, MessageSentEvent};
+    use crate::domain::event::{
+        AdapterConnectedEvent, MessageAcceptedEvent, MessageReceivedEvent, MessageSentEvent,
+    };
     use crate::infrastructure::plugin::protocol::WireMessage;
     use crate::infrastructure::plugin::registry::PluginRegistry;
     use crate::infrastructure::plugin::PluginManifest;
@@ -85,7 +115,7 @@ mod tests {
             name: name.to_string(),
             version: "0.1.0".to_string(),
             description: "示例插件".to_string(),
-            permissions: vec![],
+            permissions: vec![crate::infrastructure::plugin::PluginPermission::MessageRead],
             executable: "plugin-bin".to_string(),
             config: serde_json::json!({}),
         }
@@ -153,6 +183,7 @@ mod tests {
             conversation_sequence: 0,
             platform_message_id: None,
             ingested_at: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
         });
         // 事件 2：MessageSent（仅 alpha 订阅）。
         let sent_event = CoreEvent::MessageSent(MessageSentEvent {
@@ -180,6 +211,7 @@ mod tests {
             conversation_sequence: 0,
             platform_message_id: None,
             ingested_at: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
         });
 
         // 在独立任务中运行桥接（订阅总线），主测试限量读取插件通道。
@@ -247,6 +279,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bridge_normalizes_message_accepted_to_one_message_received_notification() {
+        let mut h = harness();
+        let bus = EventBus::with_capacity(4);
+        let bridge_task = tokio::spawn({
+            let bridge = EventBridge::new(h.registry.clone());
+            let sub = bus.subscribe();
+            async move { bridge.run(sub).await }
+        });
+
+        bus.publish(&CoreEvent::MessageAccepted(MessageAcceptedEvent {
+            event_uuid: "accepted-1".into(),
+            conversation_id: 7,
+            sender_id: 8,
+            message_id: 9,
+            content: "持久化消息".into(),
+            timestamp: ts(),
+            is_mentioned: true,
+            character_id: 10,
+            conversation_sequence: 11,
+            platform_message_id: Some(12),
+            ingested_at: ts(),
+            metadata: serde_json::json!({"author_kind":"user"}),
+        }));
+
+        let notification =
+            tokio::time::timeout(std::time::Duration::from_secs(1), h.alpha_rx.recv())
+                .await
+                .expect("插件应收到 canonical 消息事件")
+                .expect("通知通道不应提前关闭");
+        match notification {
+            WireMessage::Notify { event, data } => {
+                assert_eq!(event, "message.received");
+                assert_eq!(data["MessageReceived"]["message_id"], 9);
+                assert_eq!(data["MessageReceived"]["content"], "持久化消息");
+                assert_eq!(data["MessageReceived"]["metadata"]["author_kind"], "user");
+            }
+            other => panic!("期望 Notify，实际 {other:?}"),
+        }
+        bridge_task.abort();
+    }
+
+    #[tokio::test]
     async fn bridge_skips_plugins_without_connection() {
         let mut h = harness();
         // gamma 订阅 message.received 但无连接 → 静默跳过，不影响 alpha/beta。
@@ -265,6 +339,7 @@ mod tests {
             conversation_sequence: 0,
             platform_message_id: None,
             ingested_at: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
         });
         let ty = EventType::from_core_event(&ev).expect("MessageReceived 应对插件可见");
         let data = serde_json::to_value(&ev).unwrap();
@@ -319,6 +394,7 @@ mod tests {
             conversation_sequence: 0,
             platform_message_id: None,
             ingested_at: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
         });
         let data = serde_json::to_value(&ev).unwrap();
         // 满通道丢弃 + warn，正常通道照常收到 → 事件不阻塞。

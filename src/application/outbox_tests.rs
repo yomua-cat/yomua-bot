@@ -39,10 +39,6 @@ impl MemOutboxRepo {
     pub fn new() -> Self {
         Self::default()
     }
-
-    fn next_id(&self) -> i64 {
-        self.events.lock().unwrap().len() as i64 + 1
-    }
 }
 
 #[async_trait]
@@ -223,16 +219,6 @@ impl MemOutboxRepo {
         self.events.lock().unwrap().push(event);
     }
 
-    /// P0: 实现 trait 方法 add_outbox_event。
-    /// 注意：MemOutboxRepo 的 add_event 和 add_outbox_event 行为相同。
-    async fn add_outbox_event(
-        &self,
-        event: OutboxEvent,
-    ) -> Result<(), crate::error::RepositoryError> {
-        self.add_event(event);
-        Ok(())
-    }
-
     /// P0: 模拟 claim 事件（用于测试）。
     /// 将事件设置为 Processing 状态并生成 lease_token。
     fn claim_event_for_test(&self, event_uuid: &str) -> String {
@@ -266,6 +252,7 @@ impl MemOutboxRepo {
             conversation_sequence: sequence,
             platform_message_id: None,
             ingested_at: Utc::now(),
+            metadata: serde_json::json!({}),
         };
 
         OutboxEvent {
@@ -640,7 +627,7 @@ async fn test_poison_event_does_not_block_next() {
 #[tokio::test]
 async fn test_mpsc_send_does_not_mark_completed() {
     // 这个测试验证概念：MPSC send().await == Ok(()) 只表示事件进入了缓冲区
-    // 不表示 EventProcessor 已接收，更不表示处理完成
+    // 不表示 OutboxProcessor 已接收，更不表示处理完成
     let (tx, mut rx) = mpsc::channel::<ProcessingOutcome>(1);
 
     // 发送一个 ProcessingOutcome
@@ -915,6 +902,7 @@ mod outbox_ownership_tests {
             conversation_sequence: sequence,
             platform_message_id: None,
             ingested_at: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
         };
 
         OutboxEvent {
@@ -1390,8 +1378,8 @@ mod outbox_ownership_tests {
             let claimed = repo
                 .claim_next_event(30)
                 .await
-                .expect(&format!("claim failed {}", i))
-                .expect(&format!("no event {}", i));
+                .unwrap_or_else(|_| panic!("claim failed {}", i))
+                .unwrap_or_else(|| panic!("no event {}", i));
             assert_eq!(claimed.attempts, i);
 
             // 强制使 lease 过期，然后恢复

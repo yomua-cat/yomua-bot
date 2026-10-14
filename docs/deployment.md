@@ -10,7 +10,7 @@
 cargo build --release --locked --bin yomua-bot --bin yomua-bot-ctl
 ```
 
-产物为 `target/release/yomua-bot` 和 `target/release/yomua-bot-ctl`。开发验证工具 `yomua-audit-harness` 不属于日常部署命令。
+部署产物为 `target/release/yomua-bot` 和 `target/release/yomua-bot-ctl`。
 
 准备配置目录，按照[配置参考](configuration.md)设置非空管理员列表、独立数据目录及 OneBot 地址。先检查帮助与导入角色卡：
 
@@ -58,14 +58,14 @@ cargo build --release --locked --bin yomua-bot --bin yomua-bot-ctl
 ## 关停与配置生效
 
 ```bash
-./target/release/yomua-bot-ctl --data-dir /absolute/path/to/yomua-data shutdown
+./target/release/yomua-bot-ctl --data-dir /absolute/path/to/yomua-data shutdown --confirm
 ```
 
 该命令请求运行时停止插件和适配器并关闭存储。响应表示已发出关停请求，仍需确认主进程确实退出。
 
-当前主程序未注册 SIGINT/SIGTERM 处理；终端提示中的 Ctrl+C 不能当成已经实现的优雅关停。后台任务也尚未统一等待结束，`shutdown_timeout_secs` 不限制整个关停流程。服务管理器集成前应完成这一部分验收。
+主程序已将 Ctrl+C/SIGINT、SIGTERM 和控制 socket 的关停请求汇入同一套停止流程。后台任务、插件和适配器会在 `shutdown_timeout_secs` 限制内等待；超时会取消剩余任务，并保留未完成回复供后续核查。仍需在目标部署环境演练信号和重启恢复。
 
-`reload-config` 仅校验 runtime 配置快照，实际变更通过关停、确认退出、修改配置、再启动生效。
+`reload-config` 会原子读取并校验四份配置。运行时可热更新字段会整体生效；数据目录、插件目录、OneBot 连接、LLM Provider/模型和决策模型等启动装配项会返回 `restart_required`，需要关停、确认退出后再启动才能生效。重载失败时保持原运行配置。
 
 ## 备份与升级
 
@@ -85,7 +85,7 @@ sqlite3 /absolute/path/to/yomua-data/runtime.db \
 | 现象 | 排查方向 |
 | --- | --- |
 | 首次启动退出码 1 | 模板生成后的预期退出；填写管理员和连接参数 |
-| 修改配置未生效 | `reload-config` 没有动态应用配置，需受控重启 |
+| 修改配置未生效 | 查看 `reload-config` 返回的 `restart_required`；启动装配项需受控重启 |
 | 已连接但不回复 | 角色绑定、角色参与者记录、Outbox payload、行为决策与模型错误 |
 | `无法连接到 control socket` | 主进程状态、数据目录、socket 权限或控制服务错误日志 |
 | 插件启动失败 | 绝对目录、可执行文件、权限、socket 路径长度及握手日志 |

@@ -38,21 +38,32 @@ impl ActionDispatcher {
             Action::SendMessage {
                 conversation_id,
                 content,
-            } => self.execute_send_message(*conversation_id, content).await,
+            } => {
+                let response = self
+                    .execute_send_message_with_response(*conversation_id, content)
+                    .await?;
+                if response.is_ok() {
+                    Ok(())
+                } else {
+                    Err(RuntimeError::SendRejected(format!(
+                        "OneBot 明确拒绝发送：status={}, retcode={:?}, error={:?}",
+                        response.status, response.retcode, response.error
+                    )))
+                }
+            }
             _ => {
-                // 第一阶段尚未实现主动行为 / 状态更新等动作。
-                tracing::debug!(target: "runtime", action = ?action, "该动作暂不支持，忽略");
-                Ok(())
+                tracing::debug!(target: "runtime", action = ?action, "当前动作类型未接入 OneBot 发送器");
+                Err(RuntimeError::Internal("当前动作类型未实现".into()))
             }
         }
     }
 
     /// 执行发送消息动作。
-    async fn execute_send_message(
+    pub async fn execute_send_message_with_response(
         &self,
         conversation_id: i64,
         content: &str,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<crate::adapters::onebot::ActionResponse, RuntimeError> {
         let conversation = self
             .conversation_repo
             .find_by_id(conversation_id)
@@ -70,17 +81,18 @@ impl ActionDispatcher {
             "E2E_TRACE: ActionDispatcher 准备发送"
         );
 
-        match conversation.conversation_type {
-            ConversationType::Group => self
-                .adapter
-                .send_group_message(&conversation.external_id, content)
-                .await
-                .map(|_| ()),
-            ConversationType::Private => self
-                .adapter
-                .send_private_message(&conversation.external_id, content)
-                .await
-                .map(|_| ()),
-        }
+        let response = match conversation.conversation_type {
+            ConversationType::Group => {
+                self.adapter
+                    .send_group_message(&conversation.external_id, content)
+                    .await?
+            }
+            ConversationType::Private => {
+                self.adapter
+                    .send_private_message(&conversation.external_id, content)
+                    .await?
+            }
+        };
+        Ok(response)
     }
 }

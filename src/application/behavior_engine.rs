@@ -119,6 +119,13 @@ impl RuleBehaviorEngine {
             .await
             .map_err(repo_err)?;
 
+        let in_mute_window = binding
+            .as_ref()
+            .and_then(|value| value.mute_schedule.as_deref())
+            .and_then(|schedule| parse_mute_schedule(schedule).ok().flatten())
+            .map(|window| is_within_window(&window, &time_of_day(self.clock.now())))
+            .unwrap_or(false);
+
         Ok(RuleDecisionInput {
             binding,
             mood,
@@ -132,6 +139,7 @@ impl RuleBehaviorEngine {
             message_content: message_content.to_string(),
             is_mentioned,
             participant_id,
+            in_mute_window,
             evaluated_at: self.clock.now(),
         })
     }
@@ -203,9 +211,6 @@ impl RuleBehaviorEngine {
                 decided_at,
             ));
         }
-
-        // 由内容哈希派生一个确定的 [0, 1) 值。
-        let roll = deterministic_roll(&input.message_content);
 
         let (base_threshold, base_delay) = base_params(&binding.reply_mode, input.is_mentioned);
 
@@ -298,15 +303,11 @@ impl RuleBehaviorEngine {
             delay_ms += 800;
         }
 
-        let cold_start_floor = if distant_relation {
-            let protection_strength = ((0.25 - closeness.unwrap_or(0.0)) / 0.25).clamp(0.0, 1.0);
-            base_threshold + protection_strength * (1.0 - base_threshold)
-        } else {
-            0.0
-        };
-        threshold = threshold.max(cold_start_floor);
-
-        let should_reply = roll < threshold.clamp(0.0, 1.0);
+        // 参与判断不能把关系 modifier 变成概率骰子：明确提及始终回应，
+        // 其它场景只根据可解释的消息信号择机参与。
+        let substantive = is_substantive_message(&input.message_content);
+        let should_reply =
+            input.is_mentioned || (substantive && threshold >= 0.3 && !in_mute && !annoyed);
 
         if should_reply {
             Ok(BehaviorDecision {
@@ -406,20 +407,15 @@ impl RuleBehaviorEngine {
             threshold += 0.1;
         }
 
-        let hour_bucket = decided_at.format("%Y-%m-%d-%H");
-        let roll = deterministic_roll(&format!(
-            "{}|{}|{}",
-            input.character_id, input.conversation_id, hour_bucket
-        ));
-
-        let should_initiate = roll < threshold.clamp(0.0, 1.0);
+        // 主动行为需要可解释的条件；不把时间/ID哈希当作理解能力。
+        let should_initiate = threshold >= 0.5 && energy >= 30.0 && stress <= 60.0;
         if should_initiate {
             Ok(BehaviorDecision {
-                action: BehaviorAction::UpdateState,
+                action: BehaviorAction::InitiateProactive,
                 priority: Priority::Background,
                 cognition_level: CognitionLevel::None,
                 delay_ms: 0,
-                reason: "主动行为检查通过（MVP：仅更新内部状态）".to_string(),
+                reason: "主动行为检查通过，交由回复任务生成".to_string(),
                 decided_at,
             })
         } else {
@@ -498,6 +494,17 @@ fn repo_err(e: crate::error::RepositoryError) -> DomainError {
     DomainError::Internal(format!("仓储错误: {e}"))
 }
 
+/// 将旧测试与调试调用使用的稳定散列映射为 [0,1)；不参与生产回复概率。
+#[cfg(test)]
+fn deterministic_roll(input: &str) -> f64 {
+    let mut hash: u64 = 1469598103934665603;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    (hash as f64) / (u64::MAX as f64 + 1.0)
+}
+
 /// 依据 reply_mode 与 mentioned 返回基础回复阈值与延迟（毫秒）。
 fn base_params(reply_mode: &ReplyMode, is_mentioned: bool) -> (f64, u64) {
     let (threshold, delay) = match reply_mode {
@@ -526,14 +533,15 @@ fn base_params(reply_mode: &ReplyMode, is_mentioned: bool) -> (f64, u64) {
     (threshold, delay)
 }
 
-/// 用一个简单的确定性哈希把消息内容映射到 [0, 1)。
-fn deterministic_roll(content: &str) -> f64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in content.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+fn is_substantive_message(content: &str) -> bool {
+    let text = content.trim();
+    if text.chars().count() >= 2 {
+        return true;
     }
-    (hash & 0xFFFF_FFFF) as f64 / 4_294_967_296.0
+    text.ends_with(['?', '？', '!', '！', '.', '。'])
+        || text.contains("吗")
+        || text.contains("什么")
+        || text.contains("为什么")
 }
 
 /// 生成一个忽略决策。
@@ -998,7 +1006,7 @@ mod tests {
         (engine, rel_repo)
     }
 
-    /// 用状态构造引擎；energy 兼容旧封装，其余字段使用默认值。
+    /// 用状态构造引擎；测试只设置 energy，其余字段使用默认值。
     fn build_engine_from_energy(
         bindings: Vec<CharacterBinding>,
         rel: Option<Relationship>,
@@ -1501,13 +1509,9 @@ mod tests {
         );
     }
 
-    /// Test 5：Relationship 接近 0.25 时，floor 连续下降
-    /// 由于 roll 是确定性的，此测试验证不同 closeness 下 floor 的相对大小关系
+    /// Test 5：关系变化不会把可解释参与规则变成内容哈希骰子。
     #[tokio::test]
     async fn cold_start_floor_decreases_as_closeness_increases() {
-        // 测试策略：使用 "a" 作为消息内容，它的 roll 值约为 0.06
-        // 对于所有 closeness < 0.25 的情况，floor 都应该 >= 0.06，因此必定 REPLY
-        // 这验证了 cold-start 对新用户的保护
         let closeness_values = [0.075, 0.125, 0.1875, 0.249];
 
         for closeness in closeness_values {
@@ -1528,16 +1532,14 @@ mod tests {
                 )),
                 Arc::new(FakeClock::new()),
             );
-            // "a" 的 roll 值约为 0.06，远低于任何 floor 值
             let d = engine
-                .decide_response(1, 10, "a", false, Some(1))
+                .decide_response(1, 10, "你好", false, Some(1))
                 .await
                 .unwrap();
             assert_eq!(
                 d.action,
                 BehaviorAction::Reply,
-                "closeness={} 应触发回复",
-                closeness
+                "实质消息应按统一规则参与 closeness={closeness}"
             );
         }
     }

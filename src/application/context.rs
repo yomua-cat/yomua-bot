@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::application::character_history::CharacterHistoryProvider;
-use crate::application::llm_scheduler::EmbeddingScheduler;
 use crate::domain::character::{Character, CharacterBinding, LorebookEntry};
 use crate::domain::conversation::Conversation;
 use crate::domain::emotion::Mood;
@@ -77,56 +76,6 @@ pub struct LlmTurns {
     pub current: Option<LlmTurn>,
 }
 
-/// Lorebook 检索的匹配类型。
-#[derive(Debug, Clone, PartialEq)]
-pub enum MatchType {
-    /// 向量相似度匹配。
-    Vector,
-    /// 关键词匹配。
-    Keyword,
-    /// 同时被向量和关键词匹配。
-    Both,
-}
-
-/// Lorebook 匹配结果（包含匹配元数据）。
-#[derive(Debug, Clone)]
-pub struct LorebookMatch {
-    /// Lorebook 条目内容。
-    pub entry: String,
-    /// 优先级。
-    pub priority: i64,
-    /// 命中的关键词（若是关键词匹配）。
-    pub key: String,
-    /// 综合评分（向量分数 * 权重 + 关键词分数 * 权重）。
-    pub score: f32,
-    /// 匹配类型。
-    pub match_type: MatchType,
-}
-
-/// Lorebook 检索的限制参数。
-#[derive(Debug, Clone, Copy)]
-pub struct LorebookLimits {
-    /// 向量相似度阈值（默认 0.7）。
-    pub vector_threshold: f32,
-    /// 向量权重（默认 0.6）。
-    pub vector_weight: f32,
-    /// 关键词权重（默认 0.4）。
-    pub keyword_weight: f32,
-    /// 最大返回条数。
-    pub limit: i64,
-}
-
-impl Default for LorebookLimits {
-    fn default() -> Self {
-        Self {
-            vector_threshold: 0.7,
-            vector_weight: 0.6,
-            keyword_weight: 0.4,
-            limit: 5,
-        }
-    }
-}
-
 /// 一个会话的已组装上下文。
 #[derive(Debug, Clone)]
 pub struct ConversationContext {
@@ -168,10 +117,6 @@ pub struct ContextBuilder {
     relationship_repo: Arc<dyn RelationshipRepository>,
     mood_repo: Arc<dyn MoodRepository>,
     binding_repo: Arc<dyn CharacterBindingRepository>,
-    /// 向量嵌入调度器（可选，无时退化为纯关键词匹配）。
-    embedding_scheduler: Option<Arc<dyn EmbeddingScheduler>>,
-    /// Lorebook 检索的限制参数。
-    lorebook_limits: LorebookLimits,
 }
 
 impl ContextBuilder {
@@ -193,21 +138,7 @@ impl ContextBuilder {
             relationship_repo,
             mood_repo,
             binding_repo,
-            embedding_scheduler: None,
-            lorebook_limits: LorebookLimits::default(),
         }
-    }
-
-    /// 设置向量嵌入调度器。
-    pub fn with_embedding_scheduler(mut self, s: Arc<dyn EmbeddingScheduler>) -> Self {
-        self.embedding_scheduler = Some(s);
-        self
-    }
-
-    /// 设置 Lorebook 检索的限制参数。
-    pub fn with_lorebook_limits(mut self, limits: LorebookLimits) -> Self {
-        self.lorebook_limits = limits;
-        self
     }
 
     /// 组装一个会话的上下文。
@@ -259,56 +190,31 @@ impl ContextBuilder {
             .into_iter()
             .find(|b| b.character_id == character.id);
 
-        // Lorebook 匹配：优先使用混合检索（向量 + 关键词），无 embedding 时退化为纯关键词。
-        let matching_lorebook = {
-            let prompt_text = recent_messages_text(&recent_messages);
-            if self.embedding_scheduler.is_some() {
-                // 混合检索：向量相似度 ∪ 关键词命中，取并集后重排
-                match self
-                    .match_lorebook_hybrid(character, &prompt_text, self.lorebook_limits)
-                    .await
-                {
-                    Ok(matches) => matches
-                        .into_iter()
-                        .map(|m| LorebookEntry {
-                            keywords: vec![m.key],
-                            content: m.entry,
-                            enabled: true,
-                            priority: m.priority as i32,
-                        })
-                        .collect(),
-                    Err(e) => {
-                        tracing::warn!("混合检索失败，退化为关键词匹配: {}", e);
-                        self.match_lorebook_by_keywords(character, &prompt_text)
-                            .into_iter()
-                            .map(|(e, _)| e)
-                            .collect()
-                    }
-                }
-            } else {
-                // 纯关键词匹配（既有行为不变）
-                self.match_lorebook_by_keywords(character, &prompt_text)
-                    .into_iter()
-                    .map(|(e, _)| e)
-                    .take(limits.lorebook_limit)
-                    .collect()
-            }
-        };
+        // 世界书由角色卡规则统一选择；检索输入只使用该角色可见历史，避免跨会话泄露。
+        let matching_lorebook = character
+            .definition
+            .select_lorebook(&[recent_messages_text(&recent_messages)])
+            .into_iter()
+            .take(limits.lorebook_limit)
+            .collect();
 
         // 记忆：结合「按重要度的近期记忆」与「按最近消息关键词的结构化检索」，
         // 合并去重后截断到上限（MVP 不做向量检索）。
         let memory = {
             let by_importance = self
                 .memory_repo
-                .find_by_character_id(character.id, None, limits.memory_limit as i64)
+                .find_visible(character.id, conversation_id, limits.memory_limit as i64)
                 .await?;
             let keywords = extract_keywords(&recent_messages_text(&recent_messages));
             let by_keyword = if keywords.is_empty() {
                 Vec::new()
             } else {
                 self.memory_repo
-                    .search_by_keywords(character.id, &keywords, limits.memory_limit as i64)
+                    .find_visible(character.id, conversation_id, limits.memory_limit as i64)
                     .await?
+                    .into_iter()
+                    .filter(|m| keywords.iter().any(|k| m.content.contains(k)))
+                    .collect()
             };
             merge_memories(by_importance, by_keyword, limits.memory_limit)
         };
@@ -340,135 +246,6 @@ impl ContextBuilder {
             current_turn: None,
             llm_turns: Default::default(),
         })
-    }
-
-    /// 从角色 lorebook 中选出匹配文本的启用条目及其命中的关键词。
-    ///
-    /// 返回 (LorebookEntry, 第一个匹配的关键词)。
-    fn match_lorebook_by_keywords(
-        &self,
-        character: &Character,
-        prompt: &str,
-    ) -> Vec<(LorebookEntry, String)> {
-        let haystack = prompt.to_lowercase();
-
-        // TODO: 当前对 lorebook 中每个条目每个关键词做 contains，时间复杂度 O(关键词数 * 条目数)。
-        // 未来可考虑构建 inverted index（关键词 → 条目列表）以降低匹配成本（AUDIT-042）。
-        let mut matched: Vec<(LorebookEntry, String)> = character
-            .definition
-            .lorebook
-            .iter()
-            .filter_map(|entry| {
-                if !entry.enabled {
-                    return None;
-                }
-                entry
-                    .keywords
-                    .iter()
-                    .find(|kw| !kw.trim().is_empty() && haystack.contains(&kw.to_lowercase()))
-                    .map(|kw| (entry.clone(), kw.clone()))
-            })
-            .collect();
-
-        // 按 priority 降序（越重要的越靠前）。
-        matched.sort_by_key(|(e, _)| std::cmp::Reverse(e.priority));
-        matched
-    }
-
-    /// 混合检索 lorebook：向量相似度 ∪ 关键词命中，取并集后重排。
-    ///
-    /// 向量检索使用 EmbeddingScheduler 生成查询向量，从 semantic_memories 表匹配。
-    /// 当 embedding_scheduler 不可用时退化为纯关键词匹配。
-    async fn match_lorebook_hybrid(
-        &self,
-        character: &Character,
-        query_text: &str,
-        limits: LorebookLimits,
-    ) -> Result<Vec<LorebookMatch>, RuntimeError> {
-        // 1. 向量检索（如有 embedding_scheduler）
-        let vector_matches = if let Some(ref scheduler) = self.embedding_scheduler {
-            let query_embedding = scheduler
-                .submit_embedding(vec![query_text.to_string()])
-                .await?;
-            let query_vec = &query_embedding[0];
-
-            let results = self
-                .memory_repo
-                .search_by_embedding(character.id, query_vec, Some("lorebook"), limits.limit)
-                .await?;
-
-            // 过滤低于阈值的向量匹配，并标记为 Vector 类型
-            results
-                .into_iter()
-                .filter(|r| r.score >= limits.vector_threshold)
-                .map(|r| {
-                    (
-                        r.memory.content,
-                        r.memory.importance as i64,
-                        r.score,
-                        MatchType::Vector,
-                    )
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-
-        // 2. 关键词检索（复用现有逻辑）
-        let keyword_matches = self.match_lorebook_by_keywords(character, query_text);
-        let keyword_entries: Vec<(String, i64, String)> = keyword_matches
-            .into_iter()
-            .map(|(e, kw)| (e.content, e.priority as i64, kw))
-            .collect();
-
-        // 3. 合并去重（按 entry 内容）
-        let mut all_matches: Vec<LorebookMatch> = Vec::new();
-        let mut seen_entries: HashSet<String> = HashSet::new();
-
-        for (content, priority, score, match_type) in vector_matches {
-            if !seen_entries.contains(&content) {
-                seen_entries.insert(content.clone());
-                all_matches.push(LorebookMatch {
-                    entry: content,
-                    priority,
-                    key: String::new(),
-                    score,
-                    match_type,
-                });
-            }
-        }
-
-        for (content, priority, key) in keyword_entries {
-            if !seen_entries.contains(&content) {
-                seen_entries.insert(content.clone());
-                all_matches.push(LorebookMatch {
-                    entry: content,
-                    priority,
-                    key,
-                    score: 1.0,
-                    match_type: MatchType::Keyword,
-                });
-            }
-        }
-
-        // 4. 重排：score = vector_score * vector_weight + keyword_score * keyword_weight
-        // keyword_score = 1.0（命中关键词）
-        for m in &mut all_matches {
-            m.score = match m.match_type {
-                MatchType::Vector => m.score * limits.vector_weight,
-                MatchType::Keyword => 1.0 * limits.keyword_weight,
-                MatchType::Both => m.score * limits.vector_weight + limits.keyword_weight,
-            };
-        }
-        all_matches.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-
-        // 5. 转换为 LorebookMatch 并截断
-        let final_matches: Vec<LorebookMatch> = all_matches
-            .into_iter()
-            .take(limits.limit as usize)
-            .collect();
-
-        Ok(final_matches)
     }
 }
 
@@ -526,7 +303,7 @@ fn extract_keywords(text: &str) -> Vec<String> {
 ///
 /// 去重逻辑：
 /// - 已持久化的记忆（id != 0）按 id 去重；
-/// - 同时按内容 hash 去重，避免两条已持久化但内容相同的记忆都被保留（AUDIT-016）；
+/// - 同时按内容 hash 去重，避免两条已持久化但内容相同的记忆都被保留；
 /// - id 为 0（未持久化）时始终追加，但也会与已有内容去重。
 fn merge_memories(
     by_importance: Vec<Memory>,
@@ -559,7 +336,6 @@ fn merge_memories(
             .partial_cmp(&a.importance)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    // TODO: 未来可考虑在存储层预先排序或缓存，避免每次构建 context 都执行 O(n log n) 排序（AUDIT-040）。
     merged.truncate(limit);
     merged
 }

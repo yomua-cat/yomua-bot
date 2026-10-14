@@ -5,8 +5,6 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
-
 use crate::domain::emotion::Mood;
 use crate::domain::repository::MoodRepository;
 use crate::error::RuntimeError;
@@ -40,26 +38,6 @@ impl MoodService {
             .upsert(character_id, conversation_id, &default)
             .await?;
         Ok(default)
-    }
-
-    /// 对一条收到消息应用情绪变化（Character × Conversation 范围）。
-    ///
-    /// 收到消息的调整说明：与人交流带来愉悦（+2）、增进好感（按现有模型以 mood 上升体现）。
-    pub async fn apply_message_event(
-        &self,
-        character_id: i64,
-        conversation_id: i64,
-        _user_message: &str,
-    ) -> Result<Mood, RuntimeError> {
-        let mut mood = self.load(character_id, conversation_id).await?;
-        mood = mood.clamped();
-        // 收到消息后情绪略微回升。
-        mood.value = (mood.value + 2.0).clamp(0.0, 100.0);
-        mood.last_updated = Utc::now();
-        self.mood_repo
-            .upsert(character_id, conversation_id, &mood)
-            .await?;
-        Ok(mood)
     }
 }
 
@@ -123,22 +101,6 @@ mod tests {
         assert_eq!(mood.value, Mood::default().value);
         // 已落库。
         assert!(repo.persisted(1, 10).is_some());
-    }
-
-    #[tokio::test]
-    async fn apply_message_event_updates_and_persists() {
-        let repo = Arc::new(MemMoodRepo {
-            moods: Mutex::new(HashMap::new()),
-        });
-        let service = MoodService::new(repo.clone());
-
-        let mood = service.apply_message_event(1, 10, "你好").await.unwrap();
-        // 收到消息 → mood 上升。
-        assert!(mood.value > Mood::default().value);
-
-        // 落库。
-        let persisted = repo.persisted(1, 10).unwrap();
-        assert_eq!(persisted.value, mood.value);
     }
 
     #[tokio::test]

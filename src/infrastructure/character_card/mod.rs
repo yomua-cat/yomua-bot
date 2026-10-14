@@ -1,6 +1,6 @@
 //! Character Card 导入器 —— 将外部 SillyTavern 卡转换为内部规范模型。
 //!
-//! 采用文档 docs/10 的「Importer → Canonical」模式：
+//! 本模块采用「外部格式 → 领域模型」转换：
 //! 本模块负责识别卡版本、解析 JSON / PNG 元数据，
 //! 并把 V1 / V2 / V3 字段映射到 domain 的 [`CharacterDefinition`]。
 //! domain 层不依赖任何外部 schema；外部格式的解析能力全部集中在此适配层。
@@ -81,7 +81,11 @@ fn extract_source(value: &Value) -> (CardVersion, Value) {
     let spec_version = value.get("spec_version").and_then(|v| v.as_str());
     let spec = value.get("spec").and_then(|v| v.as_str());
 
-    let version = if is_v3(spec_version) || is_v3(spec) {
+    let version = if spec == Some("chara_card_v3")
+        || spec_version.is_some_and(|s| s == "3.0" || s.starts_with("3."))
+        || is_v3(spec_version)
+        || is_v3(spec)
+    {
         CardVersion::V3
     } else if is_v2(spec) {
         CardVersion::V2
@@ -138,7 +142,7 @@ fn get_string(data: &Value, keys: &[&str]) -> Option<String> {
 
 /// 提取示例消息。
 ///
-/// - V2/V3：`mes_example` 为 ChatItem（`{name, content}`）数组 → `"name: content"`。
+/// - 兼容部分导出工具的 `mes_example` ChatItem（`{name, content}`）数组 → `"name: content"`。
 /// - V1：`mes_example` 为字符串 → 按行拆分。
 /// - V1：`examples` 也可能存在（V1 旧字段数组），一并兼容。
 fn extract_example_messages(data: &Value) -> Vec<String> {
@@ -223,11 +227,15 @@ fn extract_lorebook(data: &Value) -> Vec<LorebookEntry> {
     };
 
     let entries = match book.get("entries") {
-        Some(Value::Array(entries)) => entries,
+        Some(Value::Array(entries)) => entries.iter().collect::<Vec<_>>(),
+        Some(Value::Object(entries)) => entries.values().collect(),
         _ => return Vec::new(),
     };
 
-    entries.iter().filter_map(parse_lorebook_entry).collect()
+    entries
+        .into_iter()
+        .filter_map(parse_lorebook_entry)
+        .collect()
 }
 
 /// 解析单个 lorebook 条目（宽松）。
@@ -235,6 +243,7 @@ fn parse_lorebook_entry(entry: &Value) -> Option<LorebookEntry> {
     let content = entry.get("content")?.as_str()?;
     let keywords = entry
         .get("keys")
+        .or_else(|| entry.get("key"))
         .and_then(|k| k.as_array())
         .map(|arr| {
             arr.iter()
@@ -254,7 +263,7 @@ fn parse_lorebook_entry(entry: &Value) -> Option<LorebookEntry> {
     let priority = entry
         .get("insertion_order")
         .and_then(|o| o.as_i64())
-        .map(|o| o as i32)
+        .and_then(|o| i32::try_from(o).ok())
         .unwrap_or(0);
 
     Some(LorebookEntry {
@@ -268,6 +277,34 @@ fn parse_lorebook_entry(entry: &Value) -> Option<LorebookEntry> {
 /// 构建 metadata：记录原始 spec / spec_version 及少量来源字段。
 fn build_metadata(root: &Value, version: CardVersion, data: &Value) -> Value {
     let mut metadata = serde_json::Map::new();
+    // 保留完整来源，未知扩展与世界书规则不会在导入时丢失。
+    metadata.insert("raw_card".into(), root.clone());
+    if data
+        .get("extensions")
+        .and_then(Value::as_object)
+        .is_some_and(|v| !v.is_empty())
+    {
+        tracing::warn!("角色卡包含扩展字段，已保留原始数据；部分扩展可能不参与运行");
+    }
+
+    if let Some(book) = data.get("character_book").or_else(|| data.get("lorebook")) {
+        metadata.insert("lorebook_config".into(), book.clone());
+        let entries: Vec<&Value> = match book.get("entries") {
+            Some(Value::Array(v)) => v.iter().collect(),
+            Some(Value::Object(v)) => v.values().collect(),
+            _ => Vec::new(),
+        };
+        metadata.insert(
+            "lorebook_rules".into(),
+            Value::Array(
+                entries
+                    .into_iter()
+                    .filter(|v| parse_lorebook_entry(v).is_some())
+                    .cloned()
+                    .collect(),
+            ),
+        );
+    }
 
     let version_str = match version {
         CardVersion::V1 => "chara_card_v1",

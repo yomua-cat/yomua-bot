@@ -2,14 +2,13 @@
 //!
 //! 负责把一条 `MessageReceivedEvent` 走完整个回复流程：
 //! 确定参与角色 → 更新关系/情绪 → 组装上下文 → 行为决策 →
-//! （可选）认知生成 → 分派发送动作。供 [`crate::application::event_processor::EventProcessor`]
-//! 调用。
+//! （可选）认知生成 → 分派发送动作，供 Outbox 处理器复用。
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::domain::message::ReplyTaskStatus;
 use chrono::Utc;
-use rand::seq::SliceRandom;
 
 #[allow(unused_imports)]
 use crate::adapters::onebot::ActionResponse;
@@ -22,7 +21,7 @@ use crate::application::memory_service::MemoryService;
 use crate::application::mood_service::MoodService;
 use crate::application::relationship_service::RelationshipService;
 use crate::application::runtime::CharacterRuntime;
-use crate::domain::behavior::{Action, BehaviorAction};
+use crate::domain::behavior::BehaviorAction;
 use crate::domain::conversation::ParticipantRole;
 use crate::domain::event::{
     BehaviorDecidedEvent, CoreEvent, MessageReceivedEvent, ResponseGeneratedEvent, ResponseSource,
@@ -36,22 +35,22 @@ use crate::error::RuntimeError;
 /// 行为引擎给出的延时（用于模拟输入间隔）可能较大；为了不让一条普通消息
 /// 长时间卡住回复链路，这里统一截断到该上限。
 const MAX_REPLY_DELAY_MS: u64 = 3_000;
+const NORMAL_BATCH_WAIT_MS: u64 = 1_500;
+const MENTION_BATCH_WAIT_MS: u64 = 500;
+const MAX_BATCH_MESSAGES: usize = 20;
+
+fn combine_batch_contents(contents: impl IntoIterator<Item = String>) -> String {
+    contents
+        .into_iter()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// 把行为引擎给出的延迟截断到安全上限。
 fn capped_delay_ms(delay_ms: u64) -> u64 {
     delay_ms.min(MAX_REPLY_DELAY_MS)
-}
-
-/// 待发送的回复（延迟发送，打乱顺序）。
-struct PendingReply {
-    /// 所属绑定 ID（用于日志追踪）。
-    binding_id: i64,
-    /// 回复内容。
-    content: String,
-    /// 目标会话 ID。
-    conversation_id: i64,
-    /// 延迟时长。
-    delay: Duration,
 }
 
 /// 延迟执行器 —— 把"等待 N 毫秒"抽象为可注入依赖。
@@ -81,7 +80,6 @@ pub struct ReplyProcessor {
     decision_orchestrator: crate::application::decision_orchestrator::DecisionOrchestrator,
     cognition: Arc<CognitionLayer>,
     relationship_service: Arc<RelationshipService>,
-    mood_service: Arc<MoodService>,
     memory_service: Arc<MemoryService>,
     action_dispatcher: Arc<ActionDispatcher>,
     event_bus: EventBus,
@@ -91,9 +89,127 @@ pub struct ReplyProcessor {
     /// 当前 Bot 在 OneBot 中的账号 ID（QQ 号），用于精确识别"当前 Bot 自己"。
     /// 在单 Bot 部署中从 OneBotConfig 传入；在多 Bot 场景下由各 Bot 独立持有。
     bot_self_id: Option<i64>,
+    message_repo: Option<Arc<dyn crate::domain::repository::MessageRepository>>,
 }
 
 impl ReplyProcessor {
+    fn event_expired(event: &MessageReceivedEvent) -> bool {
+        event.message_id > 0 && (Utc::now() - event.ingested_at).num_seconds() > 120
+    }
+
+    /// 在回复任务开始时冻结一轮连续输入。
+    ///
+    /// 入站消息仍逐条保存；这里只把已经落库、同一会话同一发送者、紧邻当前序号的
+    /// 消息合并成一次模型输入。等待结束后才读取数据库，因此生成期间到达的消息
+    /// 不会混入本轮，而会由后续 Outbox 任务处理。
+    async fn freeze_batch(&self, event: &MessageReceivedEvent) -> Result<String, RuntimeError> {
+        let Some(repo) = &self.message_repo else {
+            return Ok(event.content.clone());
+        };
+        let wait_ms = if event.is_mentioned {
+            MENTION_BATCH_WAIT_MS
+        } else {
+            NORMAL_BATCH_WAIT_MS
+        };
+        self.delay_executor.delay(wait_ms).await;
+        let deadline = event.ingested_at + chrono::Duration::milliseconds(wait_ms as i64);
+        let messages = repo
+            .find_recent(event.conversation_id, MAX_BATCH_MESSAGES as i64)
+            .await?;
+        let mut ordered = messages;
+        ordered.sort_by_key(|message| message.conversation_sequence.unwrap_or(i64::MAX));
+        let mut batch = Vec::new();
+        let mut found_current = event.message_id == 0;
+        for message in ordered {
+            let sequence = message.conversation_sequence.unwrap_or(i64::MAX);
+            if event.message_id > 0 && message.id == event.message_id {
+                found_current = true;
+                batch.push(message);
+                continue;
+            }
+            if !found_current || sequence <= event.conversation_sequence {
+                continue;
+            }
+            if message.ingested_at.is_some_and(|at| at > deadline) {
+                break;
+            }
+            let author_kind = message
+                .metadata
+                .get("author_kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or("user");
+            if author_kind != "user" {
+                continue;
+            }
+            if message.sender_id != event.sender_id
+                || message.active_character_id != Some(event.character_id)
+            {
+                break;
+            }
+            batch.push(message);
+            if batch.len() >= MAX_BATCH_MESSAGES {
+                break;
+            }
+        }
+        if event.message_id == 0 {
+            let mut combined = vec![event.content.clone()];
+            for message in batch {
+                self.save_task_for_message(
+                    message.id,
+                    event.character_id,
+                    ReplyTaskStatus::Ignored,
+                    None,
+                )
+                .await?;
+                if let crate::domain::message::MessageContent::Text(text) = message.content {
+                    combined.push(text);
+                }
+            }
+            return Ok(combine_batch_contents(combined));
+        }
+        if batch.len() <= 1 {
+            return Ok(event.content.clone());
+        }
+
+        let mut combined = Vec::new();
+        for message in batch.iter() {
+            if let crate::domain::message::MessageContent::Text(text) = &message.content {
+                if !text.trim().is_empty() {
+                    combined.push(text.trim().to_string());
+                }
+            }
+            if message.id != event.message_id {
+                self.save_task_for_message(
+                    message.id,
+                    event.character_id,
+                    ReplyTaskStatus::Ignored,
+                    None,
+                )
+                .await?;
+            }
+        }
+        let combined = combine_batch_contents(combined);
+        if combined.is_empty() {
+            Ok(event.content.clone())
+        } else {
+            Ok(combined)
+        }
+    }
+
+    async fn save_task_for_message(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        status: ReplyTaskStatus,
+        content: Option<&str>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(repo) = &self.message_repo {
+            repo.save_reply_task(message_id, character_id, status, content)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// 创建回复处理器。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -102,7 +218,7 @@ impl ReplyProcessor {
         decision_orchestrator: crate::application::decision_orchestrator::DecisionOrchestrator,
         cognition: Arc<CognitionLayer>,
         relationship_service: Arc<RelationshipService>,
-        mood_service: Arc<MoodService>,
+        _mood_service: Arc<MoodService>,
         memory_service: Arc<MemoryService>,
         action_dispatcher: Arc<ActionDispatcher>,
         event_bus: EventBus,
@@ -116,328 +232,511 @@ impl ReplyProcessor {
             decision_orchestrator,
             cognition,
             relationship_service,
-            mood_service,
             memory_service,
             action_dispatcher,
             event_bus,
             delay_executor,
             participant_repo,
             bot_self_id,
+            message_repo: None,
         }
     }
 
-    /// 处理一条收到的消息事件。
-    ///
-    /// 遍历该会话的所有绑定，每个绑定独立决策是否回复。
-    /// 多 Bot 共群时，所有待发送回复延迟随机打乱后顺序发送。
-    ///
-    /// 注意：Message 持久化由 MessagePersistence 负责，ReplyProcessor 不再 INSERT 消息。
-    /// event.character_id 是 immutable processing attribution，已由 InboundProcessor 设置。
-    pub async fn process(&self, event: &MessageReceivedEvent) -> Result<(), RuntimeError> {
-        // 1. 获取该会话的所有绑定。
-        let bindings = self
+    /// 主动任务沿同一入站事务与发送链路，保存依据与绑定版本。
+    pub async fn enqueue_proactive(
+        &self,
+        binding: &crate::domain::character::CharacterBinding,
+        source: &crate::domain::message::Message,
+        basis: &str,
+    ) -> Result<(), RuntimeError> {
+        let repo = self
+            .message_repo
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Internal("主动任务未装配持久仓储".into()))?;
+        if basis.trim().is_empty()
+            || source.conversation_id != binding.conversation_id
+            || source.active_character_id != Some(binding.character_id)
+        {
+            return Err(RuntimeError::Internal("主动发言缺少有效来源".into()));
+        }
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let payload = serde_json::json!({"event_uuid":uuid,"conversation_id":binding.conversation_id,"sender_id":source.sender_id,"message_id":0,"content":basis,"timestamp":now,"is_mentioned":true,"character_id":binding.character_id,"conversation_sequence":0,"platform_message_id":null,"ingested_at":now,"metadata":{"proactive":true,"basis_message_ids":[source.id],"binding_id":binding.id,"binding_version":binding.switched_at,"author_kind":"system"}});
+        repo.accept_message(&crate::domain::repository::AcceptedMessageInput {
+            conversation_id: binding.conversation_id,
+            sender_id: source.sender_id,
+            content_json: serde_json::json!({"Text":basis}).to_string(),
+            timestamp: now.to_rfc3339(),
+            platform_message_id: None,
+            character_id: binding.character_id,
+            event_uuid: uuid,
+            outbox_payload: payload.to_string(),
+        })
+        .await?;
+        Ok(())
+    }
+    /// 装配可靠回复任务存储。
+    pub fn with_message_repository(
+        mut self,
+        repo: Arc<dyn crate::domain::repository::MessageRepository>,
+    ) -> Self {
+        self.message_repo = Some(repo);
+        self
+    }
+
+    async fn save_task(
+        &self,
+        event: &MessageReceivedEvent,
+        status: ReplyTaskStatus,
+        content: Option<&str>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(repo) = &self.message_repo {
+            if event.message_id > 0 {
+                repo.save_reply_task(event.message_id, event.character_id, status, content)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+    async fn save_task_error(
+        &self,
+        event: &MessageReceivedEvent,
+        status: ReplyTaskStatus,
+        content: Option<&str>,
+        error: &str,
+    ) -> Result<(), RuntimeError> {
+        if let Some(repo) = &self.message_repo {
+            if event.message_id > 0 {
+                repo.save_reply_task_error(
+                    event.message_id,
+                    event.character_id,
+                    status,
+                    content,
+                    Some(error),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+    async fn current_binding(
+        &self,
+        event: &MessageReceivedEvent,
+    ) -> Result<Option<crate::domain::character::CharacterBinding>, RuntimeError> {
+        let binding = self
             .binding_manager
             .by_conversation(event.conversation_id)
-            .await?;
-        if bindings.is_empty() {
-            tracing::debug!(
-                target: "runtime",
-                conversation_id = event.conversation_id,
-                "该会话未绑定角色，忽略消息"
-            );
+            .await?
+            .into_iter()
+            .find(|b| b.character_id == event.character_id);
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+        if let Some(repo) = &self.message_repo {
+            if let Some(msg) = repo.find_by_id(event.message_id).await? {
+                if let Some(id) = msg.metadata.get("binding_id").and_then(|v| v.as_i64()) {
+                    if id != binding.id
+                        || msg.metadata.get("binding_version")
+                            != Some(&serde_json::json!(binding.switched_at))
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        Ok(Some(binding))
+    }
+    /// 仅处理接收时的角色；生成内容先落库，未知发送结果交由管理员核查。
+    pub async fn process(&self, event: &MessageReceivedEvent) -> Result<(), RuntimeError> {
+        self.process_owned(event, None).await
+    }
+    pub async fn process_owned(
+        &self,
+        event: &MessageReceivedEvent,
+        lease: Option<&str>,
+    ) -> Result<(), RuntimeError> {
+        let Some(binding) = self.current_binding(event).await? else {
+            self.save_task(event, ReplyTaskStatus::Cancelled, None)
+                .await?;
+            return Ok(());
+        };
+        if Self::event_expired(event) {
+            self.save_task(event, ReplyTaskStatus::Expired, None)
+                .await?;
             return Ok(());
         }
-
-        // 2. 收集所有待发送回复（延迟发送，打乱顺序）。
-        let mut pending_replies: Vec<PendingReply> = Vec::new();
-
-        for binding in &bindings {
-            // 2a. Sender 类型过滤：区分普通用户 / 当前 Bot 自己 / 其他 Bot。
-            //
-            // semantics:
-            // - 普通用户（role=user）：始终正常处理
-            // - 当前 Bot 自己（role=character 且 external_id 匹配 bot_self_id）：始终跳过（防止自复读）
-            // - 其他 Bot（role=character 但 external_id 不同）：仅在 cross_reply_enabled=true 时处理
-            let my_character = match self.get_my_character_participant(binding).await {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "runtime",
-                        binding_id = binding.id,
-                        "获取当前 Bot participant 失败: {e}"
-                    );
-                    continue;
-                }
-            };
-
-            let sender = match self.participant_repo.find_by_id(event.sender_id).await {
-                Ok(Some(p)) => p,
-                Ok(None) => {
-                    tracing::warn!(
-                        target: "runtime",
-                        sender_id = event.sender_id,
-                        "发送者 participant 不存在"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(target: "runtime", "查询发送者 participant 失败: {e}");
-                    continue;
-                }
-            };
-
-            // Case A: 普通用户 → 正常处理
-            let classification = if sender.role == ParticipantRole::User {
-                "User".to_string()
-            } else if sender.role == ParticipantRole::Character
-                && sender.external_id == my_character.external_id
-            {
-                "SelfBot".to_string()
+        let sender = self
+            .participant_repo
+            .find_by_id(event.sender_id)
+            .await?
+            .ok_or_else(|| RuntimeError::Internal("发送者记录缺失".into()))?;
+        if self
+            .bot_self_id
+            .is_some_and(|id| sender.external_id == id.to_string())
+        {
+            return Ok(());
+        }
+        if sender.role != ParticipantRole::User && !binding.cross_reply_enabled {
+            return Ok(());
+        }
+        let character = self.runtime.refresh_character(event.character_id).await?;
+        if !character.enabled {
+            self.save_task(event, ReplyTaskStatus::Cancelled, None)
+                .await?;
+            return Ok(());
+        }
+        let stored = if let Some(repo) = &self.message_repo {
+            if event.message_id > 0 {
+                repo.reply_task(event.message_id).await?
             } else {
-                "OtherBot".to_string()
-            };
-            tracing::info!(
-                target = "runtime",
-                conversation_id = event.conversation_id,
-                sender_id = event.sender_id,
-                sender_role = ?sender.role,
-                sender_external_id = %sender.external_id,
-                my_character_external_id = %my_character.external_id,
-                cross_reply_enabled = binding.cross_reply_enabled,
-                classification = %classification,
-                "E2E_TRACE: Sender classification"
-            );
-            if sender.role == ParticipantRole::User {
-                // pass through to reply pipeline
+                None
             }
-            // Case B: 当前 Bot 自己 → 跳过
-            else if sender.role == ParticipantRole::Character
-                && sender.external_id == my_character.external_id
-            {
-                tracing::info!(target = "runtime", "E2E_TRACE: Self-bot，跳过");
-                continue;
-            }
-            // Case C: 其他 Bot
-            else {
-                if !binding.cross_reply_enabled {
-                    tracing::info!(
-                        target = "runtime",
-                        "E2E_TRACE: OtherBot + cross_reply=false，跳过"
-                    );
-                    continue;
-                }
-            }
-
-            let character_id = binding.character_id;
-
-            // 2b. 加载角色（运行时缓存 + 状态持久化）。
-            let character = match self.runtime.load_character(character_id).await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "runtime",
-                        binding_id = binding.id,
-                        character_id,
-                        "加载角色失败: {e}"
-                    );
-                    continue;
-                }
-            };
-
-            // 2c. 记忆提取：用户消息可能包含值得长期记住的信息（确定性启发式）。
-            if let Err(e) = self
-                .memory_service
-                .extract_and_store(
-                    character_id,
-                    Some(event.conversation_id),
-                    event.sender_id,
-                    &event.content,
-                )
-                .await
-            {
-                tracing::warn!(target: "runtime", binding_id = binding.id, "记忆提取失败: {e}");
-            }
-
-            // 2d. 更新关系与情绪并持久化。
-            if let Err(e) = self
-                .relationship_service
-                .record_interaction(character_id, event.sender_id)
-                .await
-            {
-                tracing::warn!(target: "runtime", binding_id = binding.id, "关系更新失败: {e}");
-            }
-            if let Err(e) = self
-                .mood_service
-                .apply_message_event(character_id, event.conversation_id, &event.content)
-                .await
-            {
-                tracing::warn!(target: "runtime", binding_id = binding.id, "情绪更新失败: {e}");
-            }
-
-            // 2e. 行为决策（经 DecisionOrchestrator，支持 LLM assistance 扩展）。
-            let decision = match self
-                .decision_orchestrator
-                .evaluate_response(
-                    character_id,
-                    event.conversation_id,
-                    &event.content,
-                    event.is_mentioned,
-                    Some(event.sender_id),
-                )
-                .await
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(
-                        target = "runtime",
-                        binding_id = binding.id,
-                        "行为决策失败: {e}"
-                    );
-                    continue;
-                }
-            };
-
-            self.event_bus
-                .publish(&CoreEvent::BehaviorDecided(BehaviorDecidedEvent {
-                    character_id,
-                    conversation_id: event.conversation_id,
-                    action: format!("{:?}", decision.action),
-                    reason: decision.reason.clone(),
-                    timestamp: Utc::now(),
-                }));
-
-            // 仅回复动作继续。
-            if decision.action != BehaviorAction::Reply {
-                tracing::info!(
-                    target = "runtime",
-                    conversation_id = event.conversation_id,
-                    character_id,
-                    action = ?decision.action,
-                    reason = %decision.reason,
-                    "E2E_TRACE: BehaviorEngine 决定不回复"
-                );
-                continue;
-            }
-
-            tracing::info!(
-                target = "runtime",
-                conversation_id = event.conversation_id,
-                character_id,
-                "E2E_TRACE: BehaviorEngine 决定 Reply，准备生成回复"
-            );
-
-            // 2f. 生成响应内容。
-            let content = match self.generate_reply(event, &character, character_id).await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(target: "runtime", binding_id = binding.id, "生成回复失败: {e}");
-                    continue;
-                }
-            };
-
-            tracing::info!(
-                target = "runtime",
-                conversation_id = event.conversation_id,
-                content_len = content.len(),
-                "E2E_TRACE: 回复内容已生成，准备发送"
-            );
-
-            // 2g. 收集待发送回复，延迟使用 BehaviorEngine 返回的延迟（截断到安全上限）。
-            pending_replies.push(PendingReply {
-                binding_id: binding.id,
-                content,
-                conversation_id: event.conversation_id,
-                delay: Duration::from_millis(capped_delay_ms(decision.delay_ms)),
-            });
-        }
-
-        // 3. 延迟 + 随机打乱顺序后发送。
-        if pending_replies.is_empty() {
-            tracing::info!(
-                target = "runtime",
-                conversation_id = event.conversation_id,
-                "E2E_TRACE: 无待发送回复"
-            );
+        } else {
+            None
+        };
+        if stored
+            .as_ref()
+            .is_some_and(|task| task.status.is_terminal())
+        {
             return Ok(());
         }
-        pending_replies.shuffle(&mut rand::thread_rng());
-        for pending in pending_replies {
-            self.delay_executor
-                .delay(pending.delay.as_millis() as u64)
-                .await;
-            if let Err(e) = self
-                .action_dispatcher
-                .execute(&Action::SendMessage {
-                    conversation_id: pending.conversation_id,
-                    content: pending.content,
-                })
+        if stored
+            .as_ref()
+            .is_some_and(|task| task.status == ReplyTaskStatus::Sending)
+        {
+            if let Some(repo) = &self.message_repo {
+                let changed = repo
+                    .mark_reply_task_unknown_if_sending(
+                        event.message_id,
+                        event.character_id,
+                        "进程在发送平台回执前退出，发送结果未知，需要核查",
+                    )
+                    .await?;
+                if changed {
+                    tracing::warn!(
+                        message_id = event.message_id,
+                        "恢复发送中回复任务并标记为 unknown"
+                    );
+                }
+            }
+            return Ok(());
+        }
+        let stable_user_key = event
+            .metadata
+            .get("external_sender_id")
+            .and_then(|value| value.as_str());
+        let relationship_participant_id = self
+            .relationship_service
+            .canonical_participant_id(event.character_id, event.sender_id, stable_user_key)
+            .await?;
+        if event.message_id > 0 {
+            self.memory_service
+                .extract_and_store(
+                    event.character_id,
+                    Some(event.conversation_id),
+                    relationship_participant_id,
+                    &event.content,
+                    event.message_id,
+                    event.timestamp,
+                )
+                .await?;
+        }
+        if event.message_id > 0 {
+            match self
+                .relationship_service
+                .record_interaction_once(
+                    event.character_id,
+                    relationship_participant_id,
+                    event.message_id,
+                )
                 .await
             {
-                // 消息发送失败是严重问题：用户看不到回复，且无重试机制。
-                // 使用 error 级别以便运维及时发现。
-                tracing::error!(
-                    target: "runtime",
-                    binding_id = pending.binding_id,
-                    error = %e,
-                    "发送回复失败"
-                );
+                Ok(_) => {}
+                Err(crate::error::RepositoryError::NotImplemented(_)) => {
+                    tracing::debug!(
+                        character_id = event.character_id,
+                        participant_id = relationship_participant_id,
+                        "关系仓储未提供交互幂等记录，跳过关系计数"
+                    );
+                }
+                Err(error) => return Err(RuntimeError::Repository(error)),
             }
         }
-
+        let batch_content = self.freeze_batch(event).await?;
+        let decision = self
+            .decision_orchestrator
+            .evaluate_response(
+                event.character_id,
+                event.conversation_id,
+                &batch_content,
+                event.is_mentioned,
+                Some(relationship_participant_id),
+            )
+            .await?;
+        self.event_bus
+            .publish(&CoreEvent::BehaviorDecided(BehaviorDecidedEvent {
+                character_id: event.character_id,
+                conversation_id: event.conversation_id,
+                action: format!("{:?}", decision.action),
+                reason: decision.reason.clone(),
+                timestamp: Utc::now(),
+            }));
+        if decision.action != BehaviorAction::Reply {
+            self.save_task(event, ReplyTaskStatus::Ignored, None)
+                .await?;
+            return Ok(());
+        }
+        if !self.cognition.enabled()
+            && stored
+                .as_ref()
+                .filter(|task| task.status.can_reuse_content())
+                .and_then(|task| task.content.as_ref())
+                .is_none()
+        {
+            tracing::info!(
+                conversation_id = event.conversation_id,
+                "未配置对话模型，保留原始消息并跳过生成"
+            );
+            self.save_task(event, ReplyTaskStatus::Ignored, None)
+                .await?;
+            return Ok(());
+        }
+        // 即时消息不做猜测式关系、情绪和记忆修改；后台批处理记录来源。
+        let content = if let Some(content) = stored
+            .as_ref()
+            .filter(|task| task.status.can_reuse_content())
+            .and_then(|task| task.content.clone())
+        {
+            content
+        } else {
+            self.save_task(event, ReplyTaskStatus::Generating, None)
+                .await?;
+            let content = self
+                .generate_reply(
+                    event,
+                    &character,
+                    event.character_id,
+                    relationship_participant_id,
+                    &batch_content,
+                )
+                .await?;
+            if Self::event_expired(event) {
+                self.save_task(event, ReplyTaskStatus::Expired, Some(&content))
+                    .await?;
+                return Ok(());
+            }
+            self.save_task(event, ReplyTaskStatus::Generated, Some(&content))
+                .await?;
+            content
+        };
+        self.delay_executor
+            .delay(capped_delay_ms(decision.delay_ms))
+            .await;
+        // 绑定切换与发送前复核必须串行。否则切换可能在复核结束后、OneBot
+        // 请求发出前插入，旧角色回复仍会发送。
+        let _binding_gate = self
+            .binding_manager
+            .acquire_conversation_lock(event.conversation_id)
+            .await;
+        if Self::event_expired(event) {
+            self.save_task(event, ReplyTaskStatus::Expired, Some(&content))
+                .await?;
+            return Ok(());
+        }
+        // 发送前再次校验绑定和硬约束，避免切换期间发送旧角色回复。
+        if self.current_binding(event).await?.is_none()
+            || !self
+                .runtime
+                .refresh_character(event.character_id)
+                .await?
+                .enabled
+        {
+            self.save_task(event, ReplyTaskStatus::Cancelled, None)
+                .await?;
+            return Ok(());
+        }
+        // 参与判断只在本轮生成前执行一次。这里重新调用决策模型会把一条普通消息
+        // 变成“两次参与判断 + 一次生成”，既增加成本，也可能因为模型结果变化而
+        // 在发送前把已经生成的回复临时改掉。发送前只复核不会交给模型的硬约束。
+        if let (Some(repo), Some(token)) = (&self.message_repo, lease) {
+            if !repo.owns_outbox_lease(event.message_id, token).await? {
+                return Err(RuntimeError::Internal(
+                    "回复任务租约已失效，停止发送".into(),
+                ));
+            }
+        }
+        // 在发送之前写入状态；进程在 API 回执前退出时不能自动重复发送。
+        self.save_task(event, ReplyTaskStatus::Sending, None)
+            .await?;
+        match self
+            .action_dispatcher
+            .execute_send_message_with_response(event.conversation_id, &content)
+            .await
+        {
+            Ok(response) if response.is_ok() => {
+                let platform_message_id = response
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("message_id"))
+                    .and_then(|value| value.as_i64());
+                if let Some(repo) = &self.message_repo {
+                    repo.save_reply_task_delivery(
+                        event.message_id,
+                        event.character_id,
+                        ReplyTaskStatus::Sent,
+                        None,
+                        None,
+                        platform_message_id,
+                    )
+                    .await?;
+                } else {
+                    self.save_task(event, ReplyTaskStatus::Sent, None).await?;
+                }
+            }
+            Ok(response) => {
+                self.save_task(event, ReplyTaskStatus::Generated, None)
+                    .await?;
+                return Err(RuntimeError::SendRejected(format!(
+                    "OneBot 明确拒绝发送：status={}, retcode={:?}, error={:?}",
+                    response.status, response.retcode, response.error
+                )));
+            }
+            Err(e) => {
+                let definitely_not_sent = matches!(e, RuntimeError::SendRejected(_));
+                if definitely_not_sent {
+                    self.save_task(event, ReplyTaskStatus::Generated, None)
+                        .await?;
+                    return Err(e);
+                }
+                self.save_task_error(
+                    event,
+                    ReplyTaskStatus::Unknown,
+                    Some(&content),
+                    &e.to_string(),
+                )
+                .await?;
+                tracing::error!(conversation_id=event.conversation_id,message_id=event.message_id,error=%e,"发送结果未知，停止自动补发，等待核查");
+                return Ok(());
+            }
+        }
+        if let Some(repo) = &self.message_repo {
+            let assistant_sender_id = if let Some(bot_id) = self.bot_self_id {
+                if let Some(participant) = self
+                    .participant_repo
+                    .find_by_external_id(event.conversation_id, &bot_id.to_string())
+                    .await?
+                {
+                    participant.id
+                } else {
+                    let participant = crate::domain::conversation::Participant {
+                        id: 0,
+                        conversation_id: event.conversation_id,
+                        external_id: bot_id.to_string(),
+                        display_name: character.definition.name.clone(),
+                        role: crate::domain::conversation::ParticipantRole::Character,
+                        metadata: serde_json::json!({
+                            "author_kind": "assistant",
+                            "character_id": event.character_id,
+                        }),
+                    };
+                    self.participant_repo.insert(&participant).await?
+                }
+            } else {
+                return Err(RuntimeError::Internal(
+                    "未配置 Bot 外部身份，无法记录角色发言".into(),
+                ));
+            };
+            let message = crate::domain::message::Message {
+                id: 0,
+                conversation_id: event.conversation_id,
+                sender_id: assistant_sender_id,
+                content: crate::domain::message::MessageContent::Text(content),
+                timestamp: Utc::now(),
+                reply_to: Some(event.message_id),
+                mentions: vec![],
+                attachments: vec![],
+                metadata: serde_json::json!({"author_kind":"assistant","reply_task":event.message_id}),
+                active_character_id: Some(event.character_id),
+                platform_message_id: None,
+                conversation_sequence: Some(event.conversation_sequence),
+                occurred_at: Some(Utc::now()),
+                ingested_at: Some(Utc::now()),
+            };
+            repo.insert(&message).await?;
+        }
         Ok(())
     }
 
+    pub async fn process_for_outbox_owned(
+        &self,
+        event: &MessageReceivedEvent,
+        lease: &str,
+    ) -> ProcessingOutcome {
+        match self.process_owned(event, Some(lease)).await {
+            Ok(()) => ProcessingOutcome::Success,
+            Err(e) => Self::classify_outbox_error_for_event(e, event.conversation_id),
+        }
+    }
     /// 处理消息并返回 ProcessingOutcome（用于 outbox 系统）。
     ///
     /// 此方法是 `process()` 的包装，返回 `ProcessingOutcome` 而非 `Result`。
-    /// 所有内部错误均映射为 `RetryableFailure`，因为：
-    /// - binding/memory/relationship/mood/decision/cognition/action 失败都是非致命的
-    /// - 这些错误不应阻止消息处理流程继续
-    ///
-    /// 永久性失败（如数据库连接完全断开）会返回 `PermanentFailure`。
+    /// 可恢复的依赖故障映射为 `RetryableFailure`；明确不可恢复的存储故障
+    /// 映射为 `PermanentFailure`。受租约保护的入口使用同一分类函数。
     pub async fn process_for_outbox(
         &self,
         event: &MessageReceivedEvent,
     ) -> Result<ProcessingOutcome, RuntimeError> {
         match self.process(event).await {
             Ok(()) => Ok(ProcessingOutcome::Success),
-            Err(e) => {
-                // 检查是否为永久性错误
-                let error_str = e.to_string();
-                let is_permanent = matches!(
-                    e,
-                    RuntimeError::Repository(crate::error::RepositoryError::Database(_))
-                        | RuntimeError::Storage(crate::error::StorageError::Connection(_))
-                );
-
-                if is_permanent {
-                    tracing::error!(
-                        target: "outbox",
-                        conversation_id = event.conversation_id,
-                        error = %e,
-                        "永久性错误"
-                    );
-                    Ok(ProcessingOutcome::PermanentFailure { error: error_str })
-                } else {
-                    // 其他错误视为可重试
-                    tracing::warn!(
-                        target: "outbox",
-                        conversation_id = event.conversation_id,
-                        error = %e,
-                        "可重试错误"
-                    );
-                    Ok(ProcessingOutcome::RetryableFailure { error: error_str })
-                }
-            }
+            Err(e) => Ok(Self::classify_outbox_error_for_event(
+                e,
+                event.conversation_id,
+            )),
         }
     }
 
-    /// 生成回复内容：LLM 未启用时走确定性回复，启用时经认知层。
+    /// 将回复链路错误统一映射为 Outbox 结果。
+    ///
+    /// 受租约保护的入口和旧的无租约入口必须使用完全相同的分类规则，否则
+    /// 同一类故障会在不同启动路径下产生不同的重试行为。
+    fn classify_outbox_error_for_event(
+        error: RuntimeError,
+        conversation_id: i64,
+    ) -> ProcessingOutcome {
+        let error_text = error.to_string();
+        let is_permanent = matches!(
+            &error,
+            RuntimeError::Repository(crate::error::RepositoryError::Database(_))
+                | RuntimeError::Storage(crate::error::StorageError::Connection(_))
+        );
+
+        if is_permanent {
+            tracing::error!(
+                target: "outbox",
+                conversation_id,
+                error = %error,
+                "永久性错误"
+            );
+            ProcessingOutcome::PermanentFailure { error: error_text }
+        } else {
+            tracing::warn!(
+                target: "outbox",
+                conversation_id,
+                error = %error,
+                "可重试错误"
+            );
+            ProcessingOutcome::RetryableFailure { error: error_text }
+        }
+    }
+
+    /// 生成回复内容：只接受认知层生成的真实内容；没有可用模型时返回错误。
     async fn generate_reply(
         &self,
         event: &MessageReceivedEvent,
         character: &crate::domain::character::Character,
         character_id: i64,
+        participant_id: i64,
+        content: &str,
     ) -> Result<String, RuntimeError> {
         if self.cognition.enabled() {
             // C2-3: 当 conversation_sequence > 0 时使用 sequence-based 历史过滤
@@ -448,15 +747,15 @@ impl ReplyProcessor {
             };
             if let Some(content) = self
                 .cognition
-                .generate(
-                    character,
-                    event.conversation_id,
-                    event.sender_id,
-                    &event.content,
-                    event.is_mentioned,
-                    ContextLimits::default(),
+                .generate(crate::application::cognition::ConversationGeneration {
+                    character: character.clone(),
+                    conversation_id: event.conversation_id,
+                    participant_id,
+                    user_message: content.to_string(),
+                    is_mentioned: event.is_mentioned,
+                    limits: ContextLimits::default(),
                     current_sequence,
-                )
+                })
                 .await?
             {
                 self.event_bus
@@ -471,65 +770,9 @@ impl ReplyProcessor {
             }
         }
 
-        // 确定性回复（LLM 是能力不是生命线）。
-        let content = deterministic_reply(&event.content);
-        self.event_bus
-            .publish(&CoreEvent::ResponseGenerated(ResponseGeneratedEvent {
-                character_id,
-                conversation_id: event.conversation_id,
-                content: content.clone(),
-                source: ResponseSource::Rule,
-                timestamp: Utc::now(),
-            }));
-        Ok(content)
-    }
-
-    /// 获取当前 Bot 在该 binding 对应会话中的 character participant。
-    ///
-    /// 如果 `bot_self_id` 已设置，精确匹配 `external_id = bot_self_id.to_string()`；
-    /// 否则返回第一个 role='character' 的 participant（单 Bot 场景下行为一致）。
-    async fn get_my_character_participant(
-        &self,
-        binding: &crate::domain::character::CharacterBinding,
-    ) -> Result<crate::domain::conversation::Participant, RuntimeError> {
-        let participants = self
-            .participant_repo
-            .find_by_conversation_id(binding.conversation_id)
-            .await
-            .map_err(RuntimeError::Repository)?;
-
-        let bot_external_id = self.bot_self_id.map(|id| id.to_string());
-
-        let character_participant = if let Some(ref ext_id) = bot_external_id {
-            // 精确匹配：role='character' AND external_id = bot_self_id
-            participants
-                .into_iter()
-                .find(|p| p.role == ParticipantRole::Character && p.external_id == *ext_id)
-        } else {
-            // 回退：第一个 role='character'
-            participants
-                .into_iter()
-                .find(|p| p.role == ParticipantRole::Character)
-        };
-
-        character_participant.ok_or_else(|| {
-            RuntimeError::Repository(crate::error::RepositoryError::NotFound(format!(
-                "未找到会话 {} 中的 character 参与者",
-                binding.conversation_id
-            )))
-        })
-    }
-}
-
-/// 在未启用 LLM 时给出的确定性礼貌确认。
-fn deterministic_reply(user_message: &str) -> String {
-    let trimmed = user_message.trim();
-    if trimmed.is_empty() {
-        "嗯？".to_string()
-    } else {
-        // 截断过长的回声，避免无意义地重复长文本。
-        let preview: String = trimmed.chars().take(40).collect();
-        format!("我听到了：{preview}")
+        Err(RuntimeError::Llm(
+            "未配置可用的对话模型，原始消息已保留".into(),
+        ))
     }
 }
 
@@ -1394,6 +1637,7 @@ mod tests {
             conversation_sequence: 0,
             platform_message_id: None,
             ingested_at: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
         }
     }
 
@@ -1410,7 +1654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_llm_uses_deterministic_reply() {
+    async fn disabled_llm_keeps_message_without_fake_reply() {
         let (processor, adapter, provider, mood_repo, rel_repo, state_repo, _, _, _, _) =
             wire(false, false).await;
         processor
@@ -1421,16 +1665,9 @@ mod tests {
         // LLM 未启用：不应调用 provider。
         assert_eq!(*provider.calls.lock().unwrap(), 0);
 
-        // 应发送一条确定性回复。
-        let sent = adapter.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].0.contains("u100"));
-
-        // 情绪与关系应更新且持久化。
-        // 情绪按 Character × Conversation 存储：character_id=1, conversation_id=100
-        assert!(mood_repo.moods.lock().unwrap().contains_key(&(1, 100)));
-        assert!(!rel_repo.rels.lock().unwrap().is_empty());
-        // 状态应被初始化。
+        assert!(adapter.sent.lock().unwrap().is_empty());
+        assert!(mood_repo.moods.lock().unwrap().is_empty());
+        assert!(rel_repo.rels.lock().unwrap().is_empty());
         assert!(state_repo.states.lock().unwrap().contains_key(&1));
     }
 
@@ -1453,7 +1690,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_conversation_routes_to_group_adapter() {
-        let (processor, adapter, _, _, _, _, _, _, _, _) = wire(true, false).await;
+        let (processor, adapter, _, _, _, _, _, _, _, _) = wire(true, true).await;
         processor
             .process(&received_event(true))
             .await
@@ -1461,16 +1698,6 @@ mod tests {
         let sent = adapter.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert!(sent[0].0.contains("g100"));
-    }
-
-    #[test]
-    fn deterministic_reply_variants() {
-        assert!(deterministic_reply("你好").contains("我听到了"));
-        assert!(deterministic_reply("   ").contains("嗯"));
-        // 长文本会被截断。
-        let long = "x".repeat(200);
-        let out = deterministic_reply(&long);
-        assert!(out.chars().count() < 100);
     }
 
     #[test]
@@ -1482,6 +1709,36 @@ mod tests {
         // 超过上限被截断。
         assert_eq!(capped_delay_ms(3001), MAX_REPLY_DELAY_MS);
         assert_eq!(capped_delay_ms(10_000), MAX_REPLY_DELAY_MS);
+    }
+
+    #[test]
+    fn batch_contents_preserve_order_and_drop_empty_lines() {
+        assert_eq!(
+            combine_batch_contents([
+                " 在吗 ".to_string(),
+                "".to_string(),
+                "我有事".to_string(),
+                " 你看看这个".to_string(),
+            ]),
+            "在吗\n我有事\n你看看这个"
+        );
+    }
+
+    #[test]
+    fn outbox_error_classification_is_shared_by_both_entry_points() {
+        let permanent = ReplyProcessor::classify_outbox_error_for_event(
+            RuntimeError::Repository(RepositoryError::Database("schema is invalid".into())),
+            42,
+        );
+        let retryable = ReplyProcessor::classify_outbox_error_for_event(
+            RuntimeError::Llm("temporary upstream timeout".into()),
+            42,
+        );
+
+        assert!(permanent.is_permanent());
+        assert!(!permanent.is_retryable());
+        assert!(retryable.is_retryable());
+        assert!(!retryable.is_permanent());
     }
 
     #[tokio::test]
@@ -1497,7 +1754,7 @@ mod tests {
         });
 
         let (processor, adapter, _, _, _, _, _, _, _, _) =
-            wire_with_delay(false, false, controlled).await;
+            wire_with_delay(false, true, controlled).await;
 
         // 在任务中处理消息（MentionOnly + mentioned → delay 1600 > 0）。
         let proc = processor.clone();
@@ -1534,16 +1791,15 @@ mod tests {
             delays: recorded.clone(),
         });
         let (processor, adapter, _, _, _, _, _, _, _, _) =
-            wire_with_delay(false, false, recording).await;
+            wire_with_delay(false, true, recording).await;
 
         processor
             .process(&received_event(true))
             .await
             .expect("处理应成功");
 
-        // MentionOnly + @ 消息基础延迟 1600；process 中 record_interaction 会新建一段
-        // 低亲密度关系，触发"陌生→延迟"调制（+400），因此请求的延迟为 2000。
-        assert_eq!(*recorded.lock().unwrap(), vec![2000]);
+        // MentionOnly + @ 消息使用当前决策延迟；普通消息不会额外改变关系状态。
+        assert_eq!(*recorded.lock().unwrap(), vec![1600]);
         assert_eq!(adapter.sent.lock().unwrap().len(), 1);
     }
 }

@@ -2,17 +2,15 @@
 //!
 //! 控制 socket 路径：`<data_dir>/control.sock`
 //!
-//! 支持的命令（JSON over UDS）：
+//! 控制协议（JSON over UDS）：
 //! ```json
-//! {"id": 123, "cmd": "reload-config"}
-//! {"id": 456, "cmd": "status"}
-//! {"id": 789, "cmd": "shutdown"}
-//! {"id": 111, "cmd": "help"}
-//! {"id": 112, "cmd": "state-set", "params": {"character_id": 1, "conversation_id": 10, "mood": 80, "energy": 90, "stress": 20}}
-//! {"id": 113, "cmd": "state-get", "params": {"character_id": 1, "conversation_id": 10}}
+//! {"version":1,"id":123,"request":{"operation":"reload_config","params":{}}}
+//! {"version":1,"id":456,"request":{"operation":"status","params":{}}}
+//! {"version":1,"id":789,"request":{"operation":"shutdown","params":{"confirm":true}}}
+//! {"version":1,"id":112,"request":{"operation":"character_state_set","params":{"character_id":1,"conversation_id":10,"mood":80,"energy":90,"stress":20}}}
 //! ```
 //!
-//! `state-set` / `state-get` 通过领域仓储（State System）读写角色状态：
+//! `character state set` / `character state get` 通过领域仓储（State System）读写角色状态：
 //! - 不带 `conversation_id`：读写全局 Character State（energy / stress / activity）；
 //! - 带 `conversation_id`：读写 Character × Conversation 状态（energy / stress → ConversationState，mood → Mood）。
 //!
@@ -26,19 +24,22 @@
 //! {"id": 456, "ok": false, "error": {"code": "...", "message": "..."}}
 //! ```
 //!
-//! 扩展方式：实现 `CommandHandler` 并调用 `CommandRegistry::register`。
+//! `CommandRegistry` 只负责把结构化操作交给应用处理器；人类命令、别名和帮助文本由 ctl 维护。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify, RwLock};
 
 use crate::adapters::onebot::{OneBotAdapter, OneBotAdapterImpl};
-use crate::application::config::{validate_runtime, RuntimeConfig};
+use crate::application::config::{ConfigurationBundle, RuntimeConfig};
+use crate::application::runtime::CharacterRuntime;
 use crate::domain::character::ConversationState;
 use crate::domain::emotion::Mood;
 
@@ -51,6 +52,7 @@ use crate::infrastructure::plugin::supervisor::PluginSupervisor;
 use crate::infrastructure::storage::SqliteStorage;
 
 use crate::application::character_service::CharacterService;
+use crate::application::control_schema::{self, ControlEnvelope, ControlOperation, ControlRequest};
 use crate::application::session_service::SessionService;
 
 // ---------------------------------------------------------------------------
@@ -61,7 +63,11 @@ use crate::application::session_service::SessionService;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CommandDesc {
     pub name: &'static str,
+    pub usage: &'static str,
+    pub group: &'static str,
     pub description: &'static str,
+    pub destructive: bool,
+    pub requires_confirmation: bool,
 }
 
 /// 命令处理函数签名（异步）。接受 RuntimeHandle、请求 ID 与请求参数。
@@ -75,7 +81,7 @@ type CommandFuture = std::pin::Pin<
 /// 命令注册表。
 #[derive(Default, Clone)]
 pub struct CommandRegistry {
-    handlers: HashMap<String, (CommandHandler, CommandDesc)>,
+    handlers: HashMap<String, (CommandHandler, CommandDesc, bool)>,
 }
 
 impl CommandRegistry {
@@ -83,34 +89,65 @@ impl CommandRegistry {
     pub fn register(
         &mut self,
         name: &'static str,
-        description: &'static str,
+        fallback_description: &'static str,
         handler: CommandHandler,
     ) {
+        // 内置 canonical 命令的描述只从 control_schema 读取，避免服务端
+        // 注册表、help 和客户端各自维护一份文字。
+        let spec = control_schema::canonical_name(name)
+            .and_then(|canonical| {
+                control_schema::specs()
+                    .iter()
+                    .find(|spec| spec.name == canonical)
+                    .copied()
+            })
+            .unwrap_or(control_schema::ControlCommandSpec {
+                name,
+                usage: name,
+                group: "扩展",
+                description: fallback_description,
+                destructive: false,
+                requires_confirmation: false,
+            });
         self.handlers.insert(
             name.to_string(),
-            (handler, CommandDesc { name, description }),
+            (
+                handler,
+                CommandDesc {
+                    name: spec.name,
+                    usage: spec.usage,
+                    group: spec.group,
+                    description: spec.description,
+                    destructive: spec.destructive,
+                    requires_confirmation: spec.requires_confirmation,
+                },
+                true,
+            ),
         );
     }
 
-    /// 分派命令。返回 None 表示命令不存在。
-    pub fn dispatch(
+    /// 分派结构化请求。返回 None 表示请求操作没有对应的处理器。
+    pub fn dispatch_request(
         &self,
-        cmd: &str,
+        request: &ControlRequest,
         handle: &RuntimeHandle,
         id: u64,
-        params: serde_json::Value,
     ) -> Option<CommandFuture> {
         self.handlers
-            .get(cmd)
-            .map(|(handler, _)| handler(handle, id, params))
+            .get(request.operation.canonical_name())
+            .map(|(handler, _, _)| handler(handle, id, request.params.clone()))
     }
 
     /// 返回所有已注册命令的描述。
     pub fn descriptions(&self) -> Vec<CommandDesc> {
-        self.handlers
+        let mut descriptions: Vec<_> = self
+            .handlers
             .values()
-            .map(|(_, desc)| desc.clone())
-            .collect()
+            .filter(|(_, _, visible)| *visible)
+            .map(|(_, desc, _)| desc.clone())
+            .collect();
+        descriptions.sort_by_key(|description| description.name);
+        descriptions
     }
 
     /// 构建包含所有内置命令的注册表。
@@ -125,77 +162,117 @@ impl CommandRegistry {
         registry.register("shutdown", "发送优雅关停信号", handle_shutdown);
         registry.register("help", "显示所有可用命令", handle_help);
         registry.register(
-            "state-set",
+            control_schema::CHARACTER_STATE_SET,
             "修改角色状态（全局 energy/stress/activity，或 Character×Conversation 的 energy/stress/mood）",
             handle_state_set,
         );
         registry.register(
-            "state-get",
+            control_schema::CHARACTER_STATE_GET,
             "查询角色状态（全局与 Character×Conversation 范围）",
             handle_state_get,
         );
-        registry.register("character_list", "列出所有角色", handle_character_list);
         registry.register(
-            "character_card_list",
+            control_schema::CHARACTER_LIST,
+            "列出所有角色",
+            handle_character_list,
+        );
+        registry.register(
+            control_schema::CHARACTER_CARD_LIST,
             "列出所有角色卡（含启用状态）",
             handle_character_card_list,
         );
         registry.register(
-            "character_show",
+            control_schema::CHARACTER_SHOW,
             "显示角色详情（需要 id 参数）",
             handle_character_show,
         );
         registry.register(
-            "conversation_list",
+            control_schema::CONVERSATION_LIST,
             "列出所有会话",
             handle_conversation_list,
         );
         // 黑名单命令
         registry.register(
-            "blacklist_list",
+            control_schema::BLACKLIST_LIST,
             "列出所有黑名单条目",
             handle_blacklist_list,
         );
-        registry.register("blacklist_add", "添加永久黑名单", handle_blacklist_add);
         registry.register(
-            "blacklist_remove",
+            control_schema::BLACKLIST_ADD,
+            "添加永久黑名单",
+            handle_blacklist_add,
+        );
+        registry.register(
+            control_schema::BLACKLIST_REMOVE,
             "移除黑名单条目",
             handle_blacklist_remove,
         );
-        registry.register("blacklist_ban", "临时封禁", handle_blacklist_ban);
+        registry.register(
+            control_schema::BLACKLIST_BAN,
+            "临时封禁",
+            handle_blacklist_ban,
+        );
         // 记忆命令
-        registry.register("memory_list", "查询记忆列表", handle_memory_list);
-        registry.register("memory_delete", "删除记忆", handle_memory_delete);
+        registry.register(
+            control_schema::MEMORY_LIST,
+            "查询记忆列表",
+            handle_memory_list,
+        );
+        registry.register(
+            control_schema::MEMORY_DELETE,
+            "删除记忆",
+            handle_memory_delete,
+        );
+        registry.register(
+            control_schema::MEMORY_UPDATE,
+            "确认或更正记忆",
+            handle_memory_update,
+        );
+        registry.register(
+            control_schema::REPLY_UNKNOWN_LIST,
+            "列出发送结果未知、等待核查的回复任务",
+            handle_reply_unknown_list,
+        );
+        registry.register(
+            control_schema::REPLY_UNKNOWN_CHECK,
+            "查询平台是否存在未知结果对应的消息",
+            handle_reply_unknown_check,
+        );
+        registry.register(
+            control_schema::REPLY_UNKNOWN_RETRY,
+            "确认平台未发送后重新排队回复任务",
+            handle_reply_unknown_retry,
+        );
         // 会话删除命令
         registry.register(
-            "session_delete_character",
+            control_schema::SESSION_DELETE_CHARACTER,
             "删除角色关联的所有会话数据",
             handle_session_delete_character,
         );
         registry.register(
-            "session_delete_all",
+            control_schema::SESSION_DELETE_ALL,
             "删除所有会话数据",
             handle_session_delete_all,
         );
         // 角色卡命令
         registry.register(
-            "character_card_enable",
+            control_schema::CHARACTER_CARD_ENABLE,
             "启用角色卡",
             handle_character_card_enable,
         );
         registry.register(
-            "character_card_disable",
+            control_schema::CHARACTER_CARD_DISABLE,
             "停用角色卡",
             handle_character_card_disable,
         );
         registry.register(
-            "character_card_reassign",
+            control_schema::CHARACTER_CARD_REASSIGN,
             "修改角色卡 ID",
             handle_character_card_reassign,
         );
         // 状态刷新命令
         registry.register(
-            "character_state_refresh",
+            control_schema::CHARACTER_STATE_REFRESH,
             "强制刷新所有角色的全局状态时间戳",
             handle_character_state_refresh,
         );
@@ -219,30 +296,45 @@ fn handle_reload_config(
 ) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
-        use crate::application::config::load_runtime;
-
-        let runtime_path = handle.config_dir.join("runtime.toml");
-        let cfg = load_runtime(&runtime_path.display().to_string())
-            .map_err(|e| RuntimeError::Config(e.to_string()))?;
-
-        // 校验。
-        let errors = validate_runtime(&cfg);
-        if !errors.is_empty() {
-            let msg = errors.join("; ");
-            tracing::error!(target: "control", "{}", msg);
+        let next = match ConfigurationBundle::load(&handle.config_dir) {
+            Ok(next) => next,
+            Err(error) => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("VALIDATION_ERROR", error.to_string()),
+                ))
+            }
+        };
+        let Some(current) = &handle.launch_config else {
             return Ok(ControlResponse::err(
                 id,
-                ControlErrorDetail::new("VALIDATION_ERROR", msg),
+                ControlErrorDetail::new("RELOAD_UNAVAILABLE", "当前运行时未装配配置重载服务"),
+            ));
+        };
+        let restart_required = current.read().await.restart_required(&next);
+        if !restart_required.is_empty() {
+            return Ok(ControlResponse::ok(
+                id,
+                serde_json::json!({"applied": false, "restart_required": restart_required, "message": "配置需要重启，当前配置保持原样"}),
             ));
         }
-
-        tracing::info!(target: "control", "配置文件重载成功");
+        let Some(settings) = &handle.live_settings else {
+            return Ok(ControlResponse::err(
+                id,
+                ControlErrorDetail::new("RELOAD_UNAVAILABLE", "当前运行时没有热更新通道"),
+            ));
+        };
+        if let Some(reload) = &handle.log_reload {
+            reload(&next.runtime.log_level)?;
+        }
+        settings.send_replace(next.runtime.clone());
+        *current.write().await = next.clone();
+        tracing::info!(target: "control", "运行配置已整体生效");
         Ok(ControlResponse::ok(
             id,
             serde_json::json!({
-                "log_level": cfg.log_level,
-                "data_dir": cfg.data_dir,
-                "admin_users": cfg.admin_users,
+                "applied": true, "restart_required": [], "log_level": next.runtime.log_level,
+                "admin_users": next.runtime.admin_users, "shutdown_timeout_secs": next.runtime.shutdown_timeout_secs,
             }),
         ))
     })
@@ -251,11 +343,33 @@ fn handle_reload_config(
 fn handle_shutdown(handle: &RuntimeHandle, id: u64, _params: serde_json::Value) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
+        let completed = handle.shutdown_complete.notified();
         handle.shutdown();
-        Ok(ControlResponse::ok(
-            id,
-            serde_json::json!({"message": "关停信号已发送"}),
-        ))
+        let wait_for =
+            Duration::from_secs(handle.effective_config().shutdown_timeout_secs.max(1) + 5);
+        if tokio::time::timeout(wait_for, completed).await.is_err() {
+            return Ok(ControlResponse::ok(
+                id,
+                serde_json::json!({
+                    "completed": false,
+                    "timed_out": true,
+                    "unfinished_tasks": serde_json::Value::Null,
+                    "message": "已发出关停请求，但未在等待期限内确认完成"
+                }),
+            ));
+        }
+        let result = handle
+            .shutdown_result
+            .read()
+            .await
+            .clone()
+            .unwrap_or_else(|| ShutdownResult {
+                completed: false,
+                timed_out: true,
+                unfinished_tasks: None,
+                message: "关停已触发，但缺少完成报告".to_string(),
+            });
+        Ok(ControlResponse::ok(id, result))
     })
 }
 
@@ -383,43 +497,56 @@ fn handle_state_set(handle: &RuntimeHandle, id: u64, params: serde_json::Value) 
         match conversation_id {
             // 全局 Character State：energy / stress / activity。
             None => {
-                let mut state = handle
-                    .state_repo
-                    .find_by_character_id(character_id)
-                    .await
-                    .map_err(|e| RuntimeError::Internal(e.to_string()))?
-                    .unwrap_or_default();
-
-                if let Some(v) = obj.get("energy") {
-                    state.energy = v
-                        .as_f64()
-                        .ok_or_else(|| RuntimeError::Internal("energy 必须是数字".to_string()))?;
+                let mut patch = serde_json::Map::new();
+                for key in ["energy", "stress"] {
+                    if let Some(value) = obj.get(key) {
+                        if !value.is_number() {
+                            return Ok(ControlResponse::err(
+                                id,
+                                ControlErrorDetail::new(
+                                    "INVALID_PARAMS",
+                                    format!("{key} 必须是数字"),
+                                ),
+                            ));
+                        }
+                        patch.insert(key.to_string(), value.clone());
+                    }
                 }
-                if let Some(v) = obj.get("stress") {
-                    state.stress = v
-                        .as_f64()
-                        .ok_or_else(|| RuntimeError::Internal("stress 必须是数字".to_string()))?;
+                if let Some(activity) = obj.get("activity") {
+                    if !activity.is_null() && !activity.is_string() {
+                        return Ok(ControlResponse::err(
+                            id,
+                            ControlErrorDetail::new(
+                                "INVALID_PARAMS",
+                                "activity 必须是字符串或 null",
+                            ),
+                        ));
+                    }
+                    patch.insert("current_activity".to_string(), activity.clone());
                 }
-                if let Some(v) = obj.get("activity") {
-                    state.current_activity = match v {
-                        serde_json::Value::Null => None,
-                        v => Some(
-                            v.as_str()
-                                .ok_or_else(|| {
-                                    RuntimeError::Internal("activity 必须是字符串".to_string())
-                                })?
-                                .to_string(),
-                        ),
-                    };
-                }
-
-                let state = state.clamped();
-                handle
-                    .state_repo
-                    .upsert(character_id, &state)
-                    .await
-                    .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-                result["character_state"] = serde_json::to_value(&state)
+                let state = if let Some(runtime) = &handle.runtime {
+                    runtime
+                        .apply_state_patch(character_id, &serde_json::Value::Object(patch))
+                        .await?
+                } else {
+                    let state = handle
+                        .state_repo
+                        .find_by_character_id(character_id)
+                        .await?
+                        .unwrap_or_default();
+                    let mut value = serde_json::to_value(state)
+                        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+                    for (key, entry) in patch {
+                        value[key] = entry;
+                    }
+                    let state: crate::domain::character::CharacterState =
+                        serde_json::from_value(value)
+                            .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+                    let state = state.clamped();
+                    handle.state_repo.upsert(character_id, &state).await?;
+                    state
+                };
+                result["character_state"] = serde_json::to_value(state)
                     .map_err(|e| RuntimeError::Internal(e.to_string()))?;
             }
 
@@ -577,17 +704,41 @@ fn handle_state_get(handle: &RuntimeHandle, id: u64, params: serde_json::Value) 
 fn handle_character_list(
     handle: &RuntimeHandle,
     id: u64,
-    _params: serde_json::Value,
+    params: serde_json::Value,
 ) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
+        let object = params.as_object();
+        let limit = object
+            .and_then(|value| value.get("limit"))
+            .map(|value| {
+                value
+                    .as_i64()
+                    .filter(|limit| (1..=1000).contains(limit))
+                    .ok_or_else(|| RuntimeError::Config("limit 必须是 1 到 1000 之间的整数".into()))
+            })
+            .transpose()?
+            .map(|limit| limit as usize);
+        let offset = object
+            .and_then(|value| value.get("offset"))
+            .map(|value| {
+                value
+                    .as_i64()
+                    .filter(|offset| *offset >= 0)
+                    .ok_or_else(|| RuntimeError::Config("offset 必须是非负整数".into()))
+            })
+            .transpose()?
+            .unwrap_or(0) as usize;
         let characters = handle
             .character_repo
             .find_all()
             .await
             .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+        let total = characters.len();
         let list: Vec<serde_json::Value> = characters
             .into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX))
             .map(|c| {
                 serde_json::json!({
                     "id": c.id,
@@ -599,7 +750,12 @@ fn handle_character_list(
             .collect();
         Ok(ControlResponse::ok(
             id,
-            serde_json::json!({ "characters": list }),
+            serde_json::json!({
+                "characters": list,
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+            }),
         ))
     })
 }
@@ -1013,6 +1169,170 @@ fn handle_blacklist_ban(
 // 记忆处理器
 // ---------------------------------------------------------------------------
 
+fn handle_reply_unknown_list(
+    handle: &RuntimeHandle,
+    id: u64,
+    params: serde_json::Value,
+) -> CommandFuture {
+    let handle = handle.clone();
+    Box::pin(async move {
+        let limit = params
+            .get("limit")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(100)
+            .clamp(1, 1000);
+        let tasks = handle
+            .message_repo
+            .find_unknown_reply_tasks(limit)
+            .await
+            .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+        let raw = params
+            .get("raw")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let items: Vec<_> = tasks
+            .into_iter()
+            .map(|task| {
+                let mut item = serde_json::json!({
+                    "message_id": task.message_id,
+                    "character_id": task.character_id,
+                    "platform_message_id": task.platform_message_id,
+                    "content_available": task.content.is_some(),
+                    "error": task.error,
+                    "updated_at": task.updated_at.to_rfc3339(),
+                });
+                if raw {
+                    item["content"] = task
+                        .content
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null);
+                }
+                item
+            })
+            .collect();
+        Ok(ControlResponse::ok(
+            id,
+            serde_json::json!({ "tasks": items, "count": items.len() }),
+        ))
+    })
+}
+
+fn handle_reply_unknown_check(
+    handle: &RuntimeHandle,
+    id: u64,
+    params: serde_json::Value,
+) -> CommandFuture {
+    let handle = handle.clone();
+    Box::pin(async move {
+        let message_id = params
+            .get("message_id")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| RuntimeError::Internal("缺少 message_id".into()))?;
+        let task = handle
+            .message_repo
+            .find_unknown_reply_task(message_id)
+            .await?
+            .ok_or_else(|| RuntimeError::Internal("未找到未知发送结果任务".into()))?;
+        let Some(platform_message_id) = task.platform_message_id else {
+            return Ok(ControlResponse::ok(
+                id,
+                serde_json::json!({
+                    "message_id": message_id,
+                    "status": "manual_required",
+                    "reason": "任务没有平台消息 ID，无法用 get_msg 自动核查"
+                }),
+            ));
+        };
+        let response = match handle.adapter.get_message(platform_message_id).await {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(ControlResponse::ok(
+                    id,
+                    serde_json::json!({
+                        "message_id": message_id,
+                        "platform_message_id": platform_message_id,
+                        "status": "check_failed",
+                        "recorded": false,
+                        "reason": error.to_string(),
+                    }),
+                ));
+            }
+        };
+        if response.is_ok() {
+            let confirmed = handle
+                .message_repo
+                .confirm_unknown_reply_task(message_id, platform_message_id)
+                .await
+                .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+            if !confirmed {
+                return Ok(ControlResponse::ok(
+                    id,
+                    serde_json::json!({
+                        "message_id": message_id,
+                        "platform_message_id": platform_message_id,
+                        "status": "already_handled"
+                    }),
+                ));
+            }
+        }
+        // get_msg 明确返回了带错误码的失败，才足以证明原发送没有成功；
+        // 这时原子重新排队，避免把网络不确定误判成未发送。
+        let confirmed_not_sent = response.retcode.is_some_and(|code| code != 0);
+        let queued = if confirmed_not_sent {
+            handle
+                .message_repo
+                .requeue_unknown_reply_task(message_id)
+                .await
+                .map_err(|error| RuntimeError::Internal(error.to_string()))?
+        } else {
+            false
+        };
+        Ok(ControlResponse::ok(
+            id,
+            serde_json::json!({
+                "message_id": message_id,
+                "platform_message_id": platform_message_id,
+                "status": if queued { "confirmed_not_sent" } else { "check_unresolved" },
+                "recorded": false,
+                "queued": queued,
+                "platform_response": response.data,
+                "platform_error": response.error_message(),
+            }),
+        ))
+    })
+}
+
+fn handle_reply_unknown_retry(
+    handle: &RuntimeHandle,
+    id: u64,
+    params: serde_json::Value,
+) -> CommandFuture {
+    let handle = handle.clone();
+    Box::pin(async move {
+        let message_id = params
+            .get("message_id")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| RuntimeError::Internal("缺少 message_id".into()))?;
+        let changed = handle
+            .message_repo
+            .requeue_unknown_reply_task(message_id)
+            .await?;
+        if !changed {
+            return Err(RuntimeError::Internal(
+                "任务不是 unknown，或已经被其他操作处理".into(),
+            ));
+        }
+        Ok(ControlResponse::ok(
+            id,
+            serde_json::json!({
+                "message_id": message_id,
+                "status": "queued",
+                "message": "已重新排队；只有明确确认平台未发送后才应执行此命令"
+            }),
+        ))
+    })
+}
+
 fn handle_memory_list(handle: &RuntimeHandle, id: u64, params: serde_json::Value) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
@@ -1024,6 +1344,7 @@ fn handle_memory_list(handle: &RuntimeHandle, id: u64, params: serde_json::Value
 
         let character_id = params.get("character_id").and_then(|v| v.as_i64());
         let conversation_id = params.get("conversation_id").and_then(|v| v.as_i64());
+        let raw = params.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
         let memory_type = params.get("memory_type").and_then(|v| v.as_str()).map(|s| {
             match s.trim().to_lowercase().as_str() {
                 "episodic" => Ok(crate::domain::memory::MemoryType::Episodic),
@@ -1055,16 +1376,25 @@ fn handle_memory_list(handle: &RuntimeHandle, id: u64, params: serde_json::Value
         let list: Vec<serde_json::Value> = memories
             .into_iter()
             .map(|m| {
-                serde_json::json!({
+                let mut item = serde_json::json!({
                     "id": m.id,
                     "character_id": m.character_id,
                     "conversation_id": m.conversation_id,
                     "type": format!("{:?}", m.memory_type),
                     "importance": m.importance,
-                    "content": m.content,
+                    "status": m.metadata.get("status").and_then(|v| v.as_str()).unwrap_or("formal"),
+                    "shared": m.metadata.get("shared").and_then(|v| v.as_bool()).unwrap_or(false),
                     "created_at": m.created_at.to_rfc3339(),
                     "last_accessed": m.last_accessed.to_rfc3339(),
-                })
+                    "content_available": raw,
+                });
+                if raw {
+                    item["content"] = serde_json::Value::String(m.content);
+                } else {
+                    item["content_fingerprint"] =
+                        serde_json::Value::String(memory_fingerprint(&m.content));
+                }
+                item
             })
             .collect();
 
@@ -1117,6 +1447,69 @@ fn handle_memory_delete(
             serde_json::json!({ "memory_id": memory_id }),
         ))
     })
+}
+
+fn handle_memory_update(
+    handle: &RuntimeHandle,
+    id: u64,
+    params: serde_json::Value,
+) -> CommandFuture {
+    let handle = handle.clone();
+    Box::pin(async move {
+        let memory_id = match params.get("memory_id").and_then(|v| v.as_i64()) {
+            Some(v) if v > 0 => v,
+            _ => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "缺少或非法参数 memory_id"),
+                ));
+            }
+        };
+        let mut memory = match handle.memory_repo.find_by_id(memory_id).await? {
+            Some(memory) => memory,
+            None => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("MEMORY_NOT_FOUND", format!("记忆不存在：{memory_id}")),
+                ));
+            }
+        };
+        let instruction = match params.get("instruction").and_then(|v| v.as_str()) {
+            Some(value) if !value.trim().is_empty() => value.trim(),
+            _ => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new(
+                        "INVALID_PARAMS",
+                        "需要非空 instruction，自然语言描述修改意图",
+                    ),
+                ));
+            }
+        };
+        let requested_at = chrono::Utc::now().to_rfc3339();
+        memory.metadata["edit_request"] = serde_json::json!({
+            "instruction": instruction,
+            "status": "pending",
+            "requested_at": requested_at,
+        });
+        memory.metadata["updated_by"] = serde_json::Value::String("control_request".to_string());
+        handle.memory_repo.update(&memory).await?;
+        Ok(ControlResponse::ok(
+            id,
+            serde_json::json!({
+                "memory_id": memory.id,
+                "request_recorded": true,
+                "processing": "pending",
+            }),
+        ))
+    })
+}
+
+fn memory_fingerprint(content: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,10 +1650,15 @@ fn handle_character_card_enable(
             .enable_character(character_id)
             .await
         {
-            Ok(()) => Ok(ControlResponse::ok(
-                id,
-                serde_json::json!({ "id": character_id, "enabled": true }),
-            )),
+            Ok(()) => {
+                if let Some(runtime) = &handle.runtime {
+                    runtime.evict(character_id).await;
+                }
+                Ok(ControlResponse::ok(
+                    id,
+                    serde_json::json!({ "id": character_id, "enabled": true }),
+                ))
+            }
             Err(RuntimeError::UserInput(code, msg)) => Ok(ControlResponse::err(
                 id,
                 ControlErrorDetail::with_code(code, msg),
@@ -1322,10 +1720,15 @@ fn handle_character_card_disable(
             .disable_character(character_id)
             .await
         {
-            Ok(()) => Ok(ControlResponse::ok(
-                id,
-                serde_json::json!({ "id": character_id, "enabled": false }),
-            )),
+            Ok(()) => {
+                if let Some(runtime) = &handle.runtime {
+                    runtime.evict(character_id).await;
+                }
+                Ok(ControlResponse::ok(
+                    id,
+                    serde_json::json!({ "id": character_id, "enabled": false }),
+                ))
+            }
             Err(RuntimeError::UserInput(code, msg)) => Ok(ControlResponse::err(
                 id,
                 ControlErrorDetail::with_code(code, msg),
@@ -1376,10 +1779,16 @@ fn handle_character_card_reassign(
         };
 
         match handle.character_service.reassign_id(old_id, new_id).await {
-            Ok(()) => Ok(ControlResponse::ok(
-                id,
-                serde_json::json!({ "old_id": old_id, "new_id": new_id }),
-            )),
+            Ok(()) => {
+                if let Some(runtime) = &handle.runtime {
+                    runtime.evict(old_id).await;
+                    runtime.evict(new_id).await;
+                }
+                Ok(ControlResponse::ok(
+                    id,
+                    serde_json::json!({ "old_id": old_id, "new_id": new_id }),
+                ))
+            }
             Err(RuntimeError::UserInput(code, msg)) => Ok(ControlResponse::err(
                 id,
                 ControlErrorDetail::with_code(code, msg),
@@ -1471,17 +1880,17 @@ impl ControlErrorDetail {
         }
     }
 
-    /// 未知命令。
-    pub fn unknown_command(cmd: &str) -> Self {
+    /// 请求操作没有对应处理器。
+    pub fn unsupported_operation(operation: ControlOperation) -> Self {
         Self::new(
-            "UNKNOWN_COMMAND",
-            format!("未知命令: {cmd}，使用 help 查看可用命令"),
+            "UNSUPPORTED_OPERATION",
+            format!("控制操作未启用: {}", operation.canonical_name()),
         )
     }
 
-    /// 缺少 cmd 字段。
-    pub fn missing_cmd() -> Self {
-        Self::new("MISSING_CMD", "请求缺少 cmd 字段")
+    /// 缺少结构化请求字段。
+    pub fn missing_request() -> Self {
+        Self::new("MISSING_REQUEST", "请求缺少 request 字段")
     }
 
     /// 无效的 JSON。
@@ -1530,6 +1939,8 @@ impl ControlResponse {
 // RuntimeHandle
 // ---------------------------------------------------------------------------
 
+pub type LogReload = Arc<dyn Fn(&str) -> Result<(), RuntimeError> + Send + Sync>;
+
 /// 运行时句柄 —— 持有所有关键组件，供命令处理器使用。
 #[derive(Clone)]
 pub struct RuntimeHandle {
@@ -1537,6 +1948,11 @@ pub struct RuntimeHandle {
     pub config_dir: PathBuf,
     /// 当前运行时配置。
     pub runtime_cfg: RuntimeConfig,
+    /// 生效的热更新配置与启动装配快照。
+    pub live_settings: Option<watch::Sender<RuntimeConfig>>,
+    pub launch_config: Option<Arc<tokio::sync::RwLock<ConfigurationBundle>>>,
+    pub log_reload: Option<LogReload>,
+    pub runtime: Option<Arc<CharacterRuntime>>,
     /// 数据目录。
     pub data_dir: PathBuf,
     /// 插件监督器。
@@ -1547,6 +1963,9 @@ pub struct RuntimeHandle {
     pub storage: Arc<SqliteStorage>,
     /// 关停信号发送端。
     pub shutdown_tx: watch::Sender<bool>,
+    /// 关停完成通知与结果。控制客户端等待这一通知后再报告成功。
+    pub shutdown_complete: Arc<Notify>,
+    pub shutdown_result: Arc<RwLock<Option<ShutdownResult>>>,
     /// 命令注册表（可外部扩展）。
     pub commands: CommandRegistry,
     /// 角色仓储（State System：校验角色存在）。
@@ -1573,7 +1992,22 @@ pub struct RuntimeHandle {
     pub memory_repo: Arc<dyn MemoryRepository>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ShutdownResult {
+    pub completed: bool,
+    pub timed_out: bool,
+    pub unfinished_tasks: Option<usize>,
+    pub message: String,
+}
+
 impl RuntimeHandle {
+    pub fn effective_config(&self) -> RuntimeConfig {
+        self.live_settings
+            .as_ref()
+            .map(|settings| settings.borrow().clone())
+            .unwrap_or_else(|| self.runtime_cfg.clone())
+    }
+
     /// 返回当前运行时状态。
     pub async fn status(&self) -> RuntimeStatus {
         // 系统时间（UTC，RFC3339）
@@ -1600,7 +2034,7 @@ impl RuntimeHandle {
             onebot_status: adapter_state,
             plugin_count: self.supervisor.plugin_count(),
             data_dir: self.data_dir.to_string_lossy().to_string(),
-            log_level: self.runtime_cfg.log_level.clone(),
+            log_level: self.effective_config().log_level,
         }
     }
 
@@ -1695,8 +2129,7 @@ async fn run_control_server(
         })?;
     }
 
-    // 删除旧 socket 文件（如果存在）。
-    let _ = std::fs::remove_file(&socket_path);
+    prepare_socket_path(&socket_path).await?;
 
     let listener = UnixListener::bind(&socket_path).map_err(|e| {
         RuntimeError::Internal(format!(
@@ -1705,6 +2138,10 @@ async fn run_control_server(
         ))
     })?;
 
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| RuntimeError::Internal(format!("设置控制 socket 权限失败：{e}")))?;
+    let _socket_guard = SocketCleanup(socket_path.clone());
+    let mut connections = tokio::task::JoinSet::new();
     tracing::info!(target: "control", path = %socket_path.display(), "控制服务已启动");
 
     loop {
@@ -1715,15 +2152,16 @@ async fn run_control_server(
                     RuntimeError::Internal(format!("accept 控制 socket 失败: {e}"))
                 })?;
                 let handle = handle.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     if let Err(e) = handle_connection(&handle, &mut stream).await {
                         tracing::warn!(target: "control", error = %e, "处理命令出错");
                     }
                 });
             }
             // 收到关停信号，退出。
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
+            _ = connections.join_next(), if !connections.is_empty() => {}
+            result = shutdown_rx.changed() => {
+                if result.is_err() || *shutdown_rx.borrow() {
                     tracing::info!(target: "control", "控制服务收到关停信号，正在退出");
                     break;
                 }
@@ -1731,8 +2169,11 @@ async fn run_control_server(
         }
     }
 
-    // 清理 socket 文件。
-    let _ = std::fs::remove_file(&socket_path);
+    // 已接受的 shutdown 命令有机会写完应答；其余连接受整体关停时限约束。
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
     Ok(())
 }
 
@@ -1740,58 +2181,74 @@ async fn handle_connection(
     handle: &RuntimeHandle,
     stream: &mut UnixStream,
 ) -> Result<(), RuntimeError> {
-    let mut buf = Vec::with_capacity(4096);
-    let n = stream
-        .read_buf(&mut buf)
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("读取控制命令失败: {e}")))?;
+    let envelope: ControlEnvelope = match read_control_json(stream, CONTROL_REQUEST_LIMIT).await {
+        Ok(value) => value,
+        Err(error) => {
+            let response =
+                ControlResponse::err(0, ControlErrorDetail::invalid_json(&error.to_string()));
+            write_response(stream, response).await?;
+            return Ok(());
+        }
+    };
 
-    if n == 0 {
+    let id = envelope.id;
+    if envelope.version != control_schema::CONTROL_PROTOCOL_VERSION {
+        let response = ControlResponse::err(
+            id,
+            ControlErrorDetail::new(
+                "INVALID_REQUEST",
+                format!("不支持的控制协议版本（版本 {}）", envelope.version),
+            ),
+        );
+        write_response(stream, response).await?;
         return Ok(());
     }
 
-    buf.truncate(n);
+    let operation = envelope.request.operation;
+    let command_name = operation.canonical_name();
+    if control_schema::requires_confirmation(command_name)
+        && envelope
+            .request
+            .params
+            .get("confirm")
+            .and_then(|value| value.as_bool())
+            != Some(true)
+    {
+        let response = ControlResponse::err(
+            id,
+            ControlErrorDetail::new(
+                "CONFIRMATION_REQUIRED",
+                "此操作会修改或删除数据，必须在 request.params.confirm 中明确传入 true",
+            ),
+        );
+        write_response(stream, response).await?;
+        return Ok(());
+    }
 
-    // 解析请求。
-    let val: serde_json::Value = match serde_json::from_slice(&buf) {
-        Ok(v) => v,
-        Err(e) => {
-            let resp = ControlResponse::err(0, ControlErrorDetail::invalid_json(&e.to_string()));
-            write_response(stream, resp).await?;
-            return Ok(());
-        }
-    };
-
-    // 提取请求 ID（可选，默认为 0）。
-    let id = val.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-
-    // 解析命令名称。
-    let cmd = match val.get("cmd").and_then(|v| v.as_str().map(String::from)) {
-        Some(cmd) => cmd,
+    let resp = match handle
+        .commands
+        .dispatch_request(&envelope.request, handle, id)
+    {
+        Some(future) => match tokio::time::timeout(CONTROL_COMMAND_TIMEOUT, future).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => ControlResponse::err(
+                id,
+                ControlErrorDetail::new("COMMAND_FAILED", error.to_string()),
+            ),
+            Err(_) => ControlResponse::err(
+                id,
+                ControlErrorDetail::new("COMMAND_TIMEOUT", "命令处理超时"),
+            ),
+        },
         None => {
-            let resp = ControlResponse::err(id, ControlErrorDetail::missing_cmd());
+            let resp =
+                ControlResponse::err(id, ControlErrorDetail::unsupported_operation(operation));
             write_response(stream, resp).await?;
             return Ok(());
         }
     };
 
-    // 提取参数（可选；无 params 视为 Null）。
-    let params = val
-        .get("params")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-
-    // 分派命令。
-    let resp = match handle.commands.dispatch(&cmd, handle, id, params) {
-        Some(future) => future.await,
-        None => {
-            let resp = ControlResponse::err(id, ControlErrorDetail::unknown_command(&cmd));
-            write_response(stream, resp).await?;
-            return Ok(());
-        }
-    };
-
-    write_response(stream, resp?).await?;
+    write_response(stream, resp).await?;
     Ok(())
 }
 
@@ -1799,11 +2256,192 @@ async fn write_response(
     stream: &mut UnixStream,
     resp: ControlResponse,
 ) -> Result<(), RuntimeError> {
-    let json = serde_json::to_string(&resp)
-        .map_err(|e| RuntimeError::Internal(format!("序列化响应失败: {e}")))?;
-    stream
-        .write_all(json.as_bytes())
+    write_control_json(stream, &resp, CONTROL_RESPONSE_LIMIT).await
+}
+
+/// 控制接口每条连接一问一答，JSON 可分片传输，大小与总等待时间均受限。
+pub const CONTROL_REQUEST_LIMIT: usize = 1024 * 1024;
+pub const CONTROL_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
+pub const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(10);
+pub const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub async fn read_control_json<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<T, RuntimeError> {
+    tokio::time::timeout(CONTROL_IO_TIMEOUT, async {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read_limit = chunk.len().min(limit.saturating_sub(buffer.len()) + 1);
+            let length = reader
+                .read(&mut chunk[..read_limit])
+                .await
+                .map_err(|e| RuntimeError::Internal(format!("读取控制数据失败：{e}")))?;
+            if length == 0 {
+                return Err(RuntimeError::Internal(
+                    "控制连接在完整 JSON 到达前关闭".to_string(),
+                ));
+            }
+            buffer.extend_from_slice(&chunk[..length]);
+            if buffer.len() > limit {
+                return Err(RuntimeError::Internal(format!(
+                    "控制数据超过 {limit} 字节上限"
+                )));
+            }
+            match serde_json::from_slice(&buffer) {
+                Ok(value) => return Ok(value),
+                Err(error) if error.is_eof() => {}
+                Err(error) => {
+                    return Err(RuntimeError::Internal(format!(
+                        "控制 JSON 格式错误：{error}"
+                    )))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| RuntimeError::Internal("读取控制数据超时".to_string()))?
+}
+
+pub async fn write_control_json<W: AsyncWrite + Unpin, T: serde::Serialize>(
+    writer: &mut W,
+    value: &T,
+    limit: usize,
+) -> Result<(), RuntimeError> {
+    let mut buffer = serde_json::to_vec(value)
+        .map_err(|e| RuntimeError::Internal(format!("序列化控制数据失败：{e}")))?;
+    if buffer.len() + 1 > limit {
+        return Err(RuntimeError::Internal(format!(
+            "控制数据超过 {limit} 字节上限"
+        )));
+    }
+    buffer.push(b'\n');
+    tokio::time::timeout(CONTROL_IO_TIMEOUT, writer.write_all(&buffer))
         .await
-        .map_err(|e| RuntimeError::Internal(format!("写入响应失败: {e}")))?;
+        .map_err(|_| RuntimeError::Internal("写入控制数据超时".to_string()))?
+        .map_err(|e| RuntimeError::Internal(format!("写入控制数据失败：{e}")))
+}
+
+struct SocketCleanup(PathBuf);
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+async fn prepare_socket_path(path: &std::path::Path) -> Result<(), RuntimeError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() {
+                return Err(RuntimeError::Internal(format!(
+                    "控制 socket 路径已有非 socket 文件：{}",
+                    path.display()
+                )));
+            }
+            match UnixStream::connect(path).await {
+                Ok(_) => {
+                    return Err(RuntimeError::Internal(
+                        "控制 socket 已被运行中的进程占用".to_string(),
+                    ))
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    std::fs::remove_file(path).map_err(|e| {
+                        RuntimeError::Internal(format!("清理失效 socket 失败：{e}"))
+                    })?;
+                }
+                Err(error) => {
+                    return Err(RuntimeError::Internal(format!(
+                        "检查控制 socket 失败：{error}"
+                    )))
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(RuntimeError::Internal(format!(
+                "检查控制 socket 文件失败：{error}"
+            )))
+        }
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn builtin_help_exposes_canonical_names_only() {
+        let registry = CommandRegistry::builtin();
+        let names: Vec<_> = registry
+            .descriptions()
+            .into_iter()
+            .map(|description| description.name)
+            .collect();
+        assert!(names.contains(&"character list"));
+        assert!(names.contains(&"character state get"));
+        assert!(!names.contains(&"character_list"));
+        assert!(!names.contains(&"state-get"));
+        assert!(!registry.handlers.contains_key("character_list"));
+    }
+
+    #[tokio::test]
+    async fn fragmented_and_large_json_roundtrip() {
+        let (mut sender, mut receiver) = tokio::io::duplex(64);
+        let payload = serde_json::json!({"id": 12, "text": "中文消息".repeat(10000)});
+        let expected = payload.clone();
+        let writer = tokio::spawn(async move {
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            for chunk in bytes.chunks(7) {
+                sender.write_all(chunk).await.unwrap();
+            }
+        });
+        let received: serde_json::Value = read_control_json(&mut receiver, CONTROL_RESPONSE_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(received, expected);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_and_truncated_json_rejected() {
+        let mut oversized = &b"{\"text\":\"too long\"}"[..];
+        assert!(read_control_json::<_, serde_json::Value>(&mut oversized, 5)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("上限"));
+        let mut truncated = &b"{\"text\":"[..];
+        assert!(
+            read_control_json::<_, serde_json::Value>(&mut truncated, 100)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn active_socket_and_regular_file_are_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sock");
+        std::fs::write(&path, "用户文件").unwrap();
+        assert!(prepare_socket_path(&path).await.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "用户文件");
+        std::fs::remove_file(&path).unwrap();
+        match UnixListener::bind(&path) {
+            Ok(_listener) => {
+                assert!(prepare_socket_path(&path).await.is_err());
+                assert!(path.exists());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                // 受限 CI / 沙箱可能禁止创建 UDS；路径判定已由普通文件分支覆盖。
+            }
+            Err(error) => panic!("创建测试 socket 失败：{error}"),
+        }
+    }
 }

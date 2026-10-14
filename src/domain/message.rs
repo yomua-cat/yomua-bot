@@ -44,7 +44,7 @@ pub struct Message {
 
     /// QQBOT Application Ingress Order。
     /// Conversation 内严格递增，不要求连续，gap 合法。
-    /// NULL 表示 legacy 数据（无法证明 authoritative ingress order）。
+    /// NULL 表示缺少可证明的入口顺序（例如手工导入的数据）。
     pub conversation_sequence: Option<i64>,
 
     /// 平台时间（OneBot/NapCat），即消息发生时间。
@@ -105,4 +105,83 @@ pub struct Attachment {
     pub path: Option<String>,
     pub mime_type: Option<String>,
     pub size: Option<u64>,
+}
+
+/// 持久回复任务状态，发送中的任务在恢复时需要核查。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyTaskStatus {
+    Pending,
+    Generating,
+    Generated,
+    Sending,
+    Sent,
+    Unknown,
+    Cancelled,
+    Expired,
+    Ignored,
+}
+impl ReplyTaskStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Sent | Self::Unknown | Self::Cancelled | Self::Expired | Self::Ignored
+        )
+    }
+
+    /// 只有已完整生成的任务可以复用持久化内容。
+    /// `unknown` 即使带有内容也代表平台结果未核查，不能从普通处理路径补发。
+    pub fn can_reuse_content(self) -> bool {
+        matches!(self, Self::Generated)
+    }
+}
+impl std::fmt::Display for ReplyTaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Pending => "pending",
+                Self::Generating => "generating",
+                Self::Generated => "generated",
+                Self::Sending => "sending",
+                Self::Sent => "sent",
+                Self::Unknown => "unknown",
+                Self::Cancelled => "cancelled",
+                Self::Expired => "expired",
+                Self::Ignored => "ignored",
+            }
+        )
+    }
+}
+
+#[cfg(test)]
+mod reply_task_status_tests {
+    use super::ReplyTaskStatus;
+
+    #[test]
+    fn unknown_content_is_never_reused_by_normal_processing() {
+        assert!(ReplyTaskStatus::Generated.can_reuse_content());
+        assert!(!ReplyTaskStatus::Sending.can_reuse_content());
+        assert!(!ReplyTaskStatus::Unknown.can_reuse_content());
+        assert!(!ReplyTaskStatus::Sent.can_reuse_content());
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplyTask {
+    pub status: ReplyTaskStatus,
+    pub content: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 发送结果未知、需要人工核查的平台消息任务。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnknownReplyTask {
+    pub message_id: i64,
+    pub character_id: i64,
+    pub platform_message_id: Option<i64>,
+    pub content: Option<String>,
+    pub error: Option<String>,
+    pub updated_at: DateTime<Utc>,
 }

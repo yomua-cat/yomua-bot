@@ -47,12 +47,23 @@ impl RelationshipService {
         Ok(new_rel)
     }
 
-    /// 记录一次交互：更新交互次数 / 熟悉度，并做轻量调制，最后落库并发布事件。
-    ///
-    /// 轻量调制说明：
-    /// - 每次交互轻微提升 `familiarity`（熟悉）；
-    /// - 轻微提升 `affection`（好感）；
-    /// - 若消息较长或频率高，轻微提升 `annoyance`（厌烦），这里 MVP 仅做固定微增。
+    /// 使用平台稳定用户键查找已有关系；找不到时回退到当前会话参与者。
+    pub async fn canonical_participant_id(
+        &self,
+        character_id: i64,
+        participant_id: i64,
+        stable_user_key: Option<&str>,
+    ) -> Result<i64, RuntimeError> {
+        let Some(key) = stable_user_key.filter(|value| !value.trim().is_empty()) else {
+            return Ok(participant_id);
+        };
+        self.relationship_repo
+            .ensure_stable_relationship_participant(character_id, participant_id, key)
+            .await
+            .map_err(RuntimeError::Repository)
+    }
+
+    /// 记录一次已去重交互，仅累计熟悉度。调用方必须保证事件只应用一次。
     pub async fn record_interaction(
         &self,
         character_id: i64,
@@ -62,12 +73,6 @@ impl RelationshipService {
 
         // 调用领域模型记录交互（更新次数 / 时间 / 熟悉度）。
         rel.record_interaction();
-
-        // 轻量调制：好感微增，厌烦在交互较频繁时微增（用次数粗略判断）。
-        rel.affection = (rel.affection + 0.01).min(1.0);
-        if rel.interaction_count > 20 {
-            rel.annoyance = (rel.annoyance + 0.005).min(1.0);
-        }
 
         self.relationship_repo.upsert(&rel).await?;
 
@@ -79,6 +84,28 @@ impl RelationshipService {
             }));
 
         Ok(rel)
+    }
+
+    /// 按来源消息幂等记录一次交互；Outbox 重试不会重复增加熟悉度。
+    pub async fn record_interaction_once(
+        &self,
+        character_id: i64,
+        participant_id: i64,
+        source_message_id: i64,
+    ) -> Result<bool, crate::error::RepositoryError> {
+        let recorded = self
+            .relationship_repo
+            .record_interaction_once(character_id, participant_id, source_message_id)
+            .await?;
+        if recorded {
+            self.event_bus
+                .publish(&CoreEvent::RelationshipChanged(RelationshipChangedEvent {
+                    character_id,
+                    participant_id,
+                    timestamp: Utc::now(),
+                }));
+        }
+        Ok(recorded)
     }
 }
 
@@ -165,7 +192,7 @@ mod tests {
 
         let rel = service.record_interaction(1, 2).await.unwrap();
         assert_eq!(rel.interaction_count, 1);
-        assert!(rel.affection > 0.2); // 默认 0.2 + 微增
+        assert_eq!(rel.affection, 0.2); // 熟悉并不自动代表好感
 
         // 落库。
         let persisted = repo.find_mem(1, 2).unwrap();

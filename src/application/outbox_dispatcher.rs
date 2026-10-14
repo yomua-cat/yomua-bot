@@ -9,24 +9,26 @@
 //! - 启动时恢复已过期的 processing 事件
 //!
 //! **MPSC 只是 volatile transport**：`mpsc.send().await` 成功只表示事件已进入通道缓冲区，
-//! 不表示 EventProcessor 已接收，更不表示处理完成。真正的完成信号是 ACK 通道。
+//! 不表示 OutboxProcessor 已接收，更不表示处理完成。真正的完成信号是 ACK 通道。
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, timeout};
+use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
+use crate::application::outbox_processor::DEFAULT_EVENT_PROCESSING_TIMEOUT_SECS;
 use crate::domain::outbox::{OutboxEvent, ProcessingOutcome};
 use crate::domain::repository::OutboxRepository;
 
-/// Lease 超时时间（秒）。如果 EventProcessor 在此时间内未返回 ACK，事件可被重新 claim。
-const DEFAULT_LEASE_DURATION_SECS: i64 = 30;
+/// Lease 超时时间（秒）。如果 OutboxProcessor 在此时间内未返回 ACK，事件可被重新 claim。
+const DEFAULT_LEASE_DURATION_SECS: i64 = 150;
 
 /// 重试最大次数。超过此次数后事件进入 dead_letter。
-const MAX_RETRY_ATTEMPTS: i64 = 5;
+const MAX_RETRY_ATTEMPTS: i64 = 3;
 
 /// 重试退避基数（秒）。实际退避时间 = BASE * 2^attempts。
 const RETRY_BACKOFF_BASE_SECS: i64 = 2;
@@ -42,6 +44,10 @@ pub struct OutboxDispatcherConfig {
     pub poll_interval_ms: u64,
     /// 退避基数（秒）。
     pub backoff_base_secs: i64,
+    /// 单个事件等待处理结果的绝对截止时间（秒）。
+    ///
+    /// 续租只延长 ownership，不应让一个卡住的事件永久占用 processing 状态。
+    pub processing_timeout_secs: u64,
 }
 
 impl Default for OutboxDispatcherConfig {
@@ -51,6 +57,7 @@ impl Default for OutboxDispatcherConfig {
             max_retry_attempts: MAX_RETRY_ATTEMPTS,
             poll_interval_ms: 100,
             backoff_base_secs: RETRY_BACKOFF_BASE_SECS,
+            processing_timeout_secs: DEFAULT_EVENT_PROCESSING_TIMEOUT_SECS,
         }
     }
 }
@@ -70,6 +77,54 @@ pub struct OutboxDispatcher {
 }
 
 impl OutboxDispatcher {
+    fn next_retry_at(&self, attempts: i32) -> chrono::DateTime<chrono::Utc> {
+        let exponent = attempts.clamp(0, 30) as u32;
+        let factor = 1_i64.checked_shl(exponent).unwrap_or(i64::MAX);
+        let backoff_secs = self.config.backoff_base_secs.max(1).saturating_mul(factor);
+        chrono::Utc::now() + chrono::Duration::seconds(backoff_secs)
+    }
+
+    async fn reschedule_transport_failure(
+        &self,
+        event: &OutboxEvent,
+        lease_token: &str,
+        error: &str,
+    ) {
+        if event.attempts >= self.config.max_retry_attempts.max(1) as i32 {
+            if let Err(mark_error) = self
+                .repo
+                .mark_dead_letter(&event.event_uuid, lease_token, error)
+                .await
+            {
+                error!(
+                    target: "outbox",
+                    event_uuid = %event.event_uuid,
+                    error = %mark_error,
+                    "传输失败后标记 dead_letter 失败"
+                );
+            }
+            return;
+        }
+
+        if let Err(mark_error) = self
+            .repo
+            .mark_retry_wait(
+                &event.event_uuid,
+                lease_token,
+                error,
+                self.next_retry_at(event.attempts),
+            )
+            .await
+        {
+            warn!(
+                target: "outbox",
+                event_uuid = %event.event_uuid,
+                error = %mark_error,
+                "传输失败后更新 retry_wait 失败"
+            );
+        }
+    }
+
     /// 创建 Outbox 调度器。
     pub fn new(repo: Arc<dyn OutboxRepository>, config: OutboxDispatcherConfig) -> Self {
         Self {
@@ -101,22 +156,14 @@ impl OutboxDispatcher {
 
         let mut poll_interval = interval(Duration::from_millis(self.config.poll_interval_ms));
 
+        let mut work = FuturesUnordered::new();
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        info!(target: "outbox", "OutboxDispatcher 收到关停信号，正在停止...");
-                        break;
-                    }
-                }
-                _ = poll_interval.tick() => {
-                    // 每次 poll 最多处理少量事件，避免阻塞过久
-                    for _ in 0..16 {
-                        if let Err(_) = self.tick_once(&event_tx).await {
-                            // shutdown 或错误，停止
-                            break;
-                        }
-                    }
+                biased;
+                changed=shutdown_rx.changed()=>{if changed.is_err()||*shutdown_rx.borrow(){break}},
+                Some(_)=work.next(),if !work.is_empty()=>{},
+                _=poll_interval.tick()=>{
+                    if work.len()<16 { work.push(self.tick_once(&event_tx)); }
                 }
             }
         }
@@ -147,6 +194,7 @@ impl OutboxDispatcher {
             .lease_token
             .clone()
             .expect("claim 的事件必须包含 lease_token");
+        let processing_timeout_secs = self.config.processing_timeout_secs.max(1);
 
         debug!(
             target: "outbox",
@@ -160,37 +208,72 @@ impl OutboxDispatcher {
         let (response_tx, response_rx) = oneshot::channel();
 
         // 发送到 MPSC（volatile transport）
-        match event_tx.send((event.clone(), response_tx)).await {
-            Ok(()) => {
+        match tokio::time::timeout(
+            Duration::from_secs(processing_timeout_secs),
+            event_tx.send((event.clone(), response_tx)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
                 debug!(target: "outbox", event_uuid = %event_uuid, "事件已发送至 MPSC");
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 // MPSC 通道已关闭（OutboxProcessor 已停止）
                 error!(target: "outbox", event_uuid = %event_uuid, error = %e, "MPSC 发送失败，标记为可恢复");
                 // 将事件状态重置为 pending，以便下次 poll 可以重新 claim
                 // 注意：这可能导致事件被处理两次（如果事件实际上已被处理）
-                if let Err(e) = self
-                    .repo
-                    .mark_retry_wait(
-                        &event_uuid,
-                        &lease_token,
-                        &format!("MPSC send failed: {}", e),
-                        chrono::Utc::now(),
-                    )
-                    .await
-                {
-                    warn!(target: "outbox", event_uuid = %event_uuid, error = %e, "重置事件状态失败");
-                }
+                self.reschedule_transport_failure(
+                    &event,
+                    &lease_token,
+                    &format!("MPSC send failed: {}", e),
+                )
+                .await;
                 return Err(()); // 停止轮询
+            }
+            Err(_) => {
+                warn!(
+                    target: "outbox",
+                    event_uuid = %event_uuid,
+                    processing_timeout_secs,
+                    "发送事件到处理器达到绝对截止时间"
+                );
+                self.reschedule_transport_failure(
+                    &event,
+                    &lease_token,
+                    "向 OutboxProcessor 发送事件超时",
+                )
+                .await;
+                return Err(());
             }
         };
 
-        // 等待 ACK 或超时
-        let ack_result = timeout(
-            Duration::from_secs(self.config.lease_duration_secs as u64),
-            response_rx,
-        )
-        .await;
+        let mut response_rx = response_rx;
+        let deadline = tokio::time::sleep(Duration::from_secs(processing_timeout_secs));
+        tokio::pin!(deadline);
+        let mut renew = interval(Duration::from_secs(
+            (self.config.lease_duration_secs / 3).max(1) as u64,
+        ));
+        let ack_result = loop {
+            tokio::select! {
+                outcome=&mut response_rx=>break Ok::<_,()>(outcome),
+                _=&mut deadline=>{
+                    warn!(
+                        target: "outbox",
+                        event_uuid = %event_uuid,
+                        processing_timeout_secs,
+                        "事件处理达到绝对截止时间"
+                    );
+                    break Err(());
+                },
+                _=renew.tick()=>{
+                    match self.repo.renew_lease(&event_uuid,&lease_token,self.config.lease_duration_secs).await {
+                        Ok(true)=>{},
+                        Ok(false)=>{warn!(event_uuid,"租约已失效，停止等待");break Err(())},
+                        Err(e)=>{warn!(event_uuid,error=%e,"租约续期失败");break Err(())}
+                    }
+                }
+            }
+        };
 
         match ack_result {
             Ok(Ok(outcome)) => {
@@ -208,30 +291,19 @@ impl OutboxDispatcher {
                 // oneshot 发送方已 dropped（通常意味着 OutboxProcessor 已停止）
                 warn!(target: "outbox", event_uuid = %event_uuid, "ACK 通道已关闭");
                 // 将事件标记为可重新 claim
-                if let Err(e) = self
-                    .repo
-                    .mark_retry_wait(
-                        &event_uuid,
-                        &lease_token,
-                        "ACK channel closed",
-                        chrono::Utc::now(),
-                    )
-                    .await
-                {
-                    warn!(target: "outbox", event_uuid = %event_uuid, error = %e, "更新事件状态失败");
-                }
+                self.reschedule_transport_failure(&event, &lease_token, "ACK channel closed")
+                    .await;
                 return Err(());
             }
             Err(_) => {
-                // ACK 超时：lease 已过期，事件可能被重新 claim
+                // ACK 超时：停止续租。处理器本身也有相同的 deadline；如果 ACK
+                // 丢失，事件会在当前 lease 到期后由 recover_expired_processing 恢复。
                 warn!(
                     target: "outbox",
                     event_uuid = %event_uuid,
                     lease_duration_secs = self.config.lease_duration_secs,
-                    "ACK 超时，事件 lease 已过期"
+                    "ACK 超时，停止续租并等待 lease 恢复"
                 );
-                // 不在这里更新状态：lease 过期的事件会在下次 poll 时被恢复
-                // 或者如果 EventProcessor 实际上处理成功了，会发送 ACK 但我们没收到
             }
         }
 
@@ -312,9 +384,8 @@ impl OutboxDispatcher {
                     .ok()
                     .flatten()
                     .map(|e| e.attempts)
-                    .unwrap_or(1) as i64;
-                let backoff_secs = self.config.backoff_base_secs * 2_i64.pow(attempts as u32);
-                let next_available = chrono::Utc::now() + chrono::Duration::seconds(backoff_secs);
+                    .unwrap_or(1);
+                let next_available = self.next_retry_at(attempts);
 
                 if let Err(e) = self
                     .repo
@@ -363,7 +434,7 @@ impl OutboxDispatcher {
             .repo
             .claim_next_event(self.config.lease_duration_secs)
             .await
-            .map_err(|e| crate::error::RuntimeError::Repository(e))?;
+            .map_err(crate::error::RuntimeError::Repository)?;
 
         if let Some(ref e) = event {
             debug!(
@@ -421,5 +492,9 @@ mod tests {
         assert_eq!(config.max_retry_attempts, MAX_RETRY_ATTEMPTS);
         assert_eq!(config.poll_interval_ms, 100);
         assert_eq!(config.backoff_base_secs, RETRY_BACKOFF_BASE_SECS);
+        assert_eq!(
+            config.processing_timeout_secs,
+            DEFAULT_EVENT_PROCESSING_TIMEOUT_SECS
+        );
     }
 }
