@@ -22,6 +22,7 @@ pub mod mute;
 pub mod outbox;
 pub mod relationship;
 pub mod repository;
+pub mod user;
 
 #[cfg(test)]
 mod behavior_tests;

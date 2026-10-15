@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio::time::timeout as tokio_timeout;
 
 use async_trait::async_trait;
@@ -147,6 +148,8 @@ pub struct OneBotAdapterImpl {
     shutdown_tx: watch::Sender<bool>,
     /// 是否已启动。
     started: AtomicBool,
+    /// 适配器常驻任务句柄；关停时必须等待或取消，避免任务继续访问已关闭资源。
+    tasks: Mutex<Vec<JoinHandle<()>>>,
     /// 连接器（真实或测试用假连接）。
     connector: Arc<dyn WsConnector>,
 }
@@ -207,6 +210,7 @@ impl OneBotAdapterImpl {
             event_tx,
             shutdown_tx,
             started: AtomicBool::new(false),
+            tasks: Mutex::new(Vec::new()),
             connector,
         }
     }
@@ -246,7 +250,7 @@ impl OneBotAdapter for OneBotAdapterImpl {
         let config = self.config.clone();
 
         // 连接循环任务（负责收发、心跳、断线重连）。
-        tokio::spawn(connection::run_connection_loop(
+        let connection_task = tokio::spawn(connection::run_connection_loop(
             connector,
             shared,
             outbound_rx,
@@ -264,7 +268,11 @@ impl OneBotAdapter for OneBotAdapterImpl {
             binding_manager: self.binding_manager.clone(),
             blacklist_repo: self.blacklist_repo.clone(),
         };
-        tokio::spawn(async move { processor.run().await });
+        let processor_task = tokio::spawn(async move { processor.run().await });
+        self.tasks
+            .lock()
+            .await
+            .extend([connection_task, processor_task]);
 
         Ok(())
     }
@@ -274,6 +282,14 @@ impl OneBotAdapter for OneBotAdapterImpl {
         self.shared
             .set_state(OneBotConnectionState::Disconnected)
             .await;
+        let tasks = std::mem::take(&mut *self.tasks.lock().await);
+        let wait = Duration::from_secs(self.config.action_timeout_secs.max(1));
+        for mut task in tasks {
+            if tokio::time::timeout(wait, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
         Ok(())
     }
 
@@ -412,6 +428,17 @@ impl InboundProcessor {
             }
         };
 
+        // self_id 来自平台事件本身，比本地可选配置更可靠。自身回声不能进入
+        // 命令、关系、记忆或回复链路；发送后的 assistant 历史由出站路径落库。
+        if inbound.is_self_echo {
+            tracing::debug!(
+                target: "adapter",
+                platform_message_id = inbound.platform_message_id,
+                "忽略 OneBot 自身回声事件"
+            );
+            return;
+        }
+
         // 黑名单必须在 resolve 之前检查。resolve 会按需创建会话和参与者，
         // 否则首次来自被拉黑目标的消息仍会留下身份记录。
         if let Some(blacklist_repo) = &self.blacklist_repo {
@@ -530,7 +557,7 @@ impl InboundProcessor {
                 Some(inbound.platform_message_id),
                 character_id,
                 inbound.is_mentioned,
-                serde_json::json!({"author_kind":"user","external_sender_id":inbound.external_sender_id,"display_name":inbound.display_name,"mentions":inbound.mention_targets,"reply_to":inbound.reply_to,"content_metadata":inbound.content_metadata,"binding_id":sorted[0].id,"binding_version":sorted[0].switched_at}),
+                serde_json::json!({"author_kind":"user","external_sender_id":inbound.external_sender_id,"display_name":inbound.display_name,"mentions":inbound.mention_targets,"reply_to_platform_message_id":inbound.reply_to,"content_metadata":inbound.content_metadata,"binding_id":sorted[0].id,"binding_version":sorted[0].switched_at}),
             )
             .await;
 

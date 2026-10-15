@@ -340,6 +340,7 @@ async fn create_env() -> TestEnv {
         session_service: SessionService::new(pool.clone()),
         character_service: CharacterService::new(pool.clone()),
         memory_repo: memory_repo.clone(),
+        participant_repo: participant_repo.clone(),
     };
 
     let socket_path = socket_dir.join("control.sock");
@@ -640,6 +641,78 @@ async fn test_shutdown_command_sets_flag() {
     assert_eq!(resp["ok"], true);
     // 关停信号应已通过 watch channel 发出。
     assert!(*env.shutdown_tx.borrow(), "shutdown 信号应已置位");
+}
+
+#[tokio::test]
+async fn test_user_merge_and_delete_commands() {
+    let env = create_env().await;
+    let pool = env.storage.pool().clone();
+
+    let source_user: i64 = sqlx::query_scalar(
+        "INSERT INTO users(platform,external_id) VALUES('onebot_qq','900001') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let target_user: i64 = sqlx::query_scalar(
+        "INSERT INTO users(platform,external_id) VALUES('onebot_qq','900002') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO relationships(character_id,user_id,interaction_count) VALUES(?,?,?)")
+        .bind(env.character_id)
+        .bind(source_user)
+        .bind(2_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // 相同 ID 拒绝。
+    let same = send_json(
+        &env.socket_path,
+        &serde_json::json!({ "version": 1, "id": 500, "request": { "operation": "user_merge", "params": {"source_user_id": source_user, "target_user_id": source_user} } }),
+    )
+    .await
+    .expect("same-id merge request should return a response");
+    assert_eq!(same["ok"], serde_json::json!(false));
+    assert_eq!(same["error"]["code"], "INVALID_PARAMS");
+
+    let merge = send_json(
+        &env.socket_path,
+        &serde_json::json!({ "version": 1, "id": 501, "request": { "operation": "user_merge", "params": {"source_user_id": source_user, "target_user_id": target_user} } }),
+    )
+    .await
+    .expect("merge request should return a response");
+    assert_eq!(merge["ok"], serde_json::json!(true));
+    assert_eq!(
+        merge["data"]["merged_user_id"],
+        serde_json::json!(target_user)
+    );
+    let source_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id=?")
+        .bind(source_user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(source_left, 0);
+
+    let delete = send_json(
+        &env.socket_path,
+        &serde_json::json!({ "version": 1, "id": 502, "request": { "operation": "user_delete", "params": {"user_id": target_user} } }),
+    )
+    .await
+    .expect("delete request should return a response");
+    assert_eq!(delete["ok"], serde_json::json!(true));
+    assert_eq!(
+        delete["data"]["deleted_user_id"],
+        serde_json::json!(target_user)
+    );
+    let target_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id=?")
+        .bind(target_user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(target_left, 0);
 }
 
 // ============================================================================
@@ -1651,7 +1724,7 @@ async fn test_character_card_reassign_updates_all_fk_children() {
     relationship_repo
         .upsert(&Relationship {
             character_id: old_id,
-            participant_id,
+            user_id: participant_id,
             familiarity: 0.5,
             affection: 0.3,
             trust: 0.2,
@@ -3273,7 +3346,7 @@ async fn test_semantic_memory_conversation_id_set_null_on_delete() {
         .is_some());
 }
 
-/// 验证：session delete-character 保留 Relationship（character-scoped）
+/// 验证：删除会话后，全域用户关系仍保留。
 #[tokio::test]
 async fn test_session_delete_character_retains_relationships() {
     let storage = SqliteStorage::open_in_memory()
@@ -3361,7 +3434,7 @@ async fn test_session_delete_character_retains_relationships() {
     // 创建 relationship
     let rel = Relationship {
         character_id: char1_id,
-        participant_id,
+        user_id: participant_id,
         familiarity: 0.3,
         affection: 0.4,
         trust: 0.5,
@@ -3388,18 +3461,13 @@ async fn test_session_delete_character_retains_relationships() {
         .await
         .expect("删除会话失败");
 
-    // 验证：relationship 已删除
-    // 原因：Relationship 的 participant FK cascade。
-    // 删除 conversation → cascade 删除 participant → cascade 删除 relationship
+    // Relationship 现在以全域 user_id 为外键；删除单个会话只删除会话 participant，
+    // 不应抹掉该角色与同一平台用户在其他会话中的关系。
     let rels_after = relationship_repo
         .find_by_character_id(char1_id)
         .await
         .expect("查询关系");
-    assert_eq!(
-        rels_after.len(),
-        0,
-        "Relationship 应该已删除（cascade: conversation → participant → relationship）"
-    );
+    assert_eq!(rels_after.len(), 1, "删除单个会话不应删除全域用户关系");
 
     // 验证：角色仍然存在
     assert!(char_repo

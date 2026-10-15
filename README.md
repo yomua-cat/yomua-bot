@@ -1,159 +1,114 @@
-# yomua-bot
+<div align="center">
+  <img src="docs/images/yomua-bot.png" alt="油木然-bot 头像" width="160" />
+  <h1>油木然-bot</h1>
+  <p>住在 QQ 群里的角色机器人：它记得你们聊过什么，会看气氛说话，也可能自己冒出来搭一句。</p>
+</div>
 
-**面向 QQ 会话的持久角色运行时。** yomua-bot 用 Rust 管理角色、会话、关系、状态、记忆和回复任务，通过 OneBot 11 接入 QQ，通过兼容 Chat Completions 的服务调用语言模型。
+> [!IMPORTANT]
+> 项目还在早期开发阶段（0.2.x）。核心链路已经有自动化测试覆盖，但还没经过真实 QQ 群的长期运行验收。想尝鲜可以自己部署一个，入口见下方文档导航。
 
-> **开发状态**
->
-> 当前版本是 `0.2.x` 开发版本，尚未达到 `v1.0.0` 的生产承诺。自动化检查已经覆盖主要本地链路，但真实 QQ/NapCat、外部模型、故障转移和长期运行仍需在隔离环境中验收。
+## 它能做什么
 
-## 你可以用它做什么
+- **持续记住你们**：聊天记录、关系（熟悉度、好感、信任）和角色状态都存在本地 SQLite 里，下次聊天还在。
+- **有自己的状态**：每个角色在每个会话里有独立的心情值和压力值（自研设计），写进发给模型的上下文，影响它的语气和参与意愿。
+- **会自己冒泡**：绑定开启主动发言后，它会按冷却时间和每日额度在群里搭话，不会刷屏。
+- **可拓展**：插件是独立进程，通过 IPC 与主程序通信；插件崩溃不会拖垮主 bot。
 
-| 能力 | 当前状态 | 说明 |
-| --- | --- | --- |
-| 持久角色与会话绑定 | 已实现 | 一个 QQ 账号可在不同会话扮演不同角色；单个会话同时绑定一个角色。 |
-| 消息接收与 Outbox | 已验证 | 消息、作者身份、观察角色、提及、引用和绑定版本在同一事务中保存。 |
-| 连续消息合并 | 已验证 | 原消息逐条保留，短时间连续输入合并为一轮模型请求。 |
-| 角色卡 | 已实现 | 支持 JSON/PNG 角色卡；真实角色体验仍需实际聊天验收。 |
-| 记忆隐私边界 | 已验证 | 默认只显示摘要；读取原文必须显式请求，跨会话可见范围由程序控制。 |
-| `yomua-bot-ctl` | 已验证 | 支持短命令、别名、REPL 历史与光标编辑、全屏 TUI 和结构化 Unix socket 协议。 |
-| 多 Provider 与备用链 | 已验证 | Provider 与模型实例分离，可按任务配置备用链；真实服务地址、模型名和额度需要实测。 |
-| 决策模型 | 已接入接口 | `decision.toml` 独立选择模型；输出只能作为建议，程序规则拥有最终裁决权。 |
-| 语音通话 | 未接入 | 当前出站链路只有文本动作，语音能力另行设计。 |
+以上每一条都有代码和测试支持。语音能力还在计划中，尚未开始开发。
 
-## 最短上手流程
+## 在群里是什么感觉
 
-### 1. 准备工具
+把角色卡导入并绑定到一个群，它就在那个群里待着了。你可以：
 
-开发验证使用 Rust stable；目标部署环境为 Linux。QQ 接入还需要独立运行的 OneBot 11 WebSocket 服务，例如 NapCat 配套的 OneBot 实现。
+- **@它说话**：默认它只回被 @ 的消息（回复模式可调）。
+- **让它自然参与**：把绑定调成 natural 模式，它会根据当前心情和与你的关系决定接不接话、隔多久回。
+- **让它自己搭话**：开启主动发言后，它会在冷却和额度允许时主动加入话题。
 
-```bash
-cargo build --locked --lib --bins --examples
-cargo test --locked --lib --bins
-```
+下面是一段虚构的示意对话，展示的是设计目标下的体验，不是某个真实群里的记录：
 
-### 2. 生成配置模板
-
-首次启动会在启动目录下创建 `config/`，补齐四份模板，然后以退出码 `1` 退出，避免在未填写密钥时直接启动：
-
-```bash
-cargo run --locked --bin yomua-bot
-```
-
-编辑以下文件中的占位值：
+> **示意**
 
 ```text
-config/runtime.toml    运行目录、管理员和关停超时
-config/onebot.toml     OneBot WebSocket、Bot QQ 号和令牌
-config/llm.toml        对话/认知 Provider、模型和备用链
-config/decision.toml   参与判断与状态建议使用的决策模型
+阿茶：@油木然-bot 上次我们说的那个游戏叫什么来着？
+油木然-bot：记得呀，是《星轨旅人》，你上周还立 flag 说这周通关来着。
+阿茶：……你怎么记这么清
+油木然-bot：毕竟你天天提（笑）
 ```
 
-配置字段、首次启动行为和重载边界见[配置参考](docs/configuration.md)。根目录中已有的本地 `*.toml` 不会被删除；标准位置是 `config/`，需要使用旧位置时必须显式传入 `--config-dir .`。
+## 它记得什么、数据在哪
 
-### 3. 导入角色并启动
+| 记录内容 | 存放位置 | 说明 |
+| --- | --- | --- |
+| 消息与会话记录 | 本地 SQLite（data/ 目录） | 每条消息保存作者、会话与引用关系 |
+| 关系（熟悉、好感、信任） | 本地 SQLite | 按角色 × 参与者记录，随交互次数增长 |
+| 角色心情与状态 | 本地 SQLite | 按角色 × 会话隔离 |
 
-导入命令使用明确的二进制目标，路径和会话 ID 请替换为实际值：
+两点需要知道：
 
-```bash
-cargo run --locked --bin yomua-bot -- import-card /path/to/character.json \
-  --config-dir config \
-  --conversation 123456 \
-  --group
+- **消息会发送给维护者配置的 LLM 服务**。bot 生成回复时，消息内容会作为上下文发给部署时配置的模型接口，具体提供商和地址由部署者决定。
+- **想让它忘记你的内容**，需要向维护者提出，由维护者通过控制端删除对应记忆；目前没有使用者自助删除入口。
 
-cargo run --locked --bin yomua-bot -- --config-dir config
-```
+身份边界：目前同一个 QQ 号在两个群里会被记为两个参与者，跨群统一身份还在设计中。记忆和关系按角色分开存，不同角色互不共享。
 
-### 4. 用 ctl 检查和关停
+## 当前状态
 
-```bash
-cargo run --locked --bin yomua-bot-ctl -- --data-dir data status --raw
-cargo run --locked --bin yomua-bot-ctl -- --data-dir data --tui
-cargo run --locked --bin yomua-bot-ctl -- --data-dir data shutdown --confirm
-```
+| 类别 | 内容 |
+| --- | --- |
+| 已实现 | 角色卡导入、会话绑定、消息收发链路、记忆与关系、心情/状态模块、控制端 yomua-bot-ctl、插件 IPC |
+| 试验中 | 主动发言节奏、多 Provider 备用链、决策模型接入 |
+| 还没做 | 语音、跨群统一用户身份、自动记忆整理与矛盾修订 |
 
-不带命令时，ctl 进入支持历史记录、上下键、光标编辑和 Tab 补全的 REPL。常用别名包括 `s`（`status`）、`c list`（`character list`）、`ss list`（`conversation list`）、`m list`（`memory list`）和 `cfg reload`（`reload-config`）。命令本由 ctl 维护，bot 只接收版本化结构化请求；完整命令见[CLI 参考](docs/cli.md)。
+更完整的验证证据和已知问题见[项目现状](docs/status.md)。
 
-## 工作方式
-
-消息入站后，适配器先把平台事件转换为结构化消息。应用层在一个事务里写入消息和 Outbox 事件，再由后台任务按会话顺序冻结一批连续输入、执行参与判断、组装上下文、调用模型并创建回复任务。发送前会再次检查角色绑定、停用状态和任务版本。
+## 架构一览
 
 ```mermaid
 flowchart LR
-    Q[OneBot 11 / QQ] --> A[消息适配器]
-    A --> T[接收入库事务]
-    T --> DB[(SQLite 消息与状态)]
+    Q[QQ via OneBot 11] --> A[消息适配器]
+    A --> T[接收入库]
+    T --> DB[(SQLite)]
     T --> O[Outbox]
-    O --> P[回复任务处理器]
-    P --> D[参与决策]
-    D --> C[上下文组装]
-    C --> L[Provider / 模型实例]
-    L --> R[回复任务与发送核查]
+    O --> P[回复处理器]
+    P --> L[LLM 服务]
+    L --> R[发送前核查]
     R --> Q
-    DB --> M[记忆与关系服务]
-    M --> C
+    DB --> M[记忆 / 关系 / 状态]
+    M --> P
 ```
 
-上下文优先级为：系统硬约束、角色卡、动态状态、可见记忆、历史、当前消息、回复格式要求。只有角色真实发出的消息才会以 `assistant` 身份进入历史；其他成员、其他 Bot 和被引用消息保留各自身份。
+程序负责身份、权限、频率、并发和任务生命周期等硬约束；模型只负责理解上下文和生成回复，不能绕过程序的限制。详细分层和消息链路见[架构文档](docs/architecture.md)。
 
-## 配置模型
+## 想自己跑一个
 
-首次发布可以只配置一个 Provider 和一个默认模型；同一 Provider 配置多个模型时，只需在 `llm.toml` 的 `model_instances` 中填写模型名，不必重复 URL。需要备用链时，为任务声明主模型和备用模型：只有网络错误、超时、HTTP 429 或 5xx 才会切换，认证失败、参数错误和响应格式错误会直接报告。
+```bash
+# 首次启动：在 ./config 生成配置模板，校验失败会退出
+cargo run --locked --bin yomua-bot
 
-```toml
-# config/llm.toml（结构示意，真实密钥只放本地文件）
-[providers.primary]
-provider_type = "openai-compatible"
-base_url = "https://api.example.invalid/v1"
-api_key = "REPLACE_WITH_KEY"
+# 填好 config/ 下的 OneBot 地址、bot QQ 号和 LLM 凭据后再次启动
+cargo run --locked --bin yomua-bot
 
-[model_instances.conversation]
-provider = "primary"
-model = "REPLACE_WITH_MODEL"
-
-[roles.conversation]
-model_instance = "conversation"
-fallback_model_instances = []
+# 导入角色卡并绑定到群
+cargo run --locked --bin yomua-bot -- import-card /path/to/card.json \
+  --config-dir config --conversation 群号 --group --participant 你的QQ号
 ```
 
-Grok 等兼容接口按 Provider 配置，不在代码中写死厂商名称。决策模型单独放在 `config/decision.toml`，与对话模型分开控制超时、输出长度和单次 token 预算。完整字段和示例见[配置参考](docs/configuration.md)。
+前置环境（Rust、OneBot 11 实现、SQLite）和配置项说明见[部署运维](docs/deployment.md)与[配置参考](docs/configuration.md)。
 
-## 仓库导航
+## 扩展它
 
-```text
-src/             Domain、Application、Infrastructure、Adapters 及程序入口
-tests/           集成测试
-examples/        插件示例
-docs/            当前架构、配置、运维、CLI、插件和验收说明
-.github/         CI、问题模板和 PR 模板
-config/          首次启动生成的本地模板（不提交真实密钥）
-```
+插件是独立进程，通过 Unix socket 和 msgpack IPC 与主程序通信，可以订阅消息事件、读写自己的数据；不允许直接替角色发消息或改核心状态。最小示例在 examples/echo_plugin.rs，开发细节见[插件文档](docs/plugins.md)。
 
-- [文档索引](docs/README.md)：按主题进入当前文档。
-- [架构](docs/architecture.md)：分层、消息链路、状态边界和后台任务。
-- [配置](docs/configuration.md)：四份配置文件、Provider 路由和重载规则。
-- [部署运维](docs/deployment.md)：构建、启动、备份、关停和恢复边界。
-- [CLI](docs/cli.md)：主程序工具、ctl 命令、别名和控制协议。
-- [插件](docs/plugins.md)：插件生命周期、IPC 和权限限制。
-- [项目现状](docs/status.md)：验证证据、未完成项和后续整顿顺序。
-- [使用验收指南](docs/verification-guide.md)：按功能场景逐项检查。
-- [贡献规范](CONTRIBUTING.md)：修改边界、检查命令和协作要求。
+## 技术栈
 
-## 隐私与安全
+- **Rust + tokio**：单进程异步运行时，负责消息处理、任务调度和插件监督。
+- **SQLite（经 sqlx）**：所有持久化数据的存储层，单文件、便于备份。
+- **OneBot 11**：QQ 消息接入协议，通过 WebSocket 与 OneBot 实现通信。
+- **msgpack IPC**：主程序与插件进程之间的通信格式。
 
-配置密钥、运行数据、日志、NapCat 数据、角色卡素材和 Agent 记忆均属于本地内容，不应提交到 Git。控制 socket 目前依赖文件系统权限，能够访问 socket 的本机进程可以执行管理命令；部署时请使用专用用户并限制数据目录权限。
+没有可引用的性能基准数据，这里只陈述事实：核心用 Rust 写成，存储用 SQLite，异步层基于 tokio。
 
-记忆默认不返回原文。ctl 的 `memory list` 只显示摘要和元数据，只有显式添加 `--raw` 才会读取原文；日志和错误输出仍可能包含会话相关信息，应按运行数据处理。
+## 参与与许可
 
-## 验证状态
-
-当前工作树已通过库、主程序、ctl、集成测试、格式检查、严格 Clippy 和本地 Markdown 链接检查；具体数字和边界以[项目现状](docs/status.md)为准。以下内容仍需真实环境验证：
-
-1. OneBot/NapCat 的真实收发、提及和角色切换。
-2. 外部模型的真实响应格式、额度、延迟和备用链切换。
-3. 长时间运行、信号关停、重启恢复和生产级数据备份。
-
-在这些证据完成前，请将项目视为开发中的可验证组件，而不是已经发布的 `v1.0.0` 服务。
-
-## 许可
-
-[MIT](LICENSE)
+- 问题反馈：[Issue 模板](.github/ISSUE_TEMPLATE)
+- 贡献指南：[CONTRIBUTING.md](CONTRIBUTING.md)
+- 许可证：[MIT License](LICENSE)

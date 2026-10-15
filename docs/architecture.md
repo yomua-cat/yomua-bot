@@ -54,8 +54,10 @@ flowchart TD
 | ConversationState | Character × Conversation | 会话精力、压力与更新时间 |
 | Mood | Character × Conversation | mood 标量与更新时间 |
 | BehaviorState | Character × Conversation | 主动行为冷却时间 |
-| Relationship | Character × Participant | 关系数值与交互记录 |
-| Memory | Character，可附会话 | 确定性提取的记忆及语义记忆存储能力 |
+| User | `(platform, external_id)` | 跨会话稳定的平台用户身份；支持审计合并与删除 |
+| Participant | Conversation × external_id | 会话内显示名、作者身份和消息归属，不能替代 User |
+| Relationship | Character × User | 关系数值与跨会话交互记录；领域对象保存 `user_id`，会话 `participant_id` 只用于入站解析；交互幂等表同样按 `user_id` 归并 |
+| Memory | Character × 可选 User，可附会话 | 记忆来源和用户归属；同一用户可跨会话召回，候选记忆仍不可见 |
 | CharacterBinding | Conversation → Character | 回复模式、主动行为、静默时段等绑定设置 |
 
 [领域模型](../src/domain/character.rs)与[情绪模型](../src/domain/emotion.rs)定义状态。[角色运行时](../src/application/runtime.rs)按需加载并缓存角色，以每角色锁保护状态更新。控制命令直接写仓储时与缓存同步的关系仍需整顿。
@@ -66,7 +68,7 @@ flowchart TD
 
 [规则行为引擎](../src/application/behavior_engine.rs)结合回复模式、提及、静默时段、状态和关系决定是否回复及延迟。[决策编排器](../src/application/decision_orchestrator.rs)以规则结果为基线；`decision.toml` 启用后接入 advisory 决策模型，模型输出必须经过验证器和硬约束策略。
 
-[ContextBuilder](../src/application/context.rs)加载角色归属的历史、Lorebook、记忆、关系及会话情绪；[CharacterHistoryProvider](../src/application/character_history.rs)负责历史归属和序号边界。[ContextAssembler](../src/application/context_assembler.rs)估算 token、预留输出空间并按层降级，需要已知的 `context_window`。主程序从 `llm.toml` 的 `[options]` 读取预算，即使使用多模型配置也是如此。
+[ContextBuilder](../src/application/context.rs)加载角色归属的历史、Lorebook、记忆、关系及会话情绪；关系查询会先把当前 participant 映射到全域 User，记忆查询同时允许同一 User 在其他会话的可见记忆。[CharacterHistoryProvider](../src/application/character_history.rs)负责历史归属和序号边界。[ContextAssembler](../src/application/context_assembler.rs)估算 token、预留输出空间并按层降级，需要已知的 `context_window`。主程序从 `llm.toml` 的 `[options]` 读取预算，即使使用多模型配置也是如此。
 
 [认知层](../src/application/cognition.rs)通过[调度器](../src/application/llm_scheduler.rs)发起请求，HTTP 实现在[OpenAI-compatible Provider](../src/infrastructure/llm/openai_compatible.rs)。Provider 连接与对话模型来自 `llm.toml`，独立决策模型来自 `decision.toml`，同一 Provider 可复用多个模型。LLM 关闭时保留消息并跳过生成，不发送伪造回复；启用后模型或上下文错误会按 Outbox 失败路径处理。
 

@@ -620,31 +620,29 @@ impl ReplyProcessor {
             }
         }
         if let Some(repo) = &self.message_repo {
-            let assistant_sender_id = if let Some(bot_id) = self.bot_self_id {
-                if let Some(participant) = self
-                    .participant_repo
-                    .find_by_external_id(event.conversation_id, &bot_id.to_string())
-                    .await?
-                {
-                    participant.id
-                } else {
-                    let participant = crate::domain::conversation::Participant {
-                        id: 0,
-                        conversation_id: event.conversation_id,
-                        external_id: bot_id.to_string(),
-                        display_name: character.definition.name.clone(),
-                        role: crate::domain::conversation::ParticipantRole::Character,
-                        metadata: serde_json::json!({
-                            "author_kind": "assistant",
-                            "character_id": event.character_id,
-                        }),
-                    };
-                    self.participant_repo.insert(&participant).await?
-                }
+            let assistant_external_id = self
+                .bot_self_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| format!("character:{}", event.character_id));
+            let assistant_sender_id = if let Some(participant) = self
+                .participant_repo
+                .find_by_external_id(event.conversation_id, &assistant_external_id)
+                .await?
+            {
+                participant.id
             } else {
-                return Err(RuntimeError::Internal(
-                    "未配置 Bot 外部身份，无法记录角色发言".into(),
-                ));
+                let participant = crate::domain::conversation::Participant {
+                    id: 0,
+                    conversation_id: event.conversation_id,
+                    external_id: assistant_external_id,
+                    display_name: character.definition.name.clone(),
+                    role: crate::domain::conversation::ParticipantRole::Character,
+                    metadata: serde_json::json!({
+                        "author_kind": "assistant",
+                        "character_id": event.character_id,
+                    }),
+                };
+                self.participant_repo.insert(&participant).await?
             };
             let message = crate::domain::message::Message {
                 id: 0,
@@ -704,11 +702,16 @@ impl ReplyProcessor {
         conversation_id: i64,
     ) -> ProcessingOutcome {
         let error_text = error.to_string();
-        let is_permanent = matches!(
-            &error,
-            RuntimeError::Repository(crate::error::RepositoryError::Database(_))
-                | RuntimeError::Storage(crate::error::StorageError::Connection(_))
-        );
+        let is_permanent = match &error {
+            RuntimeError::Repository(crate::error::RepositoryError::Database(message)) => {
+                !Self::is_transient_database_error(message)
+            }
+            RuntimeError::Storage(crate::error::StorageError::Connection(_)) => false,
+            RuntimeError::Storage(crate::error::StorageError::Database(message)) => {
+                !Self::is_transient_database_error(message)
+            }
+            _ => false,
+        };
 
         if is_permanent {
             tracing::error!(
@@ -727,6 +730,26 @@ impl ReplyProcessor {
             );
             ProcessingOutcome::RetryableFailure { error: error_text }
         }
+    }
+
+    /// 识别 SQLite/连接层明确表示“稍后重试”的错误。
+    ///
+    /// 未列出的数据库错误保持永久失败，避免把 schema 错误、约束错误或
+    /// 数据损坏无限重试并掩盖真实问题。
+    fn is_transient_database_error(message: &str) -> bool {
+        let message = message.to_ascii_lowercase();
+        [
+            "database is locked",
+            "database is busy",
+            "sqlite_busy",
+            "pool timed out",
+            "connection reset",
+            "connection closed",
+            "broken pipe",
+            "temporarily unavailable",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
     }
 
     /// 生成回复内容：只接受认知层生成的真实内容；没有可用模型时返回错误。
@@ -1130,7 +1153,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|r| r.character_id == character_id && r.participant_id == participant_id)
+                .find(|r| r.character_id == character_id && r.user_id == participant_id)
                 .cloned())
         }
         async fn find_by_character_id(
@@ -1143,7 +1166,7 @@ mod tests {
             let mut all = self.rels.lock().unwrap();
             if let Some(existing) = all
                 .iter_mut()
-                .find(|x| x.character_id == r.character_id && x.participant_id == r.participant_id)
+                .find(|x| x.character_id == r.character_id && x.user_id == r.user_id)
             {
                 *existing = r.clone();
             } else {
@@ -1739,6 +1762,26 @@ mod tests {
         assert!(!permanent.is_retryable());
         assert!(retryable.is_retryable());
         assert!(!retryable.is_permanent());
+    }
+
+    #[test]
+    fn transient_database_errors_are_retryable_but_schema_errors_are_permanent() {
+        let locked = ReplyProcessor::classify_outbox_error_for_event(
+            RuntimeError::Repository(RepositoryError::Database("database is locked".into())),
+            42,
+        );
+        let schema = ReplyProcessor::classify_outbox_error_for_event(
+            RuntimeError::Repository(RepositoryError::Database("schema is invalid".into())),
+            42,
+        );
+        let connection = ReplyProcessor::classify_outbox_error_for_event(
+            RuntimeError::Storage(crate::error::StorageError::Connection("连接已断开".into())),
+            42,
+        );
+
+        assert!(locked.is_retryable());
+        assert!(schema.is_permanent());
+        assert!(connection.is_retryable());
     }
 
     #[tokio::test]

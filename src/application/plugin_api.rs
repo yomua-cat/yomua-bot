@@ -11,7 +11,6 @@ use crate::application::action::ActionDispatcher;
 use crate::application::cognition::CognitionLayer;
 use crate::domain::behavior::Action;
 use crate::domain::memory::{Memory, MemoryType};
-use crate::domain::relationship::Relationship;
 use crate::domain::repository::{
     CharacterBindingRepository, CharacterRepository, CharacterStateRepository, MemoryRepository,
     MessageRepository, PluginDataRepository, RelationshipRepository,
@@ -484,7 +483,11 @@ impl PluginApi {
             .map_err(|e| e.to_string())?
         {
             Some(r) => r,
-            None => Relationship::new(character_id, participant_id),
+            None => self
+                .relationship_repo
+                .create_for_participant(character_id, participant_id)
+                .await
+                .map_err(|e| e.to_string())?,
         };
 
         if let Some(v) = optional_f64(&params, "familiarity")? {
@@ -722,6 +725,7 @@ mod tests {
     use crate::domain::character::{Character, CharacterDefinition, CharacterState};
     use crate::domain::conversation::{Conversation, ConversationType};
     use crate::domain::message::Message;
+    use crate::domain::relationship::Relationship;
     use crate::domain::repository::{
         CharacterBindingRepository, ConversationRepository, MessageRepository, MoodRepository,
     };
@@ -928,7 +932,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|r| r.character_id == character_id && r.participant_id == participant_id)
+                .find(|r| r.character_id == character_id && r.user_id == participant_id)
                 .cloned())
         }
         async fn find_by_character_id(
@@ -947,8 +951,7 @@ mod tests {
         async fn upsert(&self, relationship: &Relationship) -> Result<(), RepositoryError> {
             let mut all = self.rels.lock().unwrap();
             if let Some(existing) = all.iter_mut().find(|r| {
-                r.character_id == relationship.character_id
-                    && r.participant_id == relationship.participant_id
+                r.character_id == relationship.character_id && r.user_id == relationship.user_id
             }) {
                 *existing = relationship.clone();
             } else {
@@ -1826,7 +1829,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(one["participant_id"], 11);
+        assert_eq!(one["user_id"], 11);
 
         let none = h
             .api

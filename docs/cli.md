@@ -46,6 +46,8 @@ yomua-bot-ctl --tui
 
 `--help` 和 `help` 都由 ctl 本地显示命令本，不连接服务；服务端保留结构化 `help` 操作供其他控制客户端查询能力，但不维护别名和交互提示。ctl 负责把别名和参数输入组装成版本化结构化请求，bot 只负责解码请求、确认校验和业务处理。`--raw` 始终输出完整控制响应 JSON（成功和失败都写标准输出），一次性命令收到 `ok=false` 时返回退出码 1。删除、停用、状态修改、黑名单修改和关停等危险操作必须追加 `--confirm`，服务端也会再次校验。`--raw` 和 `--confirm` 可放在命令前或命令后。
 
+ctl 按命令校验参数：选项只对声明的命令开放，`status --energy 20`、`shutdown --id 1`、`memory update --raw` 这类不适用参数会直接报错并提示可用选项，不会被静默忽略。`--raw` 仅对读取类命令开放（status、角色/会话/状态查询、memory list、reply unknown list）。
+
 命令帮助同时显示面向人的短别名，例如 `s`（`status`）、`c list`（`character list`）、`ss list`（`conversation list`）、`m list`（`memory list`）和 `cfg reload`（`reload-config`）。协议和脚本应继续使用完整命令名；别名只用于交互输入。
 
 ## 当前可解析的命令
@@ -74,6 +76,8 @@ yomua-bot-ctl --tui
 | `reply unknown list [--limit N] [--raw]` | 列出发送结果未知、等待平台核查的回复任务；默认只显示元数据，`--raw` 才返回已保存的回复原文 |
 | `reply unknown check <消息ID>` | 若任务保存了平台消息 ID，通过 OneBot `get_msg` 查询；没有平台 ID 时明确返回需要人工核查 |
 | `reply unknown retry <消息ID> --confirm` | 你已确认平台未发送后，清除未知状态并把原任务重新排队；不会根据查询失败自动执行 |
+| `user merge <来源用户ID> <目标用户ID> --confirm` | 把一个全域用户的数据合并到目标用户并删除来源用户；合并规则与迁移一致 |
+| `user delete <用户ID> --confirm` | 删除全域用户及其关联关系；需要明确确认 |
 | `session delete-character <角色ID> --confirm` | 删除与角色关联的会话数据 |
 | `session delete-all --confirm` | 删除全部会话数据 |
 

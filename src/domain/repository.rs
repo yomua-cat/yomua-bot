@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use crate::domain::character::{
     BehaviorState, Character, CharacterBinding, CharacterState, ConversationState,
 };
-use crate::domain::conversation::{Conversation, Participant};
+use crate::domain::conversation::{Conversation, ConversationType, Participant};
 use crate::domain::emotion::Mood;
 use crate::domain::memory::{Memory, SemanticMatchResult};
 use crate::domain::message::Message;
@@ -140,6 +140,20 @@ pub trait ConversationRepository: Send + Sync {
         &self,
         external_id: &str,
     ) -> Result<Option<Conversation>, RepositoryError>;
+    /// 按平台会话类型和外部 ID 查找会话。
+    ///
+    /// 外部数字 ID 在私聊和群聊命名空间中可能相同，调用方必须同时提供类型。
+    /// 默认实现保留给内存测试仓储，生产 SQLite 仓储会使用带类型的 SQL 查询。
+    async fn find_by_external_id_and_type(
+        &self,
+        external_id: &str,
+        conversation_type: ConversationType,
+    ) -> Result<Option<Conversation>, RepositoryError> {
+        Ok(self
+            .find_by_external_id(external_id)
+            .await?
+            .filter(|conversation| conversation.conversation_type == conversation_type))
+    }
     async fn find_all(&self) -> Result<Vec<Conversation>, RepositoryError>;
     async fn insert(&self, conversation: &Conversation) -> Result<i64, RepositoryError>;
     async fn update(&self, conversation: &Conversation) -> Result<(), RepositoryError>;
@@ -171,6 +185,30 @@ pub trait ParticipantRepository: Send + Sync {
     /// 更新会话内显示名和元数据；旧实现默认不支持更新。
     async fn update(&self, _participant: &Participant) -> Result<(), RepositoryError> {
         Ok(())
+    }
+
+    /// 确保平台用户存在并返回全域用户 ID。
+    /// 只由真实存储实现；测试仓储未实现时返回 `None`，不影响会话内身份测试。
+    async fn ensure_user(
+        &self,
+        _platform: &str,
+        _external_id: &str,
+    ) -> Result<Option<i64>, RepositoryError> {
+        Ok(None)
+    }
+
+    /// 将一个平台用户的历史归并到另一个用户，返回被保留的用户 ID。
+    async fn merge_users(
+        &self,
+        _source_user_id: i64,
+        _target_user_id: i64,
+    ) -> Result<i64, RepositoryError> {
+        Err(RepositoryError::NotImplemented("用户合并".into()))
+    }
+
+    /// 删除用户及其关联数据。调用方必须先完成显式确认。
+    async fn delete_user(&self, _user_id: i64) -> Result<(), RepositoryError> {
+        Err(RepositoryError::NotImplemented("用户删除".into()))
     }
 }
 
@@ -522,6 +560,19 @@ pub trait MemoryRepository: Send + Sync {
         Ok(items)
     }
 
+    /// 按当前消息作者的全域用户身份读取可见记忆。
+    /// 默认实现退化为会话范围查询，SQLite 实现会额外加入跨会话同一用户的记忆。
+    async fn find_visible_for_participant(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        _participant_id: i64,
+        limit: i64,
+    ) -> Result<Vec<Memory>, RepositoryError> {
+        self.find_visible(character_id, conversation_id, limit)
+            .await
+    }
+
     async fn find_by_character_id(
         &self,
         character_id: i64,
@@ -608,6 +659,7 @@ pub trait MemoryRepository: Send + Sync {
 
 #[async_trait]
 pub trait RelationshipRepository: Send + Sync {
+    /// 按会话参与者解析其全域用户后查找关系。
     async fn find(
         &self,
         character_id: i64,
@@ -639,13 +691,24 @@ pub trait RelationshipRepository: Send + Sync {
             .find_by_stable_user_key(character_id, stable_user_key)
             .await?
         {
-            return Ok(existing.participant_id);
+            let _ = existing;
+            return Ok(participant_id);
         }
         if self.find(character_id, participant_id).await?.is_none() {
             self.upsert(&Relationship::new(character_id, participant_id))
                 .await?;
         }
         Ok(participant_id)
+    }
+    /// 按会话参与者创建默认关系。生产仓储必须先解析 participant.user_id。
+    async fn create_for_participant(
+        &self,
+        _character_id: i64,
+        _participant_id: i64,
+    ) -> Result<Relationship, RepositoryError> {
+        Err(RepositoryError::NotImplemented(
+            "按参与者创建全域关系".into(),
+        ))
     }
     async fn upsert(&self, relationship: &Relationship) -> Result<(), RepositoryError>;
     /// 以来源消息 ID 幂等记录一次交互，避免 Outbox 重试重复增加关系熟悉度。

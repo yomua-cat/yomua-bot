@@ -484,7 +484,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|r| r.character_id == character_id && r.participant_id == participant_id)
+                .find(|r| r.character_id == character_id && r.user_id == participant_id)
                 .cloned())
         }
         async fn find_by_character_id(
@@ -504,7 +504,7 @@ mod tests {
             let mut all = self.relationships.lock().unwrap();
             if let Some(existing) = all
                 .iter_mut()
-                .find(|x| x.character_id == r.character_id && x.participant_id == r.participant_id)
+                .find(|x| x.character_id == r.character_id && x.user_id == r.user_id)
             {
                 *existing = r.clone();
             } else {
@@ -540,7 +540,7 @@ mod tests {
     fn close_relationship(character_id: i64) -> Relationship {
         Relationship {
             character_id,
-            participant_id: 1,
+            user_id: 1,
             familiarity: 0.9,
             affection: 0.8,
             trust: 0.9,
