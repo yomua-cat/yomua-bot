@@ -54,6 +54,7 @@ use crate::infrastructure::storage::SqliteStorage;
 use crate::application::character_service::CharacterService;
 use crate::application::control_schema::{self, ControlEnvelope, ControlOperation, ControlRequest};
 use crate::application::session_service::SessionService;
+use crate::domain::repository::ParticipantRepository;
 
 // ---------------------------------------------------------------------------
 // 命令处理器类型与注册表
@@ -108,6 +109,10 @@ impl CommandRegistry {
                 description: fallback_description,
                 destructive: false,
                 requires_confirmation: false,
+                positional_min: 0,
+                positional_max: 0,
+                allowed_options: &[],
+                supports_raw: false,
             });
         self.handlers.insert(
             name.to_string(),
@@ -161,6 +166,16 @@ impl CommandRegistry {
         );
         registry.register("shutdown", "发送优雅关停信号", handle_shutdown);
         registry.register("help", "显示所有可用命令", handle_help);
+        registry.register(
+            control_schema::USER_MERGE,
+            "合并两个全域用户",
+            handle_user_merge,
+        );
+        registry.register(
+            control_schema::USER_DELETE,
+            "删除全域用户",
+            handle_user_delete,
+        );
         registry.register(
             control_schema::CHARACTER_STATE_SET,
             "修改角色状态（全局 energy/stress/activity，或 Character×Conversation 的 energy/stress/mood）",
@@ -1274,6 +1289,18 @@ fn handle_reply_unknown_check(
                     }),
                 ));
             }
+            return Ok(ControlResponse::ok(
+                id,
+                serde_json::json!({
+                    "message_id": message_id,
+                    "platform_message_id": platform_message_id,
+                    "status": "confirmed_sent",
+                    "recorded": true,
+                    "queued": false,
+                    "platform_response": response.data,
+                    "platform_error": response.error_message(),
+                }),
+            ));
         }
         // get_msg 明确返回了带错误码的失败，才足以证明原发送没有成功；
         // 这时原子重新排队，避免把网络不确定误判成未发送。
@@ -1594,6 +1621,108 @@ fn handle_session_delete_all(
                 ControlErrorDetail::internal(&e.to_string()),
             )),
         }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 全域用户处理器
+// ---------------------------------------------------------------------------
+
+fn handle_user_merge(handle: &RuntimeHandle, id: u64, params: serde_json::Value) -> CommandFuture {
+    let handle = handle.clone();
+    Box::pin(async move {
+        let obj = match params.as_object() {
+            Some(o) => o,
+            None => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "params 必须是 JSON 对象"),
+                ));
+            }
+        };
+        let source_user_id = obj.get("source_user_id").and_then(|v| v.as_i64());
+        let target_user_id = obj.get("target_user_id").and_then(|v| v.as_i64());
+        let (source_user_id, target_user_id) = match (source_user_id, target_user_id) {
+            (Some(source), Some(target)) if source > 0 && target > 0 => (source, target),
+            _ => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new(
+                        "INVALID_PARAMS",
+                        "缺少或非法参数 source_user_id / target_user_id",
+                    ),
+                ));
+            }
+        };
+        if source_user_id == target_user_id {
+            return Ok(ControlResponse::err(
+                id,
+                ControlErrorDetail::new(
+                    "INVALID_PARAMS",
+                    "source_user_id 与 target_user_id 不能相同",
+                ),
+            ));
+        }
+        let merged = match handle
+            .participant_repo
+            .merge_users(source_user_id, target_user_id)
+            .await
+        {
+            Ok(merged) => merged,
+            Err(crate::error::RepositoryError::NotFound(message)) => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("USER_NOT_FOUND", message),
+                ));
+            }
+            Err(e) => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::internal(&e.to_string()),
+                ));
+            }
+        };
+        Ok(ControlResponse::ok(
+            id,
+            serde_json::json!({
+                "merged_user_id": merged,
+                "removed_user_id": source_user_id,
+            }),
+        ))
+    })
+}
+
+fn handle_user_delete(handle: &RuntimeHandle, id: u64, params: serde_json::Value) -> CommandFuture {
+    let handle = handle.clone();
+    Box::pin(async move {
+        let obj = match params.as_object() {
+            Some(o) => o,
+            None => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "params 必须是 JSON 对象"),
+                ));
+            }
+        };
+        let user_id = match obj.get("user_id").and_then(|v| v.as_i64()) {
+            Some(uid) if uid > 0 => uid,
+            _ => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "缺少或非法参数 user_id"),
+                ));
+            }
+        };
+        if let Err(e) = handle.participant_repo.delete_user(user_id).await {
+            return Ok(ControlResponse::err(
+                id,
+                ControlErrorDetail::internal(&e.to_string()),
+            ));
+        }
+        Ok(ControlResponse::ok(
+            id,
+            serde_json::json!({ "deleted_user_id": user_id }),
+        ))
     })
 }
 
@@ -1990,6 +2119,8 @@ pub struct RuntimeHandle {
     pub character_service: CharacterService,
     /// 记忆仓储（memory list/delete）。
     pub memory_repo: Arc<dyn MemoryRepository>,
+    /// 参与者仓储（全域用户合并 / 删除）。
+    pub participant_repo: Arc<dyn ParticipantRepository>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

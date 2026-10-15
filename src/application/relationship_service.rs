@@ -1,6 +1,6 @@
 //! 关系服务 —— 关系状态的读取、更新与持久化。
 //!
-//! 关系是 Character × Participant 的结构化状态，任何永久变化都通过
+//! 关系是 Character × User 的结构化状态，任何永久变化都通过
 //! [`crate::domain::repository::RelationshipRepository`] 落库，并发布
 //! [`crate::domain::event::RelationshipChangedEvent`]。
 
@@ -42,9 +42,10 @@ impl RelationshipService {
         {
             return Ok(rel);
         }
-        let new_rel = Relationship::new(character_id, participant_id);
-        self.relationship_repo.upsert(&new_rel).await?;
-        Ok(new_rel)
+        self.relationship_repo
+            .create_for_participant(character_id, participant_id)
+            .await
+            .map_err(RuntimeError::Repository)
     }
 
     /// 使用平台稳定用户键查找已有关系；找不到时回退到当前会话参与者。
@@ -125,12 +126,22 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|r| r.character_id == c && r.participant_id == p)
+                .find(|r| r.character_id == c && r.user_id == p)
                 .cloned()
         }
     }
     #[async_trait]
     impl RelationshipRepository for MemRelationshipRepo {
+        async fn create_for_participant(
+            &self,
+            character_id: i64,
+            participant_id: i64,
+        ) -> Result<Relationship, RepositoryError> {
+            let relationship = Relationship::new(character_id, participant_id);
+            self.upsert(&relationship).await?;
+            Ok(relationship)
+        }
+
         async fn find(
             &self,
             character_id: i64,
@@ -154,8 +165,7 @@ mod tests {
         async fn upsert(&self, relationship: &Relationship) -> Result<(), RepositoryError> {
             let mut all = self.relationships.lock().unwrap();
             if let Some(existing) = all.iter_mut().find(|r| {
-                r.character_id == relationship.character_id
-                    && r.participant_id == relationship.participant_id
+                r.character_id == relationship.character_id && r.user_id == relationship.user_id
             }) {
                 *existing = relationship.clone();
             } else {
@@ -175,7 +185,7 @@ mod tests {
 
         let rel = service.load_or_new(1, 2).await.unwrap();
         assert_eq!(rel.character_id, 1);
-        assert_eq!(rel.participant_id, 2);
+        assert_eq!(rel.user_id, 2);
         // 已落库。
         assert!(repo.find_mem(1, 2).is_some());
     }

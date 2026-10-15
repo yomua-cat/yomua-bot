@@ -26,6 +26,8 @@ pub enum ControlOperation {
     CharacterStateGet,
     CharacterStateSet,
     CharacterStateRefresh,
+    UserMerge,
+    UserDelete,
     BlacklistList,
     BlacklistAdd,
     BlacklistRemove,
@@ -57,6 +59,8 @@ impl ControlOperation {
             Self::CharacterStateGet => CHARACTER_STATE_GET,
             Self::CharacterStateSet => CHARACTER_STATE_SET,
             Self::CharacterStateRefresh => CHARACTER_STATE_REFRESH,
+            Self::UserMerge => USER_MERGE,
+            Self::UserDelete => USER_DELETE,
             Self::BlacklistList => BLACKLIST_LIST,
             Self::BlacklistAdd => BLACKLIST_ADD,
             Self::BlacklistRemove => BLACKLIST_REMOVE,
@@ -69,6 +73,41 @@ impl ControlOperation {
             Self::ReplyUnknownRetry => REPLY_UNKNOWN_RETRY,
             Self::SessionDeleteAll => SESSION_DELETE_ALL,
             Self::SessionDeleteCharacter => SESSION_DELETE_CHARACTER,
+        }
+    }
+
+    /// 按 canonical 命令名解析协议操作。人类别名先由 `canonicalize` 归一化。
+    pub fn from_canonical_name(name: &str) -> Option<Self> {
+        match name {
+            STATUS => Some(Self::Status),
+            HELP => Some(Self::Help),
+            RELOAD_CONFIG => Some(Self::ReloadConfig),
+            SHUTDOWN => Some(Self::Shutdown),
+            CHARACTER_LIST => Some(Self::CharacterList),
+            CHARACTER_SHOW => Some(Self::CharacterShow),
+            CHARACTER_CARD_LIST => Some(Self::CharacterCardList),
+            CHARACTER_CARD_ENABLE => Some(Self::CharacterCardEnable),
+            CHARACTER_CARD_DISABLE => Some(Self::CharacterCardDisable),
+            CHARACTER_CARD_REASSIGN => Some(Self::CharacterCardReassign),
+            CONVERSATION_LIST => Some(Self::ConversationList),
+            CHARACTER_STATE_GET => Some(Self::CharacterStateGet),
+            CHARACTER_STATE_SET => Some(Self::CharacterStateSet),
+            CHARACTER_STATE_REFRESH => Some(Self::CharacterStateRefresh),
+            USER_MERGE => Some(Self::UserMerge),
+            USER_DELETE => Some(Self::UserDelete),
+            BLACKLIST_LIST => Some(Self::BlacklistList),
+            BLACKLIST_ADD => Some(Self::BlacklistAdd),
+            BLACKLIST_REMOVE => Some(Self::BlacklistRemove),
+            BLACKLIST_BAN => Some(Self::BlacklistBan),
+            MEMORY_LIST => Some(Self::MemoryList),
+            MEMORY_DELETE => Some(Self::MemoryDelete),
+            MEMORY_UPDATE => Some(Self::MemoryUpdate),
+            REPLY_UNKNOWN_LIST => Some(Self::ReplyUnknownList),
+            REPLY_UNKNOWN_CHECK => Some(Self::ReplyUnknownCheck),
+            REPLY_UNKNOWN_RETRY => Some(Self::ReplyUnknownRetry),
+            SESSION_DELETE_ALL => Some(Self::SessionDeleteAll),
+            SESSION_DELETE_CHARACTER => Some(Self::SessionDeleteCharacter),
+            _ => None,
         }
     }
 }
@@ -113,6 +152,34 @@ pub struct ControlCommandSpec {
     pub description: &'static str,
     pub destructive: bool,
     pub requires_confirmation: bool,
+    /// 位置参数的最小数量。
+    pub positional_min: u8,
+    /// 位置参数的最大数量。
+    pub positional_max: u8,
+    /// 允许的选项；`raw`/`confirm` 之外的选项必须在此列出。
+    pub allowed_options: &'static [&'static str],
+    /// 是否支持 `--raw`。
+    pub supports_raw: bool,
+}
+
+/// 选项集合的便捷常量，供 specs() 复用。
+pub mod options {
+    pub const LIMIT: &[&str] = &["limit"];
+    pub const LIMIT_OFFSET: &[&str] = &["limit", "offset"];
+    pub const CONVERSATION: &[&str] = &["conversation"];
+    pub const STATE_VALUES: &[&str] = &[
+        "character",
+        "conversation",
+        "energy",
+        "stress",
+        "mood",
+        "activity",
+    ];
+    pub const MEMORY_LIST: &[&str] = &["character", "conversation", "type", "limit"];
+    pub const MEMORY_UPDATE: &[&str] = &["instruction"];
+    pub const BLACKLIST_REASON: &[&str] = &["reason"];
+    pub const BLACKLIST_BAN: &[&str] = &["duration", "reason"];
+    pub const REPLY_UNKNOWN_LIST: &[&str] = &["limit"];
 }
 
 pub const STATUS: &str = "status";
@@ -129,6 +196,8 @@ pub const CONVERSATION_LIST: &str = "conversation list";
 pub const CHARACTER_STATE_GET: &str = "character state get";
 pub const CHARACTER_STATE_SET: &str = "character state set";
 pub const CHARACTER_STATE_REFRESH: &str = "character state refresh";
+pub const USER_MERGE: &str = "user merge";
+pub const USER_DELETE: &str = "user delete";
 pub const BLACKLIST_LIST: &str = "blacklist list";
 pub const BLACKLIST_ADD: &str = "blacklist add";
 pub const BLACKLIST_REMOVE: &str = "blacklist remove";
@@ -151,6 +220,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "查询运行时状态",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 0,
+            positional_max: 0,
+            allowed_options: &[],
+            supports_raw: true,
         },
         ControlCommandSpec {
             name: HELP,
@@ -159,6 +232,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "显示所有可用命令",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 0,
+            positional_max: 0,
+            allowed_options: &[],
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: RELOAD_CONFIG,
@@ -167,6 +244,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "重新加载并校验配置",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 0,
+            positional_max: 0,
+            allowed_options: &[],
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: SHUTDOWN,
@@ -175,6 +256,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "优雅关闭运行时",
             destructive: true,
             requires_confirmation: true,
+            positional_min: 0,
+            positional_max: 0,
+            allowed_options: &[],
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: CHARACTER_LIST,
@@ -183,6 +268,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "列出角色",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 0,
+            positional_max: 0,
+            allowed_options: options::LIMIT_OFFSET,
+            supports_raw: true,
         },
         ControlCommandSpec {
             name: CHARACTER_SHOW,
@@ -191,6 +280,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "显示角色详情",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 1,
+            positional_max: 1,
+            allowed_options: &[],
+            supports_raw: true,
         },
         ControlCommandSpec {
             name: CHARACTER_CARD_LIST,
@@ -199,6 +292,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "列出角色卡及启用状态",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 0,
+            positional_max: 0,
+            allowed_options: &[],
+            supports_raw: true,
         },
         ControlCommandSpec {
             name: CHARACTER_CARD_ENABLE,
@@ -207,6 +304,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "启用角色卡",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 1,
+            positional_max: 1,
+            allowed_options: &[],
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: CHARACTER_CARD_DISABLE,
@@ -215,6 +316,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "停用角色卡",
             destructive: true,
             requires_confirmation: true,
+            positional_min: 1,
+            positional_max: 1,
+            allowed_options: &[],
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: CHARACTER_CARD_REASSIGN,
@@ -223,6 +328,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "修改角色卡 ID",
             destructive: true,
             requires_confirmation: true,
+            positional_min: 2,
+            positional_max: 2,
+            allowed_options: &[],
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: CONVERSATION_LIST,
@@ -231,6 +340,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "列出会话",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 0,
+            positional_max: 0,
+            allowed_options: &[],
+            supports_raw: true,
         },
         ControlCommandSpec {
             name: CHARACTER_STATE_GET,
@@ -239,6 +352,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "查询角色状态",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 0,
+            positional_max: 1,
+            allowed_options: options::CONVERSATION,
+            supports_raw: true,
         },
         ControlCommandSpec {
             name: CHARACTER_STATE_SET,
@@ -247,6 +364,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "修改角色状态",
             destructive: true,
             requires_confirmation: true,
+            positional_min: 0,
+            positional_max: 0,
+            allowed_options: options::STATE_VALUES,
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: CHARACTER_STATE_REFRESH,
@@ -255,6 +376,34 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "刷新角色状态",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 0,
+            positional_max: 0,
+            allowed_options: &[],
+            supports_raw: true,
+        },
+        ControlCommandSpec {
+            name: USER_MERGE,
+            usage: "user merge <source-user-id> <target-user-id> --confirm",
+            group: "用户",
+            description: "把一个全域用户的数据合并到另一个用户并删除来源用户",
+            destructive: true,
+            requires_confirmation: true,
+            positional_min: 2,
+            positional_max: 2,
+            allowed_options: &[],
+            supports_raw: false,
+        },
+        ControlCommandSpec {
+            name: USER_DELETE,
+            usage: "user delete <user-id> --confirm",
+            group: "用户",
+            description: "删除全域用户及其关联关系",
+            destructive: true,
+            requires_confirmation: true,
+            positional_min: 1,
+            positional_max: 1,
+            allowed_options: &[],
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: BLACKLIST_LIST,
@@ -263,6 +412,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "列出黑名单",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 0,
+            positional_max: 0,
+            allowed_options: &[],
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: BLACKLIST_ADD,
@@ -271,6 +424,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "添加黑名单",
             destructive: true,
             requires_confirmation: true,
+            positional_min: 1,
+            positional_max: 1,
+            allowed_options: options::BLACKLIST_REASON,
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: BLACKLIST_REMOVE,
@@ -279,6 +436,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "移除黑名单",
             destructive: true,
             requires_confirmation: true,
+            positional_min: 1,
+            positional_max: 1,
+            allowed_options: &[],
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: BLACKLIST_BAN,
@@ -287,6 +448,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "临时封禁用户",
             destructive: true,
             requires_confirmation: true,
+            positional_min: 1,
+            positional_max: 1,
+            allowed_options: options::BLACKLIST_BAN,
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: MEMORY_LIST,
@@ -295,6 +460,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "查询记忆",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 0,
+            positional_max: 0,
+            allowed_options: options::MEMORY_LIST,
+            supports_raw: true,
         },
         ControlCommandSpec {
             name: MEMORY_DELETE,
@@ -303,6 +472,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "删除记忆",
             destructive: true,
             requires_confirmation: true,
+            positional_min: 1,
+            positional_max: 1,
+            allowed_options: &[],
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: MEMORY_UPDATE,
@@ -311,6 +484,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "确认或更正记忆",
             destructive: true,
             requires_confirmation: true,
+            positional_min: 1,
+            positional_max: 1,
+            allowed_options: options::MEMORY_UPDATE,
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: REPLY_UNKNOWN_LIST,
@@ -319,6 +496,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "列出发送结果未知、等待核查的回复任务",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 0,
+            positional_max: 0,
+            allowed_options: options::REPLY_UNKNOWN_LIST,
+            supports_raw: true,
         },
         ControlCommandSpec {
             name: REPLY_UNKNOWN_CHECK,
@@ -327,6 +508,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "查询平台是否存在未知结果对应的消息",
             destructive: false,
             requires_confirmation: false,
+            positional_min: 1,
+            positional_max: 1,
+            allowed_options: &[],
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: REPLY_UNKNOWN_RETRY,
@@ -335,6 +520,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "确认平台未发送后重新排队回复任务",
             destructive: true,
             requires_confirmation: true,
+            positional_min: 1,
+            positional_max: 1,
+            allowed_options: &[],
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: SESSION_DELETE_ALL,
@@ -343,6 +532,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "删除全部会话数据",
             destructive: true,
             requires_confirmation: true,
+            positional_min: 0,
+            positional_max: 0,
+            allowed_options: &[],
+            supports_raw: false,
         },
         ControlCommandSpec {
             name: SESSION_DELETE_CHARACTER,
@@ -351,6 +544,10 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "删除角色关联会话数据",
             destructive: true,
             requires_confirmation: true,
+            positional_min: 1,
+            positional_max: 1,
+            allowed_options: &[],
+            supports_raw: false,
         },
     ]
 }
@@ -373,6 +570,8 @@ pub fn aliases(canonical: &str) -> &'static [&'static str] {
         CHARACTER_STATE_GET => &["state get", "st get"],
         CHARACTER_STATE_SET => &["state set", "st set"],
         CHARACTER_STATE_REFRESH => &["state refresh", "st refresh"],
+        USER_MERGE => &["u merge"],
+        USER_DELETE => &["u delete"],
         BLACKLIST_LIST => &["bl list"],
         BLACKLIST_ADD => &["bl add"],
         BLACKLIST_REMOVE => &["bl remove"],

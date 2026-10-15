@@ -491,6 +491,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
             repos._pool.clone(),
         ),
         memory_repo: repos.memory_repo.clone(),
+        participant_repo: repos.participant_repo.clone(),
     };
 
     // 启动控制服务（后台任务，监听 data/control.sock）。
@@ -851,9 +852,17 @@ async fn run_switch_character(args: &[String]) -> Result<(), Box<dyn std::error:
         open_cli_storage(&config_dir).await?;
 
     let target_conversation = conversation_repo
-        .find_by_external_id(&external_id)
+        .find_by_external_id_and_type(&external_id, conversation_type)
         .await?
-        .ok_or_else(|| RuntimeError::Config(format!("未找到会话 {external_id}")))?;
+        .ok_or_else(|| {
+            RuntimeError::Config(format!(
+                "未找到{}会话 {external_id}",
+                match conversation_type {
+                    ConversationType::Group => "群",
+                    ConversationType::Private => "私聊",
+                }
+            ))
+        })?;
 
     let target_character = character_repo
         .find_all()

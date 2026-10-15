@@ -20,6 +20,21 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
         .await
         .map_err(|e| StorageError::Migration(format!("migration 001 failed: {e}")))?;
 
+    // 会话外部 ID 按平台类型分命名空间：同一个数字可以同时是私聊用户号和群号。
+    // 旧索引只约束 external_id，会错误阻止这两类会话共存。
+    sqlx::query("DROP INDEX IF EXISTS idx_conversations_external_id")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            StorageError::Migration(format!("conversation identity migration failed: {e}"))
+        })?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_external_type ON conversations(external_id, conversation_type)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("conversation identity index failed: {e}")))?;
+
     // 迁移 003：conversation_bindings 新增 switched_at 列（换角色生效时间）。
     let has_switched_at: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*) FROM pragma_table_info('conversation_bindings')
@@ -551,36 +566,6 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
     .await
     .map_err(|e| StorageError::Migration(format!("stable user metadata backfill failed: {e}")))?;
 
-    // 关系归并索引：稳定用户键在角色范围内只能指向一个关系归属。
-    // participant 仍按会话保存，映射表只负责跨会话关系的唯一归属。
-    sqlx::query(
-        r#"CREATE TABLE IF NOT EXISTS relationship_stable_users (
-            character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
-            stable_user_key TEXT NOT NULL,
-            participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            PRIMARY KEY (character_id, stable_user_key),
-            UNIQUE (character_id, participant_id)
-        )"#,
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| StorageError::Migration(format!("stable relationship table failed: {e}")))?;
-    sqlx::query(
-        r#"INSERT OR IGNORE INTO relationship_stable_users(character_id, stable_user_key, participant_id)
-           SELECT r.character_id,
-                  json_extract(p.metadata, '$.stable_user_key'),
-                  MIN(r.participant_id)
-             FROM relationships r
-             JOIN participants p ON p.id = r.participant_id
-            WHERE p.role = 'user'
-              AND json_extract(p.metadata, '$.stable_user_key') IS NOT NULL
-            GROUP BY r.character_id, json_extract(p.metadata, '$.stable_user_key')"#,
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| StorageError::Migration(format!("stable relationship backfill failed: {e}")))?;
-
     // 迁移 015：持久化每个会话的主动发言日额度，避免进程重启绕过每日上限。
     for (column, definition) in [
         ("proactive_count_date", "TEXT"),
@@ -601,6 +586,254 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
             .map_err(|e| StorageError::Migration(format!("migration 015 {column} failed: {e}")))?;
         }
     }
+
+    // 迁移 016：建立平台级全域用户，并把旧的会话参与者关系归并到 user_id。
+    // 迁移在每次启动时重复探测，所有写入均使用 IF NOT EXISTS / 条件更新，因而可重入。
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(platform, external_id)
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 016 users failed: {e}")))?;
+
+    let has_participant_user_id: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('participants') WHERE name='user_id'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 016 participant probe failed: {e}")))?;
+    if has_participant_user_id == 0 {
+        sqlx::query(
+            "ALTER TABLE participants ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL",
+        )
+        .execute(pool)
+        .await
+        .map_err(|e| StorageError::Migration(format!("migration 016 participant column failed: {e}")))?;
+    }
+
+    // 旧数据没有平台字段时按现有 OneBot 适配器命名空间回填；未来适配器必须显式写入平台。
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO users(platform, external_id)
+           SELECT COALESCE(NULLIF(json_extract(metadata, '$.platform'), ''), 'onebot_qq'),
+                  COALESCE(NULLIF(json_extract(metadata, '$.stable_user_key'), ''), external_id)
+             FROM participants
+            WHERE role='user'"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 016 user backfill failed: {e}")))?;
+    sqlx::query(
+        r#"UPDATE participants
+              SET user_id = (
+                  SELECT u.id FROM users u
+                   WHERE u.platform = COALESCE(NULLIF(json_extract(participants.metadata, '$.platform'), ''), 'onebot_qq')
+                     AND u.external_id = COALESCE(NULLIF(json_extract(participants.metadata, '$.stable_user_key'), ''), participants.external_id)
+              ),
+                  metadata = json_set(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                                      '$.platform', COALESCE(NULLIF(json_extract(metadata, '$.platform'), ''), 'onebot_qq'))
+            WHERE role='user' AND user_id IS NULL"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 016 participant backfill failed: {e}")))?;
+
+    let has_memory_user_id: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='user_id'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 016 memory probe failed: {e}")))?;
+    if has_memory_user_id == 0 {
+        sqlx::query("ALTER TABLE memories ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL")
+            .execute(pool)
+            .await
+            .map_err(|e| StorageError::Migration(format!("migration 016 memory column failed: {e}")))?;
+    }
+    // 候选记忆沿用已有 source_participant_id；无法可靠映射的旧记忆保持 NULL。
+    sqlx::query(
+        r#"UPDATE memories
+              SET user_id = (SELECT p.user_id FROM participants p
+                               WHERE p.id = json_extract(memories.metadata, '$.source_participant_id'))
+            WHERE user_id IS NULL
+              AND json_extract(metadata, '$.source_participant_id') IS NOT NULL"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 016 memory backfill failed: {e}")))?;
+
+    migrate_relationships_to_users(pool).await?;
+    migrate_relationship_interactions_to_users(pool).await?;
+    sqlx::query("DROP TABLE IF EXISTS relationship_stable_users")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            StorageError::Migration(format!("migration 016 legacy mapping cleanup failed: {e}"))
+        })?;
+    Ok(())
+}
+
+/// 将关系交互幂等表从会话参与者归并到全域用户。
+///
+/// 旧表使用 `(character_id, participant_id, source_message_id)`，同一用户
+/// 跨会话时会出现多套幂等记录。新表使用 `(character_id, user_id,
+/// source_message_id)`；重复记录只保留一条，因为它们代表同一个来源消息。
+async fn migrate_relationship_interactions_to_users(pool: &SqlitePool) -> Result<(), StorageError> {
+    let has_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='relationship_interactions'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 017 interaction table probe failed: {e}")))?;
+    if has_table == 0 {
+        return Ok(());
+    }
+
+    let has_user_id: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('relationship_interactions') WHERE name='user_id'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        StorageError::Migration(format!(
+            "migration 017 interaction column probe failed: {e}"
+        ))
+    })?;
+    if has_user_id > 0 {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        StorageError::Migration(format!("migration 017 transaction begin failed: {e}"))
+    })?;
+    sqlx::query(
+        r#"CREATE TABLE relationship_interactions_new (
+            character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            source_message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (character_id, user_id, source_message_id)
+        )"#,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 017 interaction table failed: {e}")))?;
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO relationship_interactions_new
+             (character_id, user_id, source_message_id, created_at)
+           SELECT i.character_id, p.user_id, i.source_message_id, i.created_at
+             FROM relationship_interactions i
+             JOIN participants p ON p.id = i.participant_id
+            WHERE p.user_id IS NOT NULL"#,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        StorageError::Migration(format!("migration 017 interaction backfill failed: {e}"))
+    })?;
+    sqlx::query("DROP TABLE relationship_interactions")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            StorageError::Migration(format!("migration 017 interaction drop failed: {e}"))
+        })?;
+    sqlx::query("ALTER TABLE relationship_interactions_new RENAME TO relationship_interactions")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            StorageError::Migration(format!("migration 017 interaction rename failed: {e}"))
+        })?;
+    tx.commit().await.map_err(|e| {
+        StorageError::Migration(format!("migration 017 transaction commit failed: {e}"))
+    })?;
+    Ok(())
+}
+
+/// 将旧的 Character × Participant 关系表一次性转换为 Character × User。
+/// 合并规则：交互次数求和；熟悉度、好感、信任、尊重、厌烦、亲密取最大值；
+/// 创建时间取最早，最后交互和更新时间取最新。该规则避免丢失最强关系信号，
+/// 同时保留跨会话累积次数；重复运行会检测 user_id 列并直接跳过。
+async fn migrate_relationships_to_users(pool: &SqlitePool) -> Result<(), StorageError> {
+    let has_user_id: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('relationships') WHERE name='user_id'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        StorageError::Migration(format!("migration 016 relationship probe failed: {e}"))
+    })?;
+    if has_user_id > 0 {
+        return Ok(());
+    }
+
+    // 关系表重建包含 DROP/RENAME，必须在同一事务内完成；否则进程在
+    // DROP 后中断会留下无表或半迁移状态，下一次启动无法可靠恢复。
+    let mut tx = pool.begin().await.map_err(|e| {
+        StorageError::Migration(format!("migration 016 transaction begin failed: {e}"))
+    })?;
+
+    sqlx::query(
+        r#"CREATE TABLE relationships_new (
+            character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            familiarity REAL NOT NULL DEFAULT 0.0,
+            affection REAL NOT NULL DEFAULT 0.2,
+            trust REAL NOT NULL DEFAULT 0.1,
+            respect REAL NOT NULL DEFAULT 0.2,
+            annoyance REAL NOT NULL DEFAULT 0.0,
+            intimacy REAL NOT NULL DEFAULT 0.0,
+            interaction_count INTEGER NOT NULL DEFAULT 0,
+            last_interaction TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY(character_id, user_id)
+        )"#,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        StorageError::Migration(format!("migration 016 relationship table failed: {e}"))
+    })?;
+    sqlx::query(
+        r#"INSERT INTO relationships_new
+           (character_id,user_id,familiarity,affection,trust,respect,annoyance,intimacy,
+            interaction_count,last_interaction,created_at,updated_at)
+           SELECT r.character_id, p.user_id,
+                  MAX(r.familiarity), MAX(r.affection), MAX(r.trust), MAX(r.respect),
+                  MAX(r.annoyance), MAX(r.intimacy), SUM(r.interaction_count),
+                  MAX(r.last_interaction), MIN(r.created_at), MAX(r.updated_at)
+             FROM relationships r
+             JOIN participants p ON p.id=r.participant_id
+            WHERE p.user_id IS NOT NULL
+            GROUP BY r.character_id,p.user_id"#,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        StorageError::Migration(format!("migration 016 relationship backfill failed: {e}"))
+    })?;
+    sqlx::query("DROP TABLE relationships")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            StorageError::Migration(format!("migration 016 relationship drop failed: {e}"))
+        })?;
+    sqlx::query("ALTER TABLE relationships_new RENAME TO relationships")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            StorageError::Migration(format!("migration 016 relationship rename failed: {e}"))
+        })?;
+    tx.commit().await.map_err(|e| {
+        StorageError::Migration(format!("migration 016 transaction commit failed: {e}"))
+    })?;
     Ok(())
 }
 
@@ -671,6 +904,7 @@ CREATE TABLE IF NOT EXISTS participants (
     display_name    TEXT NOT NULL,
     role            TEXT NOT NULL CHECK (role IN ('user', 'character', 'system')),
     metadata        TEXT NOT NULL DEFAULT '{}',
+    user_id         INTEGER REFERENCES users(id) ON DELETE SET NULL,
     UNIQUE (conversation_id, external_id)
 );
 
@@ -700,16 +934,17 @@ CREATE TABLE IF NOT EXISTS memories (
     importance      REAL NOT NULL DEFAULT 0.5,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     last_accessed   TEXT NOT NULL DEFAULT (datetime('now')),
-    metadata        TEXT NOT NULL DEFAULT '{}'
+    metadata        TEXT NOT NULL DEFAULT '{}',
+    user_id         INTEGER REFERENCES users(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_character
     ON memories(character_id, memory_type);
 
--- Relationships (Character × Participant)
+-- Relationships (Character × User)
 CREATE TABLE IF NOT EXISTS relationships (
     character_id    INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
-    participant_id  INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     familiarity     REAL NOT NULL DEFAULT 0.0,
     affection       REAL NOT NULL DEFAULT 0.2,
     trust           REAL NOT NULL DEFAULT 0.1,
@@ -720,7 +955,7 @@ CREATE TABLE IF NOT EXISTS relationships (
     last_interaction TEXT NOT NULL DEFAULT (datetime('now')),
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (character_id, participant_id)
+    PRIMARY KEY (character_id, user_id)
 );
 
 -- Mood（Character × Conversation 标量心情，0-100）

@@ -86,11 +86,21 @@ impl MemoryRepository for SqliteMemoryRepository {
         .bind(memory.importance)
         .bind(memory.created_at.to_rfc3339())
         .bind(memory.last_accessed.to_rfc3339())
-        .bind(metadata)
+        .bind(&metadata)
         .bind(&memory.embedding)
         .execute(&mut *tx)
         .await?;
         let id = result.last_insert_rowid();
+        sqlx::query(
+            r#"UPDATE memories
+                  SET user_id = (SELECT p.user_id FROM participants p
+                                   WHERE p.id = json_extract(?, '$.source_participant_id'))
+                WHERE id = ? AND user_id IS NULL"#,
+        )
+        .bind(&metadata)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(Some(id))
     }
@@ -127,8 +137,18 @@ impl MemoryRepository for SqliteMemoryRepository {
                 return Err(RepositoryError::Internal("认知记忆来源范围不一致".into()));
             }
             let kind = memory_type_name(memory.memory_type);
+            let metadata = memory.metadata.to_string();
             sqlx::query("INSERT INTO memories(character_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding) VALUES(?,?,?,?,?,?,?,?,?)")
-            .bind(character_id).bind(conversation_id).bind(kind).bind(&memory.content).bind(memory.importance).bind(memory.created_at.to_rfc3339()).bind(memory.last_accessed.to_rfc3339()).bind(memory.metadata.to_string()).bind(&memory.embedding).execute(&mut *tx).await?;
+            .bind(character_id).bind(conversation_id).bind(kind).bind(&memory.content).bind(memory.importance).bind(memory.created_at.to_rfc3339()).bind(memory.last_accessed.to_rfc3339()).bind(&metadata).bind(&memory.embedding).execute(&mut *tx).await?;
+            sqlx::query(
+                r#"UPDATE memories
+                      SET user_id = (SELECT p.user_id FROM participants p
+                                       WHERE p.id = json_extract(?, '$.source_participant_id'))
+                    WHERE id = last_insert_rowid() AND user_id IS NULL"#,
+            )
+            .bind(&metadata)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(true)
@@ -141,6 +161,32 @@ impl MemoryRepository for SqliteMemoryRepository {
     ) -> Result<Vec<Memory>, RepositoryError> {
         let rows:Vec<MemoryRow>=sqlx::query_as("SELECT id,character_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding FROM memories WHERE character_id=? AND COALESCE(json_extract(metadata,'$.status'),'formal') != 'candidate' AND (conversation_id=? OR json_extract(metadata,'$.shared')=1) ORDER BY importance DESC,created_at DESC,id DESC LIMIT ?")
             .bind(character_id).bind(conversation_id).bind(limit.max(0)).fetch_all(&self.pool).await?;
+        rows.into_iter().map(parse_memory_row).collect()
+    }
+
+    async fn find_visible_for_participant(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        participant_id: i64,
+        limit: i64,
+    ) -> Result<Vec<Memory>, RepositoryError> {
+        let rows: Vec<MemoryRow> = sqlx::query_as(
+            r#"SELECT id,character_id,conversation_id,memory_type,content,importance,
+                      created_at,last_accessed,metadata,embedding
+                 FROM memories
+                WHERE character_id=?
+                  AND COALESCE(json_extract(metadata,'$.status'),'formal') != 'candidate'
+                  AND (conversation_id=? OR json_extract(metadata,'$.shared')=1
+                       OR user_id=(SELECT user_id FROM participants WHERE id=?))
+                ORDER BY importance DESC,created_at DESC,id DESC LIMIT ?"#,
+        )
+        .bind(character_id)
+        .bind(conversation_id)
+        .bind(participant_id)
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter().map(parse_memory_row).collect()
     }
     async fn find_by_id(&self, id: i64) -> Result<Option<Memory>, RepositoryError> {
@@ -276,7 +322,18 @@ impl MemoryRepository for SqliteMemoryRepository {
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        Ok(result.last_insert_rowid())
+        let id = result.last_insert_rowid();
+        sqlx::query(
+            r#"UPDATE memories
+                  SET user_id = (SELECT p.user_id FROM participants p
+                                   WHERE p.id = json_extract(?, '$.source_participant_id'))
+                WHERE id = ? AND user_id IS NULL"#,
+        )
+        .bind(&metadata)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
     }
 
     async fn update(&self, memory: &Memory) -> Result<(), RepositoryError> {

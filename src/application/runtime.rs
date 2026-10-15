@@ -166,14 +166,15 @@ impl CharacterRuntime {
     ) -> Result<(), RuntimeError> {
         let lock = self.character_lock(character_id).await;
         let _guard = lock.lock().await;
+        let normalized_state = state.clone().clamped();
         self.state_repo
-            .upsert(character_id, &state.clone().clamped())
+            .upsert(character_id, &normalized_state)
             .await?;
 
         // 再更新缓存
         let mut cache = self.cache.write().await;
         if let Some(character) = cache.get_mut(&character_id) {
-            character.state = state.clone();
+            character.state = normalized_state;
         }
 
         // 最后发布事件（保持「持久化先于事件」的生命周期顺序）
@@ -515,6 +516,27 @@ mod tests {
             CoreEvent::CharacterStateChanged(e) => assert_eq!(e.character_id, 1),
             other => panic!("期望 CharacterStateChanged，实际 {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn update_state_keeps_persisted_and_cached_values_consistent() {
+        let (runtime, _, state_repo, _) = setup_runtime().await;
+        runtime.load_character(1).await.unwrap();
+
+        let requested = CharacterState {
+            energy: 150.0,
+            stress: -10.0,
+            ..Default::default()
+        };
+        runtime.update_state(1, &requested).await.unwrap();
+
+        let cached = runtime.get_cached(1).await.unwrap().state;
+        let persisted = state_repo.find_by_character_id(1).await.unwrap().unwrap();
+        assert_eq!(cached.energy, persisted.energy);
+        assert_eq!(cached.stress, persisted.stress);
+        assert_eq!(cached.current_activity, persisted.current_activity);
+        assert_eq!(cached.energy, 100.0);
+        assert_eq!(cached.stress, 0.0);
     }
 
     #[tokio::test]

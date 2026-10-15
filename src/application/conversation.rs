@@ -54,17 +54,9 @@ impl ConversationManager {
     ) -> Result<i64, RuntimeError> {
         if let Some(conv) = self
             .conversation_repo
-            .find_by_external_id(external_id)
+            .find_by_external_id_and_type(external_id, conversation_type)
             .await?
         {
-            // 已存在：校验类型是否匹配平台语义（Group/Private）。
-            if conv.conversation_type != conversation_type {
-                return Err(RuntimeError::Domain(
-                    crate::error::DomainError::InvalidState(format!(
-                        "外部会话 {external_id} 已存在但类型不一致"
-                    )),
-                ));
-            }
             return Ok(conv.id);
         }
 
@@ -112,7 +104,7 @@ impl ConversationManager {
             display_name: display_name.to_string(),
             role: ParticipantRole::User,
             metadata: serde_json::json!({
-                "stable_user_key": external_id,
+                "platform": "onebot_qq",
                 "display_name_updated_at": Utc::now(),
             }),
         };

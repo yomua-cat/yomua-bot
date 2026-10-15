@@ -591,6 +591,23 @@ impl MessageRepository for SqliteMessageRepository {
             .get("metadata")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({"author_kind":"user"}));
+        // OneBot 的引用 ID 属于平台命名空间，不能直接当作本地 messages.id。
+        // 只有在同一会话找到对应平台消息时，才写入本地 reply_to 外键；
+        // 找不到时仍保留 metadata 中的平台引用，避免伪造关系或因外键错误丢消息。
+        let reply_to = if let Some(platform_reply_id) = metadata
+            .get("reply_to_platform_message_id")
+            .and_then(|value| value.as_i64())
+        {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM messages WHERE conversation_id = ? AND platform_message_id = ? ORDER BY id LIMIT 1",
+            )
+            .bind(conversation_id)
+            .bind(platform_reply_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            None
+        };
         // 3. 生成 ingested_at（事务内的 authoritative timestamp）
         let ingested_at = chrono::Utc::now();
 
@@ -606,7 +623,7 @@ impl MessageRepository for SqliteMessageRepository {
         .bind(sender_id)
         .bind(content_json)
         .bind(timestamp)
-        .bind(metadata.get("reply_to").and_then(|v| v.as_i64()))
+        .bind(reply_to)
         .bind(
             metadata
                 .get("mentions")

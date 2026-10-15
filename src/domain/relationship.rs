@@ -1,16 +1,17 @@
 //! 关系（Relationship）领域模型。
 //!
-//! 关系是 Character × Participant，不是全局用户属性。
+//! 关系持久化在 Character × User 维度；Participant 只作为消息作者到用户的会话映射。
 //! 同一个用户面对不同 Character 可以拥有完全不同的关系。
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Character 与 Participant 之间的关系。
+/// Character 与全域用户之间的关系。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Relationship {
     pub character_id: i64,
-    pub participant_id: i64,
+    /// 全域用户 ID。它不是会话内 participant ID。
+    pub user_id: i64,
 
     /// 熟悉程度（0.0 - 1.0）。
     pub familiarity: f64,
@@ -42,11 +43,11 @@ pub struct Relationship {
 
 impl Relationship {
     /// 以默认（陌生人）值创建一个新关系。
-    pub fn new(character_id: i64, participant_id: i64) -> Self {
+    pub fn new(character_id: i64, user_id: i64) -> Self {
         let now = Utc::now();
         Self {
             character_id,
-            participant_id,
+            user_id,
             familiarity: 0.0,
             affection: 0.2,
             trust: 0.1,

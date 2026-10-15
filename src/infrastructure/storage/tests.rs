@@ -129,6 +129,133 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn test_allocate_sequence_uses_sqlite_atomic_update() {
+        let storage = setup_storage().await;
+        let repo = crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+            storage.pool().clone(),
+        );
+        let conversation_id = repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Group,
+                external_id: "sequence-test".into(),
+                name: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(repo.allocate_sequence(conversation_id).await.unwrap(), 1);
+        assert_eq!(repo.allocate_sequence(conversation_id).await.unwrap(), 2);
+        let error = repo.allocate_sequence(i64::MAX).await.unwrap_err();
+        assert!(matches!(error, crate::error::RepositoryError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_platform_reply_id_resolves_to_local_reply_foreign_key() {
+        let storage = setup_storage().await;
+        let conversation_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let message_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let character_id: i64 =
+            sqlx::query_scalar("INSERT INTO characters(name) VALUES('引用测试角色') RETURNING id")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let conversation_id = conversation_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Group,
+                external_id: "reply-reference-test".into(),
+                name: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let sender_id: i64 = sqlx::query_scalar(
+            "INSERT INTO participants(conversation_id,external_id,display_name,role,metadata) VALUES(?,?,?,?,?) RETURNING id",
+        )
+        .bind(conversation_id)
+        .bind("reply-user")
+        .bind("引用用户")
+        .bind("user")
+        .bind("{}")
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+
+        let timestamp = chrono::Utc::now();
+        let parent = message_repo
+            .accept_message(&AcceptedMessageInput {
+                conversation_id,
+                sender_id,
+                content_json: serde_json::json!({"Text":"原消息"}).to_string(),
+                timestamp: timestamp.to_rfc3339(),
+                platform_message_id: Some(701),
+                character_id,
+                event_uuid: "reply-parent".into(),
+                outbox_payload: serde_json::json!({
+                    "event_uuid":"reply-parent",
+                    "conversation_id":conversation_id,
+                    "sender_id":sender_id,
+                    "content":"原消息",
+                    "timestamp":timestamp,
+                    "character_id":character_id,
+                    "metadata":{"author_kind":"user"}
+                })
+                .to_string(),
+            })
+            .await
+            .unwrap();
+        let child = message_repo
+            .accept_message(&AcceptedMessageInput {
+                conversation_id,
+                sender_id,
+                content_json: serde_json::json!({"Text":"回复原消息"}).to_string(),
+                timestamp: (timestamp + chrono::Duration::seconds(1)).to_rfc3339(),
+                platform_message_id: Some(702),
+                character_id,
+                event_uuid: "reply-child".into(),
+                outbox_payload: serde_json::json!({
+                    "event_uuid":"reply-child",
+                    "conversation_id":conversation_id,
+                    "sender_id":sender_id,
+                    "content":"回复原消息",
+                    "timestamp":timestamp,
+                    "character_id":character_id,
+                    "metadata":{"author_kind":"user","reply_to_platform_message_id":701}
+                })
+                .to_string(),
+            })
+            .await
+            .unwrap();
+
+        let local_reply_to: Option<i64> =
+            sqlx::query_scalar("SELECT reply_to FROM messages WHERE id=?")
+                .bind(child.0)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(local_reply_to, Some(parent.0));
+        let metadata: String = sqlx::query_scalar("SELECT metadata FROM messages WHERE id=?")
+            .bind(child.0)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&metadata).unwrap()
+                ["reply_to_platform_message_id"],
+            701
+        );
+    }
+
+    #[tokio::test]
     async fn test_accept_message_is_idempotent_by_platform_identity() {
         let storage = setup_storage().await;
         let conv_repo =
@@ -698,6 +825,115 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn memory_visibility_follows_global_user_across_conversations() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let conv_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let part_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+        let memory_repo = crate::infrastructure::storage::repository::SqliteMemoryRepository::new(
+            storage.pool().clone(),
+        );
+        let character_id = char_repo
+            .insert(&Character {
+                id: 0,
+                definition: CharacterDefinition {
+                    name: "跨会话记忆".into(),
+                    description: None,
+                    personality: None,
+                    scenario: None,
+                    style: None,
+                    background: None,
+                    greetings: vec![],
+                    example_messages: vec![],
+                    system_prompt: None,
+                    post_history_instructions: None,
+                    lorebook: vec![],
+                    metadata: serde_json::json!({}),
+                },
+                enabled: true,
+                state: CharacterState::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let conversation_a = conv_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Group,
+                external_id: "memory-a".into(),
+                name: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let conversation_b = conv_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Group,
+                external_id: "memory-b".into(),
+                name: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let participant_a = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id: conversation_a,
+                external_id: "800001".into(),
+                display_name: "小明".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform":"onebot_qq"}),
+            })
+            .await
+            .unwrap();
+        let participant_b = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id: conversation_b,
+                external_id: "800001".into(),
+                display_name: "小明（群B）".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform":"onebot_qq"}),
+            })
+            .await
+            .unwrap();
+        let mut memory = Memory::new(
+            character_id,
+            Some(conversation_a),
+            MemoryType::Semantic,
+            "小明喜欢猫".into(),
+            0.9,
+        );
+        memory.metadata = serde_json::json!({"source_participant_id": participant_a});
+        memory_repo.insert(&memory).await.unwrap();
+
+        let visible = memory_repo
+            .find_visible_for_participant(character_id, conversation_b, participant_b, 10)
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].content, "小明喜欢猫");
+        let stored_user_id: Option<i64> =
+            sqlx::query_scalar("SELECT user_id FROM memories WHERE content='小明喜欢猫'")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert!(stored_user_id.is_some());
+    }
+
+    #[tokio::test]
     async fn test_candidate_memory_is_idempotent_and_hidden_from_normal_reads() {
         let storage = setup_storage().await;
         let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
@@ -779,6 +1015,101 @@ mod storage_tests {
                 .is_empty(),
             "候选记忆不得进入普通读取路径"
         );
+    }
+
+    #[tokio::test]
+    async fn relationship_interactions_are_idempotent_across_sessions_for_one_user() {
+        let storage = setup_storage().await;
+        let char_id: i64 =
+            sqlx::query_scalar("INSERT INTO characters(name) VALUES('跨会话关系') RETURNING id")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let conv_a: i64 = sqlx::query_scalar("INSERT INTO conversations(conversation_type,external_id) VALUES('group','interaction-a') RETURNING id")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        let conv_b: i64 = sqlx::query_scalar("INSERT INTO conversations(conversation_type,external_id) VALUES('group','interaction-b') RETURNING id")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        let part_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+        let rel_repo =
+            crate::infrastructure::storage::repository::SqliteRelationshipRepository::new(
+                storage.pool().clone(),
+            );
+        let msg_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let user_a = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id: conv_a,
+                external_id: "interaction-user".into(),
+                display_name: "用户 A".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform":"onebot_qq"}),
+            })
+            .await
+            .unwrap();
+        let user_b = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id: conv_b,
+                external_id: "interaction-user".into(),
+                display_name: "用户 B".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform":"onebot_qq"}),
+            })
+            .await
+            .unwrap();
+        let message_a = msg_repo
+            .insert(&make_test_message(
+                conv_a,
+                user_a,
+                MessageContent::Text("第一条".into()),
+                chrono::Utc::now(),
+                Some(char_id),
+            ))
+            .await
+            .unwrap();
+        let message_b = msg_repo
+            .insert(&make_test_message(
+                conv_b,
+                user_b,
+                MessageContent::Text("第二条".into()),
+                chrono::Utc::now(),
+                Some(char_id),
+            ))
+            .await
+            .unwrap();
+
+        assert!(rel_repo
+            .record_interaction_once(char_id, user_a, message_a)
+            .await
+            .unwrap());
+        assert!(rel_repo
+            .record_interaction_once(char_id, user_b, message_b)
+            .await
+            .unwrap());
+        assert!(!rel_repo
+            .record_interaction_once(char_id, user_b, message_b)
+            .await
+            .unwrap());
+
+        let relationship = rel_repo.find(char_id, user_b).await.unwrap().unwrap();
+        assert_eq!(relationship.interaction_count, 2);
+        let interaction_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM relationship_interactions WHERE character_id=?",
+        )
+        .bind(char_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(interaction_rows, 2);
     }
 
     #[tokio::test]
@@ -1097,7 +1428,7 @@ mod storage_tests {
             .await
             .unwrap();
         rel_repo
-            .upsert(&Relationship::new(character_id, participant_a))
+            .create_for_participant(character_id, participant_a)
             .await
             .unwrap();
         let conversation_b = conv_repo
@@ -1127,7 +1458,13 @@ mod storage_tests {
             .await
             .unwrap()
             .expect("同一平台用户应找到跨会话关系");
-        assert_eq!(found.participant_id, participant_a);
+        let expected_user_id: i64 =
+            sqlx::query_scalar("SELECT user_id FROM participants WHERE id=?")
+                .bind(participant_a)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(found.user_id, expected_user_id);
         assert_ne!(participant_a, participant_b);
 
         // 首次通过稳定键归并时，即使当前会话的 participant 不同，也必须复用已有关系归属。
@@ -1136,6 +1473,401 @@ mod storage_tests {
             .await
             .unwrap();
         assert_eq!(canonical, participant_a);
+
+        let user_ids: Vec<i64> =
+            sqlx::query_scalar("SELECT user_id FROM participants WHERE id IN (?, ?) ORDER BY id")
+                .bind(participant_a)
+                .bind(participant_b)
+                .fetch_all(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(user_ids.len(), 2);
+        assert_eq!(user_ids[0], user_ids[1]);
+        let user_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE platform='onebot_qq' AND external_id='900001'",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(user_count, 1);
+    }
+
+    #[tokio::test]
+    async fn global_user_identity_is_namespaced_by_platform() {
+        let storage = setup_storage().await;
+        let part_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+
+        let qq_user = part_repo
+            .ensure_user("onebot_qq", "same-external-id")
+            .await
+            .unwrap()
+            .expect("QQ 用户应创建全域身份");
+        let other_platform_user = part_repo
+            .ensure_user("other_platform", "same-external-id")
+            .await
+            .unwrap()
+            .expect("其他平台用户应创建独立全域身份");
+
+        assert_ne!(qq_user, other_platform_user);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE external_id='same-external-id'")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn migration_merges_legacy_relationships_by_global_user() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let part_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+        let character_id = char_repo
+            .insert(&Character {
+                id: 0,
+                definition: CharacterDefinition {
+                    name: "迁移角色".into(),
+                    description: None,
+                    personality: None,
+                    scenario: None,
+                    style: None,
+                    background: None,
+                    greetings: vec![],
+                    example_messages: vec![],
+                    system_prompt: None,
+                    post_history_instructions: None,
+                    lorebook: vec![],
+                    metadata: serde_json::json!({}),
+                },
+                enabled: true,
+                state: CharacterState::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let conversation_a: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type,external_id) VALUES('group','legacy-a') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let conversation_b: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type,external_id) VALUES('group','legacy-b') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let participant_a = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id: conversation_a,
+                external_id: "700001".into(),
+                display_name: "旧用户 A".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"stable_user_key":"700001"}),
+            })
+            .await
+            .unwrap();
+        let participant_b = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id: conversation_b,
+                external_id: "700001".into(),
+                display_name: "旧用户 B".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"stable_user_key":"700001"}),
+            })
+            .await
+            .unwrap();
+
+        // 模拟旧库：参与者没有 user_id，只有历史 stable_user_key 元数据。
+        sqlx::query("UPDATE participants SET user_id=NULL, metadata=? WHERE id IN (?, ?)")
+            .bind(serde_json::json!({"stable_user_key":"700001"}).to_string())
+            .bind(participant_a)
+            .bind(participant_b)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+
+        sqlx::query("DROP TABLE relationships")
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"CREATE TABLE relationships (
+                character_id INTEGER NOT NULL,
+                participant_id INTEGER NOT NULL,
+                familiarity REAL NOT NULL,
+                affection REAL NOT NULL,
+                trust REAL NOT NULL,
+                respect REAL NOT NULL,
+                annoyance REAL NOT NULL,
+                intimacy REAL NOT NULL,
+                interaction_count INTEGER NOT NULL,
+                last_interaction TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(character_id,participant_id)
+            )"#,
+        )
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        for (participant_id, familiarity, count, updated) in [
+            (participant_a, 0.3, 2_i64, "2026-01-01T00:00:00Z"),
+            (participant_b, 0.8, 5_i64, "2026-02-01T00:00:00Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO relationships(character_id,participant_id,familiarity,affection,trust,respect,annoyance,intimacy,interaction_count,last_interaction,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            )
+            .bind(character_id)
+            .bind(participant_id)
+            .bind(familiarity)
+            .bind(0.2_f64)
+            .bind(0.1_f64)
+            .bind(0.2_f64)
+            .bind(0.0_f64)
+            .bind(0.0_f64)
+            .bind(count)
+            .bind(updated)
+            .bind("2025-01-01T00:00:00Z")
+            .bind(updated)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        }
+        storage.migrate().await.unwrap();
+        storage.migrate().await.unwrap();
+        let row: (i64, f64, i64) = sqlx::query_as(
+            "SELECT user_id,familiarity,interaction_count FROM relationships WHERE character_id=?",
+        )
+        .bind(character_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            row.0,
+            sqlx::query_scalar::<_, i64>("SELECT user_id FROM participants WHERE id=?")
+                .bind(participant_a)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap()
+        );
+        assert_eq!(row.1, 0.8);
+        assert_eq!(row.2, 7);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relationships WHERE character_id=?")
+                .bind(character_id)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn migration_merges_legacy_relationship_interactions_by_global_user() {
+        let storage = setup_storage().await;
+        let char_id: i64 =
+            sqlx::query_scalar("INSERT INTO characters(name) VALUES('交互迁移') RETURNING id")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let conv_a: i64 = sqlx::query_scalar("INSERT INTO conversations(conversation_type,external_id) VALUES('group','legacy-interaction-a') RETURNING id")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        let conv_b: i64 = sqlx::query_scalar("INSERT INTO conversations(conversation_type,external_id) VALUES('group','legacy-interaction-b') RETURNING id")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        let part_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+        let part_a = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id: conv_a,
+                external_id: "legacy-interaction-user".into(),
+                display_name: "旧 A".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform":"onebot_qq"}),
+            })
+            .await
+            .unwrap();
+        let part_b = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id: conv_b,
+                external_id: "legacy-interaction-user".into(),
+                display_name: "旧 B".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform":"onebot_qq"}),
+            })
+            .await
+            .unwrap();
+        let message_id: i64 = sqlx::query_scalar("INSERT INTO messages(conversation_id,sender_id,content,timestamp,active_character_id) VALUES(?,?,?,?,?) RETURNING id")
+            .bind(conv_a)
+            .bind(part_a)
+            .bind("迁移来源")
+            .bind("2026-01-01T00:00:00Z")
+            .bind(char_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+
+        sqlx::query("DROP TABLE relationship_interactions")
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"CREATE TABLE relationship_interactions (
+                character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+                participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+                source_message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY(character_id, participant_id, source_message_id)
+            )"#,
+        )
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        for participant_id in [part_a, part_b] {
+            sqlx::query("INSERT INTO relationship_interactions(character_id,participant_id,source_message_id) VALUES(?,?,?)")
+                .bind(char_id)
+                .bind(participant_id)
+                .bind(message_id)
+                .execute(storage.pool())
+                .await
+                .unwrap();
+        }
+
+        storage.migrate().await.unwrap();
+        storage.migrate().await.unwrap();
+        let has_user_id: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('relationship_interactions') WHERE name='user_id'")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(has_user_id, 1);
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM relationship_interactions WHERE character_id=?",
+        )
+        .bind(char_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(rows, 1);
+        let user_id: i64 = sqlx::query_scalar(
+            "SELECT user_id FROM relationship_interactions WHERE character_id=?",
+        )
+        .bind(char_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let expected_user_id: i64 =
+            sqlx::query_scalar("SELECT user_id FROM participants WHERE id=?")
+                .bind(part_b)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(user_id, expected_user_id);
+    }
+
+    #[tokio::test]
+    async fn merge_users_moves_data_and_removes_source_identity() {
+        let storage = setup_storage().await;
+        let part_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+        let character_id: i64 =
+            sqlx::query_scalar("INSERT INTO characters(name) VALUES('合并测试角色') RETURNING id")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type,external_id) VALUES('group','merge-test') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let source = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id,
+                external_id: "910001".into(),
+                display_name: "旧号".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let target = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id,
+                external_id: "910002".into(),
+                display_name: "新号".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let source_user: i64 = sqlx::query_scalar("SELECT user_id FROM participants WHERE id=?")
+            .bind(source)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        let target_user: i64 = sqlx::query_scalar("SELECT user_id FROM participants WHERE id=?")
+            .bind(target)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        for (user_id, count) in [(source_user, 2_i64), (target_user, 5_i64)] {
+            sqlx::query(
+                "INSERT INTO relationships(character_id,user_id,interaction_count) VALUES(?,?,?)",
+            )
+            .bind(character_id)
+            .bind(user_id)
+            .bind(count)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        }
+        part_repo
+            .merge_users(source_user, target_user)
+            .await
+            .unwrap();
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id=?")
+            .bind(source_user)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+        let merged_count: i64 = sqlx::query_scalar(
+            "SELECT interaction_count FROM relationships WHERE character_id=? AND user_id=?",
+        )
+        .bind(character_id)
+        .bind(target_user)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(merged_count, 7);
+        let source_binding: i64 = sqlx::query_scalar("SELECT user_id FROM participants WHERE id=?")
+            .bind(source)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(source_binding, target_user);
     }
 
     #[tokio::test]

@@ -46,6 +46,8 @@ pub struct InboundMessage {
     pub unix_time: i64,
     /// 消息中是否包含「at」段（即 @ 了某个对象，很可能是角色）。
     pub is_mentioned: bool,
+    /// 事件发送者是否就是本次连接对应的机器人账号。
+    pub is_self_echo: bool,
     pub mention_targets: Vec<i64>,
     pub reply_to: Option<i64>,
     /// 非文本段的结构化摘要；不代表模型已经理解了媒体内容。
@@ -142,6 +144,7 @@ pub fn onebot_event_to_inbound(event: &OneBotEvent) -> Result<InboundMessage, Ru
         content,
         unix_time: event.time,
         is_mentioned,
+        is_self_echo: sender_id == event.self_id,
         mention_targets,
         reply_to,
         content_metadata,
@@ -378,6 +381,7 @@ mod tests {
         assert_eq!(inbound.platform_message_id, 1001);
         assert_eq!(inbound.content, "你好，世界！");
         assert_eq!(inbound.unix_time, 1690000000);
+        assert!(!inbound.is_self_echo);
     }
 
     #[test]
@@ -425,6 +429,25 @@ mod tests {
             inbound.content_metadata["segments"][0]["data"]["file"],
             "photo.jpg"
         );
+    }
+
+    #[test]
+    fn event_self_id_marks_platform_echo() {
+        let event = OneBotEvent {
+            post_type: "message".to_string(),
+            time: 100,
+            self_id: 123456,
+            data: json!({
+                "message_type": "private",
+                "message_id": 9,
+                "user_id": 123456,
+                "message": "机器人刚刚发送的内容",
+                "sender": {"user_id": 123456, "nickname": "角色"}
+            }),
+        };
+
+        let inbound = onebot_event_to_inbound(&event).unwrap();
+        assert!(inbound.is_self_echo);
     }
 
     #[test]

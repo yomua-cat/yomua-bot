@@ -203,14 +203,24 @@ impl ContextBuilder {
         let memory = {
             let by_importance = self
                 .memory_repo
-                .find_visible(character.id, conversation_id, limits.memory_limit as i64)
+                .find_visible_for_participant(
+                    character.id,
+                    conversation_id,
+                    participant_id,
+                    limits.memory_limit as i64,
+                )
                 .await?;
             let keywords = extract_keywords(&recent_messages_text(&recent_messages));
             let by_keyword = if keywords.is_empty() {
                 Vec::new()
             } else {
                 self.memory_repo
-                    .find_visible(character.id, conversation_id, limits.memory_limit as i64)
+                    .find_visible_for_participant(
+                        character.id,
+                        conversation_id,
+                        participant_id,
+                        limits.memory_limit as i64,
+                    )
                     .await?
                     .into_iter()
                     .filter(|m| keywords.iter().any(|k| m.content.contains(k)))
@@ -547,7 +557,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|r| r.character_id == character_id && r.participant_id == participant_id)
+                .find(|r| r.character_id == character_id && r.user_id == participant_id)
                 .cloned())
         }
         async fn find_by_character_id(
@@ -821,7 +831,7 @@ mod tests {
         };
         let rel = Relationship {
             character_id: 1,
-            participant_id: 99,
+            user_id: 99,
             familiarity: 0.5,
             affection: 0.6,
             trust: 0.4,

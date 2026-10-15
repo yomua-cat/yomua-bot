@@ -6,7 +6,7 @@ use crate::domain::relationship::*;
 fn new_relationship_defaults() {
     let rel = Relationship::new(1, 2);
     assert_eq!(rel.character_id, 1);
-    assert_eq!(rel.participant_id, 2);
+    assert_eq!(rel.user_id, 2);
     assert_eq!(rel.familiarity, 0.0);
     assert_eq!(rel.affection, 0.2);
     assert_eq!(rel.trust, 0.1);
@@ -47,5 +47,5 @@ fn relationship_serialization_roundtrip() {
     let json = serde_json::to_string(&rel).unwrap();
     let deserialized: Relationship = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.character_id, 1);
-    assert_eq!(deserialized.participant_id, 2);
+    assert_eq!(deserialized.user_id, 2);
 }

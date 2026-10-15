@@ -24,20 +24,11 @@ use rustyline::validate::Validator;
 use rustyline::{Context, Editor, Helper};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
+use yomua_bot::application::control_schema::ControlOperation;
 
 // ============================================================================
 // Section 1: Command Specification & Registry
 // ============================================================================
-
-/// 命令路径（如 `["character", "show"]`）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommandPath(Vec<&'static str>);
-
-impl CommandPath {
-    fn matches(&self, input: &[&str]) -> bool {
-        self.0.len() == input.len() && self.0.iter().zip(input.iter()).all(|(a, b)| *a == *b)
-    }
-}
 
 /// 命令选项的枚举形式，支持所有命令的选项联合。
 #[derive(Debug, Clone, Default)]
@@ -78,160 +69,11 @@ impl CommandOptions {
     }
 }
 
-/// 内置命令定义。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuiltinCommand {
-    Status,
-    ReloadConfig,
-    Shutdown,
-    Help,
-    CharacterList,
-    CharacterShow,
-    CharacterCardList,
-    CharacterCardEnable,
-    CharacterCardDisable,
-    CharacterCardReassign,
-    ConversationList,
-    SessionDeleteAll,
-    SessionDeleteCharacter,
-    CharacterStateGet,
-    CharacterStateSet,
-    CharacterStateRefresh,
-    StateGet,
-    StateSet,
-    StateRefresh,
-    BlacklistList,
-    BlacklistAdd,
-    BlacklistRemove,
-    BlacklistBan,
-    MemoryList,
-    MemoryDelete,
-    MemoryUpdate,
-    ReplyUnknownList,
-    ReplyUnknownCheck,
-    ReplyUnknownRetry,
-}
+type BuiltinCommand = yomua_bot::application::control_schema::ControlOperation;
 
-impl BuiltinCommand {
-    fn operation(self) -> yomua_bot::application::control_schema::ControlOperation {
-        use yomua_bot::application::control_schema::ControlOperation as Op;
-        match self {
-            Self::Status => Op::Status,
-            Self::ReloadConfig => Op::ReloadConfig,
-            Self::Shutdown => Op::Shutdown,
-            Self::Help => Op::Help,
-            Self::CharacterList => Op::CharacterList,
-            Self::CharacterShow => Op::CharacterShow,
-            Self::CharacterCardList => Op::CharacterCardList,
-            Self::CharacterCardEnable => Op::CharacterCardEnable,
-            Self::CharacterCardDisable => Op::CharacterCardDisable,
-            Self::CharacterCardReassign => Op::CharacterCardReassign,
-            Self::ConversationList => Op::ConversationList,
-            Self::SessionDeleteAll => Op::SessionDeleteAll,
-            Self::SessionDeleteCharacter => Op::SessionDeleteCharacter,
-            Self::CharacterStateGet | Self::StateGet => Op::CharacterStateGet,
-            Self::CharacterStateSet | Self::StateSet => Op::CharacterStateSet,
-            Self::CharacterStateRefresh | Self::StateRefresh => Op::CharacterStateRefresh,
-            Self::BlacklistList => Op::BlacklistList,
-            Self::BlacklistAdd => Op::BlacklistAdd,
-            Self::BlacklistRemove => Op::BlacklistRemove,
-            Self::BlacklistBan => Op::BlacklistBan,
-            Self::MemoryList => Op::MemoryList,
-            Self::MemoryDelete => Op::MemoryDelete,
-            Self::MemoryUpdate => Op::MemoryUpdate,
-            Self::ReplyUnknownList => Op::ReplyUnknownList,
-            Self::ReplyUnknownCheck => Op::ReplyUnknownCheck,
-            Self::ReplyUnknownRetry => Op::ReplyUnknownRetry,
-        }
-    }
-
-    fn canonical_name(&self) -> &'static str {
-        use yomua_bot::application::control_schema as schema;
-        match self {
-            Self::Status => schema::STATUS,
-            Self::ReloadConfig => schema::RELOAD_CONFIG,
-            Self::Shutdown => schema::SHUTDOWN,
-            Self::Help => schema::HELP,
-            Self::CharacterList => schema::CHARACTER_LIST,
-            Self::CharacterShow => schema::CHARACTER_SHOW,
-            Self::CharacterCardList => schema::CHARACTER_CARD_LIST,
-            Self::CharacterCardEnable => schema::CHARACTER_CARD_ENABLE,
-            Self::CharacterCardDisable => schema::CHARACTER_CARD_DISABLE,
-            Self::CharacterCardReassign => schema::CHARACTER_CARD_REASSIGN,
-            Self::ConversationList => schema::CONVERSATION_LIST,
-            Self::SessionDeleteAll => schema::SESSION_DELETE_ALL,
-            Self::SessionDeleteCharacter => schema::SESSION_DELETE_CHARACTER,
-            Self::CharacterStateGet | Self::StateGet => schema::CHARACTER_STATE_GET,
-            Self::CharacterStateSet | Self::StateSet => schema::CHARACTER_STATE_SET,
-            Self::CharacterStateRefresh | Self::StateRefresh => schema::CHARACTER_STATE_REFRESH,
-            Self::BlacklistList => schema::BLACKLIST_LIST,
-            Self::BlacklistAdd => schema::BLACKLIST_ADD,
-            Self::BlacklistRemove => schema::BLACKLIST_REMOVE,
-            Self::BlacklistBan => schema::BLACKLIST_BAN,
-            Self::MemoryList => schema::MEMORY_LIST,
-            Self::MemoryDelete => schema::MEMORY_DELETE,
-            Self::MemoryUpdate => schema::MEMORY_UPDATE,
-            Self::ReplyUnknownList => schema::REPLY_UNKNOWN_LIST,
-            Self::ReplyUnknownCheck => schema::REPLY_UNKNOWN_CHECK,
-            Self::ReplyUnknownRetry => schema::REPLY_UNKNOWN_RETRY,
-        }
-    }
-
-    fn path(&self) -> CommandPath {
-        CommandPath(self.canonical_name().split(' ').collect())
-    }
-
-    fn from_path(path: &[String]) -> Option<Self> {
-        let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
-        let explicit = Self::all()
-            .find(|c| c.path().matches(path_refs.as_slice()))
-            .or(match path_refs.as_slice() {
-                ["session", "list"] => Some(Self::ConversationList),
-                ["state", "get"] => Some(Self::StateGet),
-                ["state", "set"] => Some(Self::StateSet),
-                ["state", "refresh"] => Some(Self::StateRefresh),
-                _ => None,
-            });
-        if explicit.is_some() {
-            return explicit;
-        }
-
-        let input = path.join(" ");
-        let canonical = yomua_bot::application::control_schema::canonicalize(&input)?;
-        Self::all().find(|command| command.canonical_name() == canonical)
-    }
-
-    fn all() -> impl Iterator<Item = Self> {
-        [
-            Self::Status,
-            Self::ReloadConfig,
-            Self::Shutdown,
-            Self::Help,
-            Self::CharacterList,
-            Self::CharacterShow,
-            Self::CharacterCardList,
-            Self::CharacterCardEnable,
-            Self::CharacterCardDisable,
-            Self::CharacterCardReassign,
-            Self::ConversationList,
-            Self::SessionDeleteAll,
-            Self::SessionDeleteCharacter,
-            Self::CharacterStateGet,
-            Self::CharacterStateSet,
-            Self::CharacterStateRefresh,
-            Self::BlacklistList,
-            Self::BlacklistAdd,
-            Self::BlacklistRemove,
-            Self::BlacklistBan,
-            Self::MemoryList,
-            Self::MemoryDelete,
-            Self::MemoryUpdate,
-            Self::ReplyUnknownList,
-            Self::ReplyUnknownCheck,
-            Self::ReplyUnknownRetry,
-        ]
-        .into_iter()
-    }
+fn command_from_path(path: &[String]) -> Option<BuiltinCommand> {
+    let canonical = yomua_bot::application::control_schema::canonicalize(&path.join(" "))?;
+    ControlOperation::from_canonical_name(canonical)
 }
 
 // ============================================================================
@@ -266,7 +108,7 @@ impl ParsedCommand {
                     .iter()
                     .map(|token| (*token).to_string())
                     .collect::<Vec<_>>();
-                BuiltinCommand::from_path(&candidate).is_some()
+                command_from_path(&candidate).is_some()
             })
             .ok_or_else(|| format!("未知命令: {}", tokens[..option_start].join(" ")))?;
 
@@ -797,6 +639,19 @@ impl OutputFormatter {
             return;
         }
 
+        // user merge / delete result
+        if let (Some(merged), Some(removed)) = (
+            obj.get("merged_user_id").and_then(|v| v.as_i64()),
+            obj.get("removed_user_id").and_then(|v| v.as_i64()),
+        ) {
+            println!("已合并用户：{} -> {}", removed, merged);
+            return;
+        }
+        if let Some(deleted) = obj.get("deleted_user_id").and_then(|v| v.as_i64()) {
+            println!("已删除用户：{}", deleted);
+            return;
+        }
+
         // memory list
         if let Some(arr) = obj.get("memories").and_then(|v| v.as_array()) {
             println!("记忆列表（共 {} 条）", arr.len());
@@ -994,7 +849,7 @@ fn build_envelope(
     if opts.confirm {
         request_params.insert("confirm".to_string(), serde_json::Value::Bool(true));
     }
-    let operation = builtin.operation();
+    let operation = builtin;
     Ok(
         yomua_bot::application::control_schema::ControlEnvelope::new(
             id,
@@ -1015,19 +870,57 @@ fn build_request(
     // 这里只整理参数；bot 只接收 build_envelope 生成的结构化请求。
     use serde_json::json;
 
-    validate_positional_args(builtin, args)?;
+    let spec = yomua_bot::application::control_schema::specs()
+        .iter()
+        .find(|spec| spec.name == builtin.canonical_name())
+        .expect("内置命令必须有 schema 定义");
+    if args.len() < spec.positional_min as usize || args.len() > spec.positional_max as usize {
+        return Err(format!(
+            "位置参数数量不符：命令 {} 需要 {}-{} 个",
+            builtin.canonical_name(),
+            spec.positional_min,
+            spec.positional_max
+        ));
+    }
+    for (present, flag) in [
+        (opts.id.is_some(), "id"),
+        (opts.limit.is_some(), "limit"),
+        (opts.offset.is_some(), "offset"),
+        (opts.character_id.is_some(), "character"),
+        (opts.conversation_id.is_some(), "conversation"),
+        (opts.memory_type.is_some(), "type"),
+        (opts.memory_id.is_some(), "memory-id"),
+        (opts.memory_instruction.is_some(), "instruction"),
+        (opts.qq_id.is_some(), "qq-id"),
+        (opts.duration.is_some(), "duration"),
+        (opts.reason.is_some(), "reason"),
+        (opts.mood.is_some(), "mood"),
+        (opts.energy.is_some(), "energy"),
+        (opts.stress.is_some(), "stress"),
+        (opts.activity.is_some(), "activity"),
+    ] {
+        if present && !spec.allowed_options.contains(&flag) {
+            return Err(format!(
+                "选项 --{flag} 不适用于命令 {}",
+                builtin.canonical_name()
+            ));
+        }
+    }
+    if opts.raw && !spec.supports_raw {
+        return Err(format!("--raw 不适用于命令 {}", builtin.canonical_name()));
+    }
 
     // Extract positional args into opts for commands that need them
     let mut opts = opts.clone();
     match builtin {
-        BuiltinCommand::CharacterShow
-        | BuiltinCommand::CharacterCardEnable
-        | BuiltinCommand::CharacterCardDisable
-        | BuiltinCommand::CharacterStateGet
-        | BuiltinCommand::CharacterStateSet => {
+        ControlOperation::CharacterShow
+        | ControlOperation::CharacterCardEnable
+        | ControlOperation::CharacterCardDisable
+        | ControlOperation::CharacterStateGet
+        | ControlOperation::CharacterStateSet => {
             if let Some(arg) = args.first() {
                 if let Ok(v) = arg.parse() {
-                    if matches!(builtin, BuiltinCommand::CharacterStateSet) {
+                    if matches!(builtin, ControlOperation::CharacterStateSet) {
                         opts.character_id = Some(v);
                     } else {
                         opts.id = Some(v);
@@ -1035,42 +928,35 @@ fn build_request(
                 }
             }
         }
-        BuiltinCommand::StateGet => {
-            if let Some(arg) = args.first() {
-                if let Ok(v) = arg.parse() {
-                    opts.character_id = Some(v);
-                }
-            }
-        }
-        BuiltinCommand::BlacklistAdd
-        | BuiltinCommand::BlacklistRemove
-        | BuiltinCommand::BlacklistBan => {
+        ControlOperation::BlacklistAdd
+        | ControlOperation::BlacklistRemove
+        | ControlOperation::BlacklistBan => {
             if let Some(arg) = args.first() {
                 opts.qq_id = Some(arg.clone());
             }
         }
-        BuiltinCommand::MemoryDelete => {
+        ControlOperation::MemoryDelete => {
             if let Some(arg) = args.first() {
                 if let Ok(v) = arg.parse() {
                     opts.memory_id = Some(v);
                 }
             }
         }
-        BuiltinCommand::MemoryUpdate => {
+        ControlOperation::MemoryUpdate => {
             if let Some(arg) = args.first() {
                 if let Ok(v) = arg.parse() {
                     opts.memory_id = Some(v);
                 }
             }
         }
-        BuiltinCommand::ReplyUnknownCheck | BuiltinCommand::ReplyUnknownRetry => {
+        ControlOperation::ReplyUnknownCheck | ControlOperation::ReplyUnknownRetry => {
             if let Some(arg) = args.first() {
                 if let Ok(v) = arg.parse() {
                     opts.id = Some(v);
                 }
             }
         }
-        BuiltinCommand::SessionDeleteCharacter => {
+        ControlOperation::SessionDeleteCharacter => {
             if let Some(arg) = args.first() {
                 if let Ok(v) = arg.parse() {
                     opts.character_id = Some(v);
@@ -1081,11 +967,11 @@ fn build_request(
     }
 
     match builtin {
-        BuiltinCommand::Status => Ok(("status", json!({}))),
-        BuiltinCommand::ReloadConfig => Ok(("reload-config", json!({}))),
-        BuiltinCommand::Shutdown => Ok(("shutdown", json!({}))),
-        BuiltinCommand::Help => Ok(("help", json!({}))),
-        BuiltinCommand::CharacterList => {
+        ControlOperation::Status => Ok(("status", json!({}))),
+        ControlOperation::ReloadConfig => Ok(("reload-config", json!({}))),
+        ControlOperation::Shutdown => Ok(("shutdown", json!({}))),
+        ControlOperation::Help => Ok(("help", json!({}))),
+        ControlOperation::CharacterList => {
             let mut p = serde_json::Map::new();
             if let Some(l) = opts.limit {
                 p.insert("limit".to_string(), json!(l));
@@ -1095,7 +981,7 @@ fn build_request(
             }
             Ok(("character list", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::CharacterShow => {
+        ControlOperation::CharacterShow => {
             let char_id = opts
                 .id
                 .or(opts.character_id)
@@ -1104,8 +990,8 @@ fn build_request(
             p.insert("id".to_string(), json!(char_id));
             Ok(("character show", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::CharacterCardList => Ok(("character card list", json!({}))),
-        BuiltinCommand::CharacterCardEnable => {
+        ControlOperation::CharacterCardList => Ok(("character card list", json!({}))),
+        ControlOperation::CharacterCardEnable => {
             let char_id = opts
                 .id
                 .or(opts.character_id)
@@ -1114,7 +1000,7 @@ fn build_request(
             p.insert("id".to_string(), json!(char_id));
             Ok(("character card enable", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::CharacterCardDisable => {
+        ControlOperation::CharacterCardDisable => {
             let char_id = opts
                 .id
                 .or(opts.character_id)
@@ -1123,7 +1009,7 @@ fn build_request(
             p.insert("id".to_string(), json!(char_id));
             Ok(("character card disable", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::CharacterCardReassign => {
+        ControlOperation::CharacterCardReassign => {
             if args.len() != 2 {
                 return Err("需要 <old-id> <new-id> 两个参数".to_string());
             }
@@ -1134,9 +1020,9 @@ fn build_request(
             p.insert("new_id".to_string(), json!(new_id));
             Ok(("character card reassign", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::ConversationList => Ok(("conversation list", json!({}))),
-        BuiltinCommand::SessionDeleteAll => Ok(("session delete-all", json!({}))),
-        BuiltinCommand::SessionDeleteCharacter => {
+        ControlOperation::ConversationList => Ok(("conversation list", json!({}))),
+        ControlOperation::SessionDeleteAll => Ok(("session delete-all", json!({}))),
+        ControlOperation::SessionDeleteCharacter => {
             let character_id = opts
                 .character_id
                 .ok_or_else(|| "需要 <character-id>".to_string())?;
@@ -1144,7 +1030,7 @@ fn build_request(
             p.insert("character_id".to_string(), json!(character_id));
             Ok(("session delete-character", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::StateGet => {
+        ControlOperation::CharacterStateGet => {
             let char_id = opts
                 .id
                 .or(opts.character_id)
@@ -1156,7 +1042,7 @@ fn build_request(
             }
             Ok(("character state get", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::StateSet => {
+        ControlOperation::CharacterStateSet => {
             let char_id = opts
                 .character_id
                 .ok_or_else(|| "需要 --character <角色ID>".to_string())?;
@@ -1179,45 +1065,9 @@ fn build_request(
             }
             Ok(("character state set", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::StateRefresh => Ok(("character state refresh", json!({}))),
-        BuiltinCommand::CharacterStateGet => {
-            let char_id = opts
-                .id
-                .or(opts.character_id)
-                .ok_or_else(|| "需要 --character <角色ID>".to_string())?;
-            let mut p = serde_json::Map::new();
-            p.insert("character_id".to_string(), json!(char_id));
-            if let Some(cid) = opts.conversation_id {
-                p.insert("conversation_id".to_string(), json!(cid));
-            }
-            Ok(("character state get", serde_json::Value::Object(p)))
-        }
-        BuiltinCommand::CharacterStateSet => {
-            let char_id = opts
-                .character_id
-                .ok_or_else(|| "需要 --character <角色ID>".to_string())?;
-            let mut p = serde_json::Map::new();
-            p.insert("character_id".to_string(), json!(char_id));
-            if let Some(cid) = opts.conversation_id {
-                p.insert("conversation_id".to_string(), json!(cid));
-            }
-            if let Some(v) = opts.energy {
-                p.insert("energy".to_string(), json!(v));
-            }
-            if let Some(v) = opts.stress {
-                p.insert("stress".to_string(), json!(v));
-            }
-            if let Some(v) = opts.mood {
-                p.insert("mood".to_string(), json!(v));
-            }
-            if let Some(ref v) = opts.activity {
-                p.insert("activity".to_string(), json!(v));
-            }
-            Ok(("character state set", serde_json::Value::Object(p)))
-        }
-        BuiltinCommand::CharacterStateRefresh => Ok(("character state refresh", json!({}))),
-        BuiltinCommand::BlacklistList => Ok(("blacklist list", json!({}))),
-        BuiltinCommand::BlacklistAdd => {
+        ControlOperation::CharacterStateRefresh => Ok(("character state refresh", json!({}))),
+        ControlOperation::BlacklistList => Ok(("blacklist list", json!({}))),
+        ControlOperation::BlacklistAdd => {
             let target = opts
                 .qq_id
                 .clone()
@@ -1230,7 +1080,7 @@ fn build_request(
             }
             Ok(("blacklist add", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::BlacklistRemove => {
+        ControlOperation::BlacklistRemove => {
             let target = opts
                 .qq_id
                 .clone()
@@ -1240,7 +1090,7 @@ fn build_request(
             p.insert("target_type".to_string(), json!("user"));
             Ok(("blacklist remove", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::BlacklistBan => {
+        ControlOperation::BlacklistBan => {
             let target = opts
                 .qq_id
                 .clone()
@@ -1259,7 +1109,7 @@ fn build_request(
             }
             Ok(("blacklist ban", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::MemoryList => {
+        ControlOperation::MemoryList => {
             let mut p = serde_json::Map::new();
             if let Some(cid) = opts.character_id {
                 p.insert("character_id".to_string(), json!(cid));
@@ -1278,7 +1128,7 @@ fn build_request(
             }
             Ok(("memory list", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::MemoryDelete => {
+        ControlOperation::MemoryDelete => {
             let mem_id = opts
                 .memory_id
                 .ok_or_else(|| "需要 <memory-id>".to_string())?;
@@ -1286,7 +1136,7 @@ fn build_request(
             p.insert("memory_id".to_string(), json!(mem_id));
             Ok(("memory delete", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::MemoryUpdate => {
+        ControlOperation::MemoryUpdate => {
             let mem_id = opts
                 .memory_id
                 .ok_or_else(|| "需要 <memory-id>".to_string())?;
@@ -1299,7 +1149,7 @@ fn build_request(
             p.insert("instruction".to_string(), json!(instruction));
             Ok(("memory update", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::ReplyUnknownList => {
+        ControlOperation::ReplyUnknownList => {
             let mut p = serde_json::Map::new();
             if let Some(limit) = opts.limit {
                 p.insert("limit".to_string(), json!(limit));
@@ -1309,59 +1159,33 @@ fn build_request(
             }
             Ok(("reply unknown list", serde_json::Value::Object(p)))
         }
-        BuiltinCommand::ReplyUnknownCheck => {
+        ControlOperation::ReplyUnknownCheck => {
             let message_id = opts.id.ok_or_else(|| "需要 <message-id>".to_string())?;
             Ok(("reply unknown check", json!({ "message_id": message_id })))
         }
-        BuiltinCommand::ReplyUnknownRetry => {
+        ControlOperation::ReplyUnknownRetry => {
             let message_id = opts.id.ok_or_else(|| "需要 <message-id>".to_string())?;
             Ok(("reply unknown retry", json!({ "message_id": message_id })))
         }
-    }
-}
-
-/// 拒绝没有被命令消费的位置参数。
-///
-/// 以前只有少数命令检查参数数量，导致 `shutdown typo`、
-/// `session delete-all accidental` 仍然会执行危险操作。
-fn validate_positional_args(builtin: BuiltinCommand, args: &[String]) -> Result<(), String> {
-    let (min, max, usage) = match builtin {
-        BuiltinCommand::CharacterShow
-        | BuiltinCommand::CharacterCardEnable
-        | BuiltinCommand::CharacterCardDisable
-        | BuiltinCommand::BlacklistAdd
-        | BuiltinCommand::BlacklistRemove
-        | BuiltinCommand::BlacklistBan
-        | BuiltinCommand::MemoryDelete
-        | BuiltinCommand::MemoryUpdate
-        | BuiltinCommand::ReplyUnknownCheck
-        | BuiltinCommand::ReplyUnknownRetry
-        | BuiltinCommand::SessionDeleteCharacter => (1, 1, "需要一个位置参数"),
-        BuiltinCommand::CharacterCardReassign => (2, 2, "需要两个位置参数"),
-        BuiltinCommand::CharacterStateGet | BuiltinCommand::StateGet => {
-            (0, 1, "最多接受一个角色 ID")
+        ControlOperation::UserMerge => {
+            if args.len() != 2 {
+                return Err("需要 <source-user-id> <target-user-id> 两个参数".to_string());
+            }
+            let source: i64 = args[0].parse().map_err(|_| "source-user-id 必须是整数")?;
+            let target: i64 = args[1].parse().map_err(|_| "target-user-id 必须是整数")?;
+            Ok((
+                "user merge",
+                json!({ "source_user_id": source, "target_user_id": target }),
+            ))
         }
-        BuiltinCommand::Status
-        | BuiltinCommand::ReloadConfig
-        | BuiltinCommand::Shutdown
-        | BuiltinCommand::Help
-        | BuiltinCommand::CharacterList
-        | BuiltinCommand::CharacterCardList
-        | BuiltinCommand::ConversationList
-        | BuiltinCommand::SessionDeleteAll
-        | BuiltinCommand::CharacterStateSet
-        | BuiltinCommand::StateSet
-        | BuiltinCommand::CharacterStateRefresh
-        | BuiltinCommand::StateRefresh
-        | BuiltinCommand::BlacklistList
-        | BuiltinCommand::MemoryList
-        | BuiltinCommand::ReplyUnknownList => (0, 0, "不接受位置参数"),
-    };
-
-    if args.len() < min || args.len() > max {
-        return Err(format!("{}：命令 {}", usage, builtin.canonical_name()));
+        ControlOperation::UserDelete => {
+            let user_id = args
+                .first()
+                .and_then(|value| value.parse::<i64>().ok())
+                .ok_or_else(|| "需要 <user-id>".to_string())?;
+            Ok(("user delete", json!({ "user_id": user_id })))
+        }
     }
-    Ok(())
 }
 
 // ============================================================================
@@ -1624,7 +1448,7 @@ async fn run_repl(socket: PathBuf) -> Result<(), String> {
             }
         };
 
-        let builtin = match BuiltinCommand::from_path(&parsed.path) {
+        let builtin = match command_from_path(&parsed.path) {
             Some(b) => b,
             None => {
                 let path_str = parsed.path.join(" ");
@@ -1721,7 +1545,7 @@ async fn run_tui_loop(stdout: &mut io::Stdout, socket: &PathBuf) -> Result<(), S
                         .split_whitespace()
                         .map(str::to_string)
                         .collect::<Vec<_>>();
-                    let builtin = BuiltinCommand::from_path(&path)
+                    let builtin = command_from_path(&path)
                         .ok_or_else(|| format!("命令定义无法解析: {}", spec.name))?;
                     let response =
                         execute_command(socket, builtin, &CommandOptions::default(), &[]).await;
@@ -1842,7 +1666,7 @@ async fn prompt_tui_command(
     let token_strings = tokenize_repl_line(line)?;
     let tokens = token_strings.iter().map(String::as_str).collect::<Vec<_>>();
     let parsed = ParsedCommand::parse(&tokens)?;
-    let builtin = BuiltinCommand::from_path(&parsed.path).ok_or_else(|| "未知命令".to_string())?;
+    let builtin = command_from_path(&parsed.path).ok_or_else(|| "未知命令".to_string())?;
     let response = execute_command(socket, builtin, &parsed.opts, &parsed.args).await?;
     let formatter = OutputFormatter::new(parsed.opts.raw, None);
     formatter.format_and_print(&response);
@@ -2093,7 +1917,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let builtin = match BuiltinCommand::from_path(&parsed.path) {
+    let builtin = match command_from_path(&parsed.path) {
         Some(b) => b,
         None => {
             let path_str = parsed.path.join(" ");
@@ -2185,28 +2009,28 @@ mod tests {
     #[test]
     fn test_session_list_alias_resolves_to_conversation_list() {
         assert_eq!(
-            BuiltinCommand::from_path(&["session".to_string(), "list".to_string()]),
-            Some(BuiltinCommand::ConversationList)
+            command_from_path(&["session".to_string(), "list".to_string()]),
+            Some(ControlOperation::ConversationList)
         );
     }
 
     #[test]
     fn test_human_short_aliases_resolve_to_canonical_commands() {
         assert_eq!(
-            BuiltinCommand::from_path(&["s".to_string()]),
-            Some(BuiltinCommand::Status)
+            command_from_path(&["s".to_string()]),
+            Some(ControlOperation::Status)
         );
         assert_eq!(
-            BuiltinCommand::from_path(&["c".to_string(), "list".to_string()]),
-            Some(BuiltinCommand::CharacterList)
+            command_from_path(&["c".to_string(), "list".to_string()]),
+            Some(ControlOperation::CharacterList)
         );
         assert_eq!(
-            BuiltinCommand::from_path(&["m".to_string(), "list".to_string()]),
-            Some(BuiltinCommand::MemoryList)
+            command_from_path(&["m".to_string(), "list".to_string()]),
+            Some(ControlOperation::MemoryList)
         );
         assert_eq!(
-            BuiltinCommand::from_path(&["cfg".to_string(), "reload".to_string()]),
-            Some(BuiltinCommand::ReloadConfig)
+            command_from_path(&["cfg".to_string(), "reload".to_string()]),
+            Some(ControlOperation::ReloadConfig)
         );
     }
 
@@ -2214,8 +2038,8 @@ mod tests {
     fn test_short_aliases_keep_longest_path_parsing() {
         let parsed = ParsedCommand::parse(&["c", "card", "list"]).unwrap();
         assert_eq!(
-            BuiltinCommand::from_path(&parsed.path),
-            Some(BuiltinCommand::CharacterCardList)
+            command_from_path(&parsed.path),
+            Some(ControlOperation::CharacterCardList)
         );
         let parsed = ParsedCommand::parse(&["ss", "delete-all", "--confirm"]).unwrap();
         assert_eq!(parsed.path, ["ss", "delete-all"]);
@@ -2382,28 +2206,28 @@ mod tests {
     #[test]
     fn test_builtin_from_path() {
         assert_eq!(
-            BuiltinCommand::from_path(&["status".to_string()]),
-            Some(BuiltinCommand::Status)
+            command_from_path(&["status".to_string()]),
+            Some(ControlOperation::Status)
         );
         assert_eq!(
-            BuiltinCommand::from_path(&["character".to_string(), "show".to_string()]),
-            Some(BuiltinCommand::CharacterShow)
+            command_from_path(&["character".to_string(), "show".to_string()]),
+            Some(ControlOperation::CharacterShow)
         );
         assert_eq!(
-            BuiltinCommand::from_path(&["blacklist".to_string(), "ban".to_string()]),
-            Some(BuiltinCommand::BlacklistBan)
+            command_from_path(&["blacklist".to_string(), "ban".to_string()]),
+            Some(ControlOperation::BlacklistBan)
         );
         assert_eq!(
-            BuiltinCommand::from_path(&["memory".to_string(), "list".to_string()]),
-            Some(BuiltinCommand::MemoryList)
+            command_from_path(&["memory".to_string(), "list".to_string()]),
+            Some(ControlOperation::MemoryList)
         );
-        assert_eq!(BuiltinCommand::from_path(&["foobar".to_string()]), None);
+        assert_eq!(command_from_path(&["foobar".to_string()]), None);
     }
 
     #[test]
     fn test_build_request_uses_canonical_command_names() {
         let (cmd, request) = build_request(
-            BuiltinCommand::CharacterStateGet,
+            ControlOperation::CharacterStateGet,
             &CommandOptions::default(),
             &["7".to_string()],
             1,
@@ -2413,7 +2237,7 @@ mod tests {
         assert_eq!(request["character_id"], 7);
 
         let (cmd, request) = build_request(
-            BuiltinCommand::MemoryList,
+            ControlOperation::MemoryList,
             &CommandOptions::default(),
             &[],
             2,
@@ -2426,7 +2250,7 @@ mod tests {
     #[test]
     fn test_build_envelope_uses_structured_operation() {
         let envelope = build_envelope(
-            BuiltinCommand::CharacterStateGet,
+            ControlOperation::CharacterStateGet,
             &CommandOptions::default(),
             &["7".to_string()],
             9,
@@ -2442,14 +2266,14 @@ mod tests {
 
     #[test]
     fn test_unknown_reply_list_uses_shared_command_schema() {
-        let command = BuiltinCommand::from_path(&[
+        let command = command_from_path(&[
             "reply".to_string(),
             "unknown".to_string(),
             "list".to_string(),
         ]);
-        assert_eq!(command, Some(BuiltinCommand::ReplyUnknownList));
+        assert_eq!(command, Some(ControlOperation::ReplyUnknownList));
         let (name, request) = build_request(
-            BuiltinCommand::ReplyUnknownList,
+            ControlOperation::ReplyUnknownList,
             &CommandOptions {
                 limit: Some(12),
                 ..Default::default()
@@ -2467,7 +2291,7 @@ mod tests {
 
     #[test]
     fn test_unknown_reply_check_and_retry_use_message_id_and_confirmation_policy() {
-        let check = BuiltinCommand::from_path(&[
+        let check = command_from_path(&[
             "reply".to_string(),
             "unknown".to_string(),
             "check".to_string(),
@@ -2478,7 +2302,7 @@ mod tests {
         assert_eq!(name, "reply unknown check");
         assert_eq!(request["message_id"], serde_json::json!(42));
 
-        let retry = BuiltinCommand::from_path(&[
+        let retry = command_from_path(&[
             "reply".to_string(),
             "unknown".to_string(),
             "retry".to_string(),
@@ -2492,22 +2316,79 @@ mod tests {
     #[test]
     fn dangerous_commands_reject_unexpected_positionals() {
         let error = build_request(
-            BuiltinCommand::Shutdown,
+            ControlOperation::Shutdown,
             &CommandOptions::default(),
             &["typo".into()],
             1,
         )
         .expect_err("shutdown must not ignore extra arguments");
-        assert!(error.contains("不接受位置参数"));
+        assert!(error.contains("位置参数数量不符"));
 
         let error = build_request(
-            BuiltinCommand::SessionDeleteAll,
+            ControlOperation::SessionDeleteAll,
             &CommandOptions::default(),
             &["accidental".into()],
             2,
         )
         .expect_err("delete-all must not ignore extra arguments");
-        assert!(error.contains("不接受位置参数"));
+        assert!(error.contains("位置参数数量不符"));
+    }
+
+    #[test]
+    fn options_not_allowed_by_command_are_rejected_not_ignored() {
+        // shutdown 是不适用参数，必须报错而不是被静默忽略。
+        let opts = CommandOptions {
+            id: Some(1),
+            ..Default::default()
+        };
+        let error = build_request(ControlOperation::Shutdown, &opts, &[], 1)
+            .expect_err("shutdown --id must be rejected");
+        assert!(error.contains("--id") && error.contains("shutdown"));
+
+        // 状态命令不能带 --limit。
+        let opts = CommandOptions {
+            limit: Some(5),
+            ..Default::default()
+        };
+        let error = build_request(
+            ControlOperation::CharacterStateGet,
+            &opts,
+            &["1".to_string()],
+            2,
+        )
+        .expect_err("state get --limit must be rejected");
+        assert!(error.contains("--limit"));
+
+        // --raw 只允许查询类命令；memory update 带 --raw 应报错。
+        let opts = CommandOptions {
+            raw: true,
+            memory_instruction: Some("改写".into()),
+            ..Default::default()
+        };
+        let error = build_request(ControlOperation::MemoryUpdate, &opts, &["7".to_string()], 3)
+            .expect_err("memory update --raw must be rejected");
+        assert!(error.contains("--raw"));
+
+        // 正常组合仍然通过：status --raw。
+        build_request(
+            ControlOperation::Status,
+            &CommandOptions {
+                raw: true,
+                ..Default::default()
+            },
+            &[],
+            4,
+        )
+        .expect("status --raw should be allowed");
+
+        // 危险命令未带 --confirm 仍由 execute_command 拦截，但参数构造应通过。
+        build_request(
+            ControlOperation::UserDelete,
+            &CommandOptions::default(),
+            &["9".to_string()],
+            5,
+        )
+        .expect("user delete request should build");
     }
 
     #[test]
@@ -2538,9 +2419,8 @@ mod tests {
     #[test]
     fn test_human_state_alias_is_accepted_but_not_sent_to_bot() {
         assert_eq!(
-            BuiltinCommand::from_path(&["state".into(), "get".into()]),
-            Some(BuiltinCommand::StateGet)
+            command_from_path(&["state".into(), "get".into()]),
+            Some(ControlOperation::CharacterStateGet)
         );
-        assert!(!BuiltinCommand::all().any(|command| command == BuiltinCommand::StateGet));
     }
 }
