@@ -3,8 +3,8 @@
 //! 通过 Unix 域套接字向运行中的 yomua-bot 发送控制命令。
 //!
 //! 支持两种模式：
-//! - **One-shot 模式**：`yomua-bot-ctl <命令>` 执行单条命令后退出
-//! - **交互模式**：`yomua-bot-ctl`（无命令）进入 REPL，可连续执行多条命令
+//! - **单条命令模式**：`yomua-bot-ctl <命令>` 执行一条命令后退出
+//! - **交互模式**：`yomua-bot-ctl`（无命令）进入交互式命令行（REPL），可连续执行多条命令
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -27,33 +27,33 @@ use tokio::time::timeout;
 use yomua_bot::application::control_schema::ControlOperation;
 
 // ============================================================================
-// Section 1: Command Specification & Registry
+// 第一节：命令定义与注册表
 // ============================================================================
 
 /// 命令选项的枚举形式，支持所有命令的选项联合。
 #[derive(Debug, Clone, Default)]
 pub struct CommandOptions {
-    // Common
+    // 通用命令
     pub raw: bool,
     pub confirm: bool,
-    // character list
+    // 角色列表
     pub limit: Option<i64>,
     pub offset: Option<i64>,
-    // character show <id>
+    // 查看角色详情
     pub id: Option<i64>,
-    // state / character operations
+    // 状态与角色操作
     pub character_id: Option<i64>,
     pub conversation_id: Option<i64>,
-    // state set
+    // 修改状态
     pub mood: Option<f64>,
     pub energy: Option<f64>,
     pub stress: Option<f64>,
     pub activity: Option<String>,
-    // blacklist
+    // 黑名单
     pub qq_id: Option<String>,
     pub duration: Option<String>,
     pub reason: Option<String>,
-    // memory
+    // 记忆
     pub memory_id: Option<i64>,
     pub memory_type: Option<String>,
     pub memory_instruction: Option<String>,
@@ -77,7 +77,7 @@ fn command_from_path(path: &[String]) -> Option<BuiltinCommand> {
 }
 
 // ============================================================================
-// Section 2: Parsed Command
+// 第二节：解析后的命令
 // ============================================================================
 
 /// 解析后的命令。
@@ -95,7 +95,7 @@ impl ParsedCommand {
         }
 
         // 命令路径按已注册命令做最长匹配。旧实现把路径硬编码为最多两段，
-        // 导致 character card list / character state get 这类三段命令永远不可达。
+        // 否则 `character card list` / `character state get` 这类三段命令会无法识别。
         let option_start = tokens
             .iter()
             .position(|token| token.starts_with("--"))
@@ -291,7 +291,7 @@ impl ParsedCommand {
 }
 
 // ============================================================================
-// Section 3: Control Protocol Types
+// 第三节：控制协议类型
 // ============================================================================
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -321,12 +321,12 @@ impl ControlResponse {
 }
 
 // ============================================================================
-// Section 4: Output Formatter
+// 第四节：输出格式化
 // ============================================================================
 
 pub struct OutputFormatter {
     raw: bool,
-    /// CLI 启动时刻（单调时钟），用于计算 ctl 运行时长。
+    /// ctl 启动时刻（单调时钟），用于计算运行时长。
     ctl_started_at: Option<std::time::Instant>,
 }
 
@@ -347,7 +347,7 @@ impl OutputFormatter {
     }
 
     fn print_raw(&self, resp: &ControlResponse) {
-        // raw 模式是稳定的机器接口：成功和失败都输出完整响应，统一写 stdout。
+        // `--raw` 模式是稳定的机器接口：成功和失败都输出完整响应，并统一写入 stdout。
         let s = serde_json::to_string(resp).unwrap_or_else(|_| {
             "{\"id\":0,\"ok\":false,\"error\":{\"code\":\"SERIALIZE_ERROR\",\"message\":\"无法序列化响应\"}}".to_string()
         });
@@ -415,9 +415,9 @@ impl OutputFormatter {
     }
 
     fn print_object(&self, obj: &serde_json::Map<String, serde_json::Value>) {
-        // status
+        // 状态查询
         if obj.get("system_time").is_some() && obj.get("main_uptime_secs").is_some() {
-            // 完整 status（新版）
+            // 完整状态信息
             let system_time = obj
                 .get("system_time")
                 .and_then(|v| v.as_str())
@@ -491,7 +491,7 @@ impl OutputFormatter {
             return;
         }
 
-        // character list (including character_card_list)
+        // 角色列表（包括角色卡列表）
         if let Some(arr) = obj.get("characters").and_then(|v| v.as_array()) {
             println!("角色列表（共 {} 个）", arr.len());
             for c in arr {
@@ -518,7 +518,7 @@ impl OutputFormatter {
             return;
         }
 
-        // session list (both "conversations" and "sessions")
+        // 会话列表（兼容 conversations 和 sessions 字段）
         if let Some(arr) = obj
             .get("conversations")
             .or(obj.get("sessions"))
@@ -542,7 +542,7 @@ impl OutputFormatter {
             return;
         }
 
-        // state
+        // 状态操作
         if let (Some(cid), Some(state)) = (
             obj.get("character_id").and_then(|v| v.as_i64()),
             obj.get("character_state"),
@@ -593,7 +593,7 @@ impl OutputFormatter {
             return;
         }
 
-        // blacklist
+        // 黑名单操作
         if let Some(arr) = obj.get("blacklist").and_then(|v| v.as_array()) {
             println!("黑名单（共 {} 项）", arr.len());
             println!("  ID    类型    状态    过期时间");
@@ -627,19 +627,19 @@ impl OutputFormatter {
             return;
         }
 
-        // session delete result
+        // 会话删除结果
         if let Some(deleted) = obj.get("deleted").and_then(|v| v.as_u64()) {
             println!("已删除会话：{}", deleted);
             return;
         }
 
-        // memory delete result
+        // 记忆删除结果
         if let Some(mid) = obj.get("memory_id").and_then(|v| v.as_i64()) {
             println!("已删除记忆：{}", mid);
             return;
         }
 
-        // user merge / delete result
+        // 用户合并或删除结果
         if let (Some(merged), Some(removed)) = (
             obj.get("merged_user_id").and_then(|v| v.as_i64()),
             obj.get("removed_user_id").and_then(|v| v.as_i64()),
@@ -652,7 +652,7 @@ impl OutputFormatter {
             return;
         }
 
-        // memory list
+        // 记忆列表
         if let Some(arr) = obj.get("memories").and_then(|v| v.as_array()) {
             println!("记忆列表（共 {} 条）", arr.len());
             for m in arr {
@@ -676,7 +676,7 @@ impl OutputFormatter {
             return;
         }
 
-        // commands list (help)
+        // 命令列表（帮助信息）
         if let Some(arr) = obj.get("commands").and_then(|v| v.as_array()) {
             println!("可用命令：");
             let mut cmd_items: Vec<(&str, &str, &str, bool)> = Vec::new();
@@ -699,7 +699,7 @@ impl OutputFormatter {
             return;
         }
 
-        // generic fallback: print the whole object
+        // 通用回退：输出完整对象
         let raw = serde_json::to_string_pretty(obj).unwrap_or_else(|_| format!("{obj:?}"));
         println!("{raw}");
     }
@@ -721,7 +721,7 @@ fn print_client_error(raw: bool, message: &str) {
 }
 
 // ============================================================================
-// Section 5: Duration Parser
+// 第五节：时长解析
 // ============================================================================
 
 pub fn parse_duration(s: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
@@ -752,7 +752,7 @@ pub fn parse_duration(s: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, 
     Ok(Some(expires))
 }
 
-/// 将 duration 字符串解析为秒数（用于传递给 server）。
+/// 将时间长度字符串解析为秒数（用于传给 bot）。
 fn parse_duration_to_secs(s: &str) -> Result<i64, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -785,7 +785,7 @@ fn parse_duration_to_secs(s: &str) -> Result<i64, String> {
 }
 
 // ============================================================================
-// Section 6: Control Client
+// 第六节：控制客户端
 // ============================================================================
 
 fn generate_id() -> u64 {
@@ -910,7 +910,7 @@ fn build_request(
         return Err(format!("--raw 不适用于命令 {}", builtin.canonical_name()));
     }
 
-    // Extract positional args into opts for commands that need them
+    // 将需要的位置参数转换为选项
     let mut opts = opts.clone();
     match builtin {
         ControlOperation::CharacterShow
@@ -1189,7 +1189,7 @@ fn build_request(
 }
 
 // ============================================================================
-// Section 7: Line Editor
+// 第七节：行编辑器
 // ============================================================================
 
 struct ReplHelper;
@@ -1321,15 +1321,15 @@ impl LineEditor {
 }
 
 // ============================================================================
-// Section 8: REPL
+// 第八节：交互式命令行
 // ============================================================================
 
 const PROMPT: &str = "yomua> ";
 
-/// 将 REPL 输入拆成参数，支持单引号、双引号和反斜杠转义。
+/// 将交互式命令行输入拆成参数，支持单引号、双引号和反斜杠转义。
 ///
-/// one-shot 模式由 shell 负责拆词；REPL 没有 shell，因此不能直接
-/// split_whitespace()，否则中文说明、原因和活动名称会被截断。
+/// 单次命令模式由 shell 负责拆词；交互模式没有 shell，因此不能直接
+/// 按空白字符切分，否则中文说明、原因和活动名称会被截断。
 fn tokenize_repl_line(line: &str) -> Result<Vec<String>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -1476,11 +1476,11 @@ async fn run_repl(socket: PathBuf) -> Result<(), String> {
 }
 
 // ============================================================================
-// Section 9: Full-screen command panel
+// 第九节：全屏命令面板
 // ============================================================================
 
 /// 全屏面板只负责挑选命令；需要 ID、文本或确认的命令仍回到行编辑器输入。
-/// 这样方向键适合浏览常用操作，复杂参数仍保留 shell/REPL 的可编辑性。
+/// 这样方向键适合浏览常用操作，复杂参数仍可在命令行中编辑。
 async fn run_tui(socket: PathBuf) -> Result<(), String> {
     let mut stdout = io::stdout();
     terminal::enable_raw_mode().map_err(|e| format!("无法启用终端原始模式: {e}"))?;
@@ -1700,7 +1700,7 @@ fn summarize_tui_response(response: &ControlResponse) -> String {
 }
 
 // ============================================================================
-// Section 10: Help
+// 第十节：帮助信息
 // ============================================================================
 
 fn print_help() {
@@ -1779,7 +1779,7 @@ fn print_help_for(prefix: &str) {
 }
 
 // ============================================================================
-// Section 10: Global Help
+// 第十节：全局帮助
 // ============================================================================
 
 fn print_global_help() {
@@ -1812,7 +1812,7 @@ fn print_global_help() {
 }
 
 // ============================================================================
-// Section 11: Main
+// 第十一节：程序入口
 // ============================================================================
 
 #[tokio::main]
@@ -1834,7 +1834,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Parse global options
+    // 解析全局选项
     let mut socket: Option<PathBuf> = None;
     let mut data_dir: PathBuf = PathBuf::from("data");
     let mut tui = false;
@@ -1898,7 +1898,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // help is a special command that doesn't need Runtime
+    // 帮助命令不需要初始化 Runtime
     let tokens: Vec<&str> = remaining.iter().map(String::as_str).collect();
     if tokens == ["help"] {
         print_help();
@@ -1954,7 +1954,7 @@ fn rand_u32() -> u32 {
 }
 
 // ============================================================================
-// Section 12: Tests
+// 第十二节：测试
 // ============================================================================
 
 #[cfg(test)]
@@ -2336,7 +2336,7 @@ mod tests {
 
     #[test]
     fn options_not_allowed_by_command_are_rejected_not_ignored() {
-        // shutdown 是不适用参数，必须报错而不是被静默忽略。
+        // 关停命令不允许该参数，必须报错而不是静默忽略。
         let opts = CommandOptions {
             id: Some(1),
             ..Default::default()
@@ -2359,7 +2359,7 @@ mod tests {
         .expect_err("state get --limit must be rejected");
         assert!(error.contains("--limit"));
 
-        // --raw 只允许查询类命令；memory update 带 --raw 应报错。
+        // `--raw` 只允许查询类命令；记忆修改命令带 `--raw` 应报错。
         let opts = CommandOptions {
             raw: true,
             memory_instruction: Some("改写".into()),
@@ -2381,7 +2381,7 @@ mod tests {
         )
         .expect("status --raw should be allowed");
 
-        // 危险命令未带 --confirm 仍由 execute_command 拦截，但参数构造应通过。
+        // 危险命令未带 `--confirm` 仍由 execute_command 拦截，但参数构造应通过。
         build_request(
             ControlOperation::UserDelete,
             &CommandOptions::default(),

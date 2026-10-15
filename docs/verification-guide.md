@@ -15,15 +15,14 @@
 - `cargo check --locked --all-targets --offline`：通过。
 - `cargo test --locked --all-targets --no-run --offline`：通过编译检查。
 - `cargo fmt --all -- --check`：通过。
-- `cargo test --locked --lib --offline -- --test-threads=1`：404 个通过，0 个失败，15 个忽略。
-- `cargo test --locked --all-targets --offline`：库 404 个、主程序 5 个、ctl 31 个、alpha 集成 8 个、控制集成 79 个通过；插件 Unix socket 测试按 `#[ignore]` 标记跳过。
+- `cargo test --locked --offline --all-targets -- --test-threads=1`：库 417 个、主程序 5 个、ctl 32 个、alpha 集成 8 个、控制集成 80 个通过；插件 Unix socket 测试按 `#[ignore]` 标记跳过。
 - `cargo test --locked --lib infrastructure::plugin::transport::tests --offline -- --ignored --test-threads=1`：15 个插件 Unix socket 测试全部通过。
 - 临时 Unix socket 模拟服务配合真实 `yomua-bot-ctl status --raw`：通过，确认发送的是版本化 `ControlEnvelope`，不含旧 `cmd` 字段。
 - CLI 解析测试：覆盖一段、二段、三段命令、短别名归一化和危险命令确认。
 - SQLite 存储测试：覆盖平台消息去重、稳定用户关系、角色归属历史和记忆可见范围。
 - 配置模板验证：首次启动在临时目录生成 `runtime.toml`、`onebot.toml`、`llm.toml`、`decision.toml`；可选 OneBot 字段留空时仍可解析，真实配置密钥未参与验证。
 
-本轮控制协议迁移、候选记忆生产接线、canonical `MessageAccepted` 事件收口、配置模板路径统一、发送中任务恢复、独立决策配置和旧入口清理后的基线为：库 404 个通过、主程序 5 个、ctl 31 个、alpha 集成 8 个、控制集成 79 个；插件 Unix socket 的 15 个测试已在本机用 `--ignored` 显式通过。
+本次核查的基线为：库 417 个通过、主程序 5 个、ctl 32 个、alpha 集成 8 个、控制集成 80 个；另有 15 个插件 Unix socket 测试在普通全目标测试中按 `#[ignore]` 跳过，并通过显式 `--ignored` 运行。
 
 ## 已实现的重点行为
 
@@ -34,6 +33,7 @@
 - 记忆候选以 `candidate` 状态保存，普通入站消息按来源消息幂等生成；候选不会直接进入正式可见记忆或默认 ctl 列表；事实/关系默认共享，具体经历默认保留会话范围。
 - ctl 的 `memory list` 默认只返回记忆摘要和不可逆指纹；只有显式 `--raw` 才读取原文。
 - `memory update` 不直接暴露或改写记忆原文，只记录带确认的自然语言修改请求，等待后台认知流程处理。
+- `user delete <ID> --confirm` 删除与用户关联的普通/向量记忆及关系，将历史参与者匿名化并清除消息/outbox 元数据、私聊路由和用户黑名单中的旧 QQ 号和昵称；历史消息正文及消息引用保留。测试同时验证非目标用户数据不变、私聊主动发言关闭、外键无孤儿和数据库失败时完整回滚。
 - ctl 服务端和客户端使用同一套 canonical 命令定义；危险命令需要 `--confirm`，服务端也会再次校验。
 - ctl REPL 支持引号和反斜杠转义，中文长参数不会因空格被截断；命令路径按注册表最长匹配。
 - 没有可用对话模型时保留原消息，不发送伪造回复。

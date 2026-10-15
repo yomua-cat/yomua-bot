@@ -159,7 +159,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         conversation_id: i64,
         limit: i64,
     ) -> Result<Vec<Memory>, RepositoryError> {
-        let rows:Vec<MemoryRow>=sqlx::query_as("SELECT id,character_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding FROM memories WHERE character_id=? AND COALESCE(json_extract(metadata,'$.status'),'formal') != 'candidate' AND (conversation_id=? OR json_extract(metadata,'$.shared')=1) ORDER BY importance DESC,created_at DESC,id DESC LIMIT ?")
+        let rows:Vec<MemoryRow>=sqlx::query_as("SELECT id,character_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding FROM memories WHERE character_id=? AND COALESCE(json_extract(metadata,'$.status'),'formal') != 'candidate' AND conversation_id=? ORDER BY importance DESC,created_at DESC,id DESC LIMIT ?")
             .bind(character_id).bind(conversation_id).bind(limit.max(0)).fetch_all(&self.pool).await?;
         rows.into_iter().map(parse_memory_row).collect()
     }
@@ -177,8 +177,10 @@ impl MemoryRepository for SqliteMemoryRepository {
                  FROM memories
                 WHERE character_id=?
                   AND COALESCE(json_extract(metadata,'$.status'),'formal') != 'candidate'
-                  AND (conversation_id=? OR json_extract(metadata,'$.shared')=1
-                       OR user_id=(SELECT user_id FROM participants WHERE id=?))
+                  AND (conversation_id=? OR (
+                       user_id=(SELECT user_id FROM participants WHERE id=? AND role='user')
+                       AND COALESCE(json_extract(metadata,'$.shared'),0)=1
+                  ))
                 ORDER BY importance DESC,created_at DESC,id DESC LIMIT ?"#,
         )
         .bind(character_id)

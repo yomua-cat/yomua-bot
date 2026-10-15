@@ -553,15 +553,14 @@ pub trait MemoryRepository: Send + Sync {
             .await?;
         items.retain(|m| {
             m.metadata.get("status").and_then(|value| value.as_str()) != Some("candidate")
-                && (m.conversation_id == Some(conversation_id)
-                    || m.metadata.get("shared") == Some(&serde_json::Value::Bool(true)))
+                && m.conversation_id == Some(conversation_id)
         });
         items.truncate(limit.max(0) as usize);
         Ok(items)
     }
 
     /// 按当前消息作者的全域用户身份读取可见记忆。
-    /// 默认实现退化为会话范围查询，SQLite 实现会额外加入跨会话同一用户的记忆。
+    /// 默认实现退化为会话范围查询，SQLite 实现只额外加入同一用户明确共享的记忆。
     async fn find_visible_for_participant(
         &self,
         character_id: i64,

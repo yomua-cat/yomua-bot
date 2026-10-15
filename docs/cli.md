@@ -77,7 +77,7 @@ ctl 按命令校验参数：选项只对声明的命令开放，`status --energy
 | `reply unknown check <消息ID>` | 若任务保存了平台消息 ID，通过 OneBot `get_msg` 查询；没有平台 ID 时明确返回需要人工核查 |
 | `reply unknown retry <消息ID> --confirm` | 你已确认平台未发送后，清除未知状态并把原任务重新排队；不会根据查询失败自动执行 |
 | `user merge <来源用户ID> <目标用户ID> --confirm` | 把一个全域用户的数据合并到目标用户并删除来源用户；合并规则与迁移一致 |
-| `user delete <用户ID> --confirm` | 删除全域用户及其关联关系；需要明确确认 |
+| `user delete <用户ID> --confirm` | 删除全域用户、关联记忆和关系；匿名保留历史消息及其引用，清理旧账号 ID、私聊路由和用户黑名单 |
 | `session delete-character <角色ID> --confirm` | 删除与角色关联的会话数据 |
 | `session delete-all --confirm` | 删除全部会话数据 |
 

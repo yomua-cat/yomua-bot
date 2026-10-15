@@ -173,6 +173,19 @@ impl ParticipantRepository for SqliteParticipantRepository {
             .execute(&mut *tx)
             .await?;
 
+        // 合并关系交互幂等键，确保来源消息在合并后重放仍只计一次。
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO relationship_interactions
+                 (character_id, user_id, source_message_id, created_at)
+               SELECT character_id, ?, source_message_id, created_at
+                 FROM relationship_interactions
+                WHERE user_id = ?"#,
+        )
+        .bind(target_user_id)
+        .bind(source_user_id)
+        .execute(&mut *tx)
+        .await?;
+
         // 关系合并规则与 016 迁移一致：交互次数求和，状态取最大值，
         // 创建时间取最早，最后交互和更新时间取最新。
         sqlx::query(
@@ -210,10 +223,208 @@ impl ParticipantRepository for SqliteParticipantRepository {
     }
 
     async fn delete_user(&self, user_id: i64) -> Result<(), RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let (platform, external_id): (String, String) =
+            sqlx::query_as("SELECT platform, external_id FROM users WHERE id = ?")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| RepositoryError::NotFound(format!("用户 {user_id} 不存在")))?;
+
+        // 先清除所有属于该身份的记忆；认知记忆可能只在来源参与者 ID 数组中留有归属。
+        sqlx::query(
+            r#"DELETE FROM memories
+                WHERE user_id = ?
+                   OR json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                                   '$.source_participant_id') IN
+                      (SELECT id FROM participants WHERE user_id = ?)
+                   OR EXISTS (
+                      SELECT 1 FROM json_each(
+                          CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                          '$.source_participant_ids'
+                      ) AS source
+                       WHERE CAST(source.value AS INTEGER) IN
+                             (SELECT id FROM participants WHERE user_id = ?)
+                   )
+                   OR EXISTS (
+                      SELECT 1 FROM json_each(
+                          CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                          '$.participant_ids'
+                      ) AS source
+                       WHERE CAST(source.value AS INTEGER) IN
+                             (SELECT id FROM participants WHERE user_id = ?)
+                   )"#,
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // 向量记忆有独立存储表，不受普通记忆删除影响；按来源参与者一并清理。
+        sqlx::query(
+            r#"DELETE FROM semantic_memories
+                WHERE json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                                   '$.user_id') = ?
+                   OR json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                                   '$.source_participant_id') IN
+                      (SELECT id FROM participants WHERE user_id = ?)
+                   OR EXISTS (
+                      SELECT 1 FROM json_each(
+                          CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                          '$.source_participant_ids'
+                      ) AS source
+                       WHERE CAST(source.value AS INTEGER) IN
+                             (SELECT id FROM participants WHERE user_id = ?)
+                   )
+                   OR EXISTS (
+                      SELECT 1 FROM json_each(
+                          CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                          '$.participant_ids'
+                      ) AS source
+                       WHERE CAST(source.value AS INTEGER) IN
+                             (SELECT id FROM participants WHERE user_id = ?)
+                   )"#,
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // 历史消息正文和消息行保留，作者改成匿名占位；移除消息元数据里的外部身份信息。
+        sqlx::query(
+            r#"UPDATE messages
+                  SET metadata = json_remove(
+                      json_set(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                               '$.author_kind', 'user', '$.display_name', '已删除用户'),
+                      '$.external_sender_id', '$.user_id'
+                  )
+                WHERE sender_id IN (SELECT id FROM participants WHERE user_id = ?)"#,
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // QQ ID 也可能出现在其他消息的 @ 目标数组中；messages.mentions 保存的内部参与者
+        // 关联仍然保留，因此只从复制的外部 ID 元数据中移除被删除账号。
+        sqlx::query(
+            r#"UPDATE messages
+                  SET metadata = json_set(
+                      metadata, '$.mentions', json(COALESCE((
+                          SELECT json_group_array(value)
+                            FROM json_each(metadata, '$.mentions')
+                           WHERE CAST(value AS TEXT) <> ?
+                      ), '[]')))
+                WHERE json_valid(metadata)
+                  AND json_type(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                                '$.mentions') = 'array'
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(
+                          CASE WHEN json_valid(messages.metadata) THEN messages.metadata ELSE '{}' END,
+                          '$.mentions'
+                      )
+                       WHERE CAST(value AS TEXT) = ?
+                  )"#,
+        )
+        .bind(&external_id)
+        .bind(&external_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Outbox 可能仍保存待处理或已完成事件的副本；同步匿名化其作者元数据，保留事件正文。
+        sqlx::query(
+            r#"UPDATE outbox_events
+                  SET payload = json_remove(
+                      json_set(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,
+                               '$.metadata.author_kind', 'user',
+                               '$.metadata.display_name', '已删除用户'),
+                      '$.metadata.external_sender_id', '$.metadata.user_id'
+                  )
+                WHERE entity_type = 'messages'
+                  AND entity_id IN (
+                      SELECT id FROM messages
+                       WHERE sender_id IN (SELECT id FROM participants WHERE user_id = ?)
+                  )
+                  AND json_valid(payload)"#,
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE outbox_events
+                  SET payload = json_set(
+                      payload, '$.metadata.mentions', json(COALESCE((
+                          SELECT json_group_array(value)
+                            FROM json_each(payload, '$.metadata.mentions')
+                           WHERE CAST(value AS TEXT) <> ?
+                      ), '[]')))
+                WHERE json_valid(payload)
+                  AND json_type(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,
+                                '$.metadata.mentions') = 'array'
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(
+                          CASE WHEN json_valid(outbox_events.payload) THEN outbox_events.payload ELSE '{}' END,
+                          '$.metadata.mentions'
+                      )
+                       WHERE CAST(value AS TEXT) = ?
+                  )"#,
+        )
+        .bind(&external_id)
+        .bind(&external_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // 参与者行继续作为历史消息的外键目标，但不再保留 QQ 号、昵称或原始适配器元数据。
+        sqlx::query(
+            r#"UPDATE participants
+                  SET external_id = 'deleted-user-' || id,
+                      display_name = '已删除用户',
+                      role = 'system',
+                      metadata = '{}'
+                WHERE user_id = ?"#,
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if platform == "onebot_qq" {
+            // 私聊会话用 QQ 号作为 external_id；匿名化会话路由并关闭旧会话主动发言。
+            sqlx::query(
+                r#"UPDATE conversation_bindings
+                      SET proactive_enabled = 0
+                    WHERE conversation_id IN (
+                        SELECT id FROM conversations
+                         WHERE conversation_type = 'private' AND external_id = ?
+                    )"#,
+            )
+            .bind(&external_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"UPDATE conversations
+                      SET external_id = 'deleted-user-conversation-' || id,
+                          name = '已删除用户'
+                    WHERE conversation_type = 'private' AND external_id = ?"#,
+            )
+            .bind(&external_id)
+            .execute(&mut *tx)
+            .await?;
+            // 黑名单仍以平台外部 ID 存储；删除账户时移除对应条目。
+            sqlx::query("DELETE FROM blacklist_entries WHERE target = ? AND target_type = 'user'")
+                .bind(&external_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        // user 外键会级联删除关系及交互去重记录；参与者外键仅解绑，保留消息归属占位。
         sqlx::query("DELETE FROM users WHERE id = ?")
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 }

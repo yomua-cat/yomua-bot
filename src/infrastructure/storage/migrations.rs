@@ -677,6 +677,68 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
         .map_err(|e| {
             StorageError::Migration(format!("migration 016 legacy mapping cleanup failed: {e}"))
         })?;
+    enforce_user_participant_identity(pool).await?;
+    Ok(())
+}
+
+/// 确保每个用户参与者都映射到全域用户；删除账户时此类历史占位会先转成 system。
+async fn enforce_user_participant_identity(pool: &SqlitePool) -> Result<(), StorageError> {
+    let missing_user_id: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM participants WHERE role='user' AND user_id IS NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("user participant identity probe failed: {e}")))?;
+    if missing_user_id > 0 {
+        return Err(StorageError::Migration(format!(
+            "存在 {missing_user_id} 个没有全域身份的用户参与者，拒绝完成迁移"
+        )));
+    }
+
+    sqlx::query(
+        r#"CREATE TRIGGER IF NOT EXISTS participants_fill_user_identity_on_insert
+           AFTER INSERT ON participants
+           FOR EACH ROW WHEN NEW.role = 'user' AND NEW.user_id IS NULL
+           BEGIN
+               INSERT OR IGNORE INTO users(platform, external_id)
+               VALUES (
+                   COALESCE(NULLIF(json_extract(CASE WHEN json_valid(NEW.metadata) THEN NEW.metadata ELSE '{}' END, '$.platform'), ''), 'onebot_qq'),
+                   NEW.external_id
+               );
+               UPDATE participants
+                  SET user_id = (
+                      SELECT id FROM users
+                       WHERE platform = COALESCE(NULLIF(json_extract(CASE WHEN json_valid(NEW.metadata) THEN NEW.metadata ELSE '{}' END, '$.platform'), ''), 'onebot_qq')
+                         AND external_id = NEW.external_id
+                  )
+                WHERE id = NEW.id AND user_id IS NULL;
+           END"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("user participant insert guard failed: {e}")))?;
+    sqlx::query(
+        r#"CREATE TRIGGER IF NOT EXISTS participants_fill_user_identity_on_update
+           AFTER UPDATE OF role, user_id, metadata, external_id ON participants
+           FOR EACH ROW WHEN NEW.role = 'user' AND NEW.user_id IS NULL
+           BEGIN
+               INSERT OR IGNORE INTO users(platform, external_id)
+               VALUES (
+                   COALESCE(NULLIF(json_extract(CASE WHEN json_valid(NEW.metadata) THEN NEW.metadata ELSE '{}' END, '$.platform'), ''), 'onebot_qq'),
+                   NEW.external_id
+               );
+               UPDATE participants
+                  SET user_id = (
+                      SELECT id FROM users
+                       WHERE platform = COALESCE(NULLIF(json_extract(CASE WHEN json_valid(NEW.metadata) THEN NEW.metadata ELSE '{}' END, '$.platform'), ''), 'onebot_qq')
+                         AND external_id = NEW.external_id
+                  )
+                WHERE id = NEW.id AND user_id IS NULL;
+           END"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("user participant update guard failed: {e}")))?;
     Ok(())
 }
 

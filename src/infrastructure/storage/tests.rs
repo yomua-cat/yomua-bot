@@ -909,6 +909,28 @@ mod storage_tests {
             })
             .await
             .unwrap();
+        let participant_c = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id: conversation_a,
+                external_id: "800002".into(),
+                display_name: "小红".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform":"onebot_qq"}),
+            })
+            .await
+            .unwrap();
+        let participant_d = part_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id: conversation_b,
+                external_id: "800003".into(),
+                display_name: "小红（群B）".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform":"onebot_qq"}),
+            })
+            .await
+            .unwrap();
         let mut memory = Memory::new(
             character_id,
             Some(conversation_a),
@@ -916,15 +938,74 @@ mod storage_tests {
             "小明喜欢猫".into(),
             0.9,
         );
-        memory.metadata = serde_json::json!({"source_participant_id": participant_a});
+        memory.metadata =
+            serde_json::json!({"source_participant_id": participant_a, "shared": true});
         memory_repo.insert(&memory).await.unwrap();
+
+        let mut private_memory = Memory::new(
+            character_id,
+            Some(conversation_a),
+            MemoryType::Episodic,
+            "小明在群A提到的具体经历".into(),
+            0.9,
+        );
+        private_memory.metadata =
+            serde_json::json!({"source_participant_id": participant_a, "shared": false});
+        memory_repo.insert(&private_memory).await.unwrap();
+
+        let mut other_user_memory = Memory::new(
+            character_id,
+            Some(conversation_a),
+            MemoryType::Semantic,
+            "小红喜欢狗".into(),
+            0.9,
+        );
+        other_user_memory.metadata =
+            serde_json::json!({"source_participant_id": participant_c, "shared": true});
+        memory_repo.insert(&other_user_memory).await.unwrap();
+
+        let mut local_memory = Memory::new(
+            character_id,
+            Some(conversation_b),
+            MemoryType::Episodic,
+            "群B的共同经历".into(),
+            0.9,
+        );
+        local_memory.metadata =
+            serde_json::json!({"source_participant_id": participant_d, "shared": false});
+        memory_repo.insert(&local_memory).await.unwrap();
 
         let visible = memory_repo
             .find_visible_for_participant(character_id, conversation_b, participant_b, 10)
             .await
             .unwrap();
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].content, "小明喜欢猫");
+        let visible_content = visible
+            .iter()
+            .map(|memory| memory.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(visible_content.len(), 2);
+        assert!(visible_content.contains(&"小明喜欢猫"));
+        assert!(visible_content.contains(&"群B的共同经历"));
+        assert!(!visible_content.contains(&"小明在群A提到的具体经历"));
+        assert!(!visible_content.contains(&"小红喜欢狗"));
+
+        let other_user_visible = memory_repo
+            .find_visible_for_participant(character_id, conversation_b, participant_d, 10)
+            .await
+            .unwrap();
+        let other_user_content = other_user_visible
+            .iter()
+            .map(|memory| memory.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(other_user_content, vec!["群B的共同经历"]);
+
+        // 没有用户身份上下文的接口只能读取本会话记忆。
+        let plugin_visible = memory_repo
+            .find_visible(character_id, conversation_b, 10)
+            .await
+            .unwrap();
+        assert_eq!(plugin_visible.len(), 1);
+        assert_eq!(plugin_visible[0].content, "群B的共同经历");
         let stored_user_id: Option<i64> =
             sqlx::query_scalar("SELECT user_id FROM memories WHERE content='小明喜欢猫'")
                 .fetch_one(storage.pool())
@@ -1518,6 +1599,35 @@ mod storage_tests {
                 .await
                 .unwrap();
         assert_eq!(count, 2);
+
+        let conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type,external_id) VALUES('group','identity-trigger-test') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let participant_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO participants(conversation_id,external_id,display_name,role,metadata)
+               VALUES(?, 'trigger-user', '触发器用户', 'user', '{"platform":"other_platform"}')
+               RETURNING id"#,
+        )
+        .bind(conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let trigger_user_id: i64 =
+            sqlx::query_scalar("SELECT user_id FROM participants WHERE id=?")
+                .bind(participant_id)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let identity: (String, String) =
+            sqlx::query_as("SELECT platform,external_id FROM users WHERE id=?")
+                .bind(trigger_user_id)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(identity, ("other_platform".into(), "trigger-user".into()));
     }
 
     #[tokio::test]
@@ -1832,6 +1942,24 @@ mod storage_tests {
             .fetch_one(storage.pool())
             .await
             .unwrap();
+        let source_message_id: i64 = sqlx::query_scalar(
+            "INSERT INTO messages(conversation_id,sender_id,content) VALUES(?,?,?) RETURNING id",
+        )
+        .bind(conversation_id)
+        .bind(source)
+        .bind("{}")
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO relationship_interactions(character_id,user_id,source_message_id) VALUES(?,?,?)",
+        )
+        .bind(character_id)
+        .bind(source_user)
+        .bind(source_message_id)
+        .execute(storage.pool())
+        .await
+        .unwrap();
         for (user_id, count) in [(source_user, 2_i64), (target_user, 5_i64)] {
             sqlx::query(
                 "INSERT INTO relationships(character_id,user_id,interaction_count) VALUES(?,?,?)",
@@ -1868,6 +1996,375 @@ mod storage_tests {
             .await
             .unwrap();
         assert_eq!(source_binding, target_user);
+
+        let interaction_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM relationship_interactions WHERE character_id=? AND user_id=? AND source_message_id=?",
+        )
+        .bind(character_id)
+        .bind(target_user)
+        .bind(source_message_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(interaction_count, 1);
+
+        let relationship_repo =
+            crate::infrastructure::storage::repository::SqliteRelationshipRepository::new(
+                storage.pool().clone(),
+            );
+        let inserted_again = relationship_repo
+            .record_interaction_once(character_id, source, source_message_id)
+            .await
+            .unwrap();
+        assert!(!inserted_again);
+        let merged_count_after_replay: i64 = sqlx::query_scalar(
+            "SELECT interaction_count FROM relationships WHERE character_id=? AND user_id=?",
+        )
+        .bind(character_id)
+        .bind(target_user)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(merged_count_after_replay, 7);
+    }
+
+    #[tokio::test]
+    async fn delete_user_removes_memories_and_anonymizes_history_atomically() {
+        let storage = setup_storage().await;
+        let participant_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+        let character_id: i64 = sqlx::query_scalar(
+            "INSERT INTO characters(name) VALUES('删除用户测试角色') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type,external_id) VALUES('group','delete-user-test') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let deleted_participant = participant_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id,
+                external_id: "920001".into(),
+                display_name: "旧账号昵称".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform":"onebot_qq","profile":"private"}),
+            })
+            .await
+            .unwrap();
+        let other_participant = participant_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id,
+                external_id: "920002".into(),
+                display_name: "另一位用户".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform":"onebot_qq"}),
+            })
+            .await
+            .unwrap();
+        let deleted_user_id: i64 =
+            sqlx::query_scalar("SELECT user_id FROM participants WHERE id = ?")
+                .bind(deleted_participant)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let other_user_id: i64 =
+            sqlx::query_scalar("SELECT user_id FROM participants WHERE id = ?")
+                .bind(other_participant)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let private_conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type,external_id,name) VALUES('private','920001','旧账号昵称') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_bindings(character_id,conversation_id,proactive_enabled) VALUES(?,?,1)",
+        )
+        .bind(character_id)
+        .bind(private_conversation_id)
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO blacklist_entries(target,target_type,reason) VALUES('920001','user','删除时应清理')",
+        )
+        .execute(storage.pool())
+        .await
+        .unwrap();
+
+        let deleted_message_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO messages(conversation_id,sender_id,content,metadata)
+               VALUES(?,?,?,?) RETURNING id"#,
+        )
+        .bind(conversation_id)
+        .bind(deleted_participant)
+        .bind(serde_json::json!("历史正文保留，账号 920001 曾写下的内容").to_string())
+        .bind(
+            serde_json::json!({
+                "author_kind":"user",
+                "external_sender_id":"920001",
+                "display_name":"旧账号昵称",
+                "mentions":[920002,920001]
+            })
+            .to_string(),
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let other_message_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO messages(conversation_id,sender_id,content,metadata)
+               VALUES(?,?,?,?) RETURNING id"#,
+        )
+        .bind(conversation_id)
+        .bind(other_participant)
+        .bind(serde_json::json!("另一位用户的历史消息").to_string())
+        .bind(
+            serde_json::json!({
+                "author_kind":"user",
+                "external_sender_id":"920002",
+                "display_name":"另一位用户",
+                "mentions":[920001,920003]
+            })
+            .to_string(),
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"INSERT INTO outbox_events
+               (event_uuid,entity_id,entity_type,event_type,event_version,payload,ordering_key,ordering_seq)
+               VALUES('delete-user-event',?,'messages','MessageAccepted',1,?,'conversation:delete-user-test',1)"#,
+        )
+        .bind(deleted_message_id)
+        .bind(serde_json::json!({
+            "message_id":deleted_message_id,
+            "content":"历史正文保留，账号 920001 曾写下的内容",
+            "metadata":{
+                "author_kind":"user",
+                "external_sender_id":"920001",
+                "display_name":"旧账号昵称",
+                "mentions":[920001]
+            }
+        }).to_string())
+        .execute(storage.pool())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO memories(character_id,conversation_id,memory_type,content,metadata,user_id) VALUES(?,?,'semantic','需要删除的个人记忆',?,?)",
+        )
+        .bind(character_id)
+        .bind(conversation_id)
+        .bind(serde_json::json!({"source_participant_id":deleted_participant}).to_string())
+        .bind(deleted_user_id)
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memories(character_id,conversation_id,memory_type,content,metadata,user_id) VALUES(?,?,'semantic','其他用户的记忆',?,?)",
+        )
+        .bind(character_id)
+        .bind(conversation_id)
+        .bind(serde_json::json!({"source_participant_id":other_participant}).to_string())
+        .bind(other_user_id)
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memories(character_id,conversation_id,memory_type,content,metadata,user_id) VALUES(?,?,'semantic','由多条经历整理出的个人记忆',?,NULL)",
+        )
+        .bind(character_id)
+        .bind(conversation_id)
+        .bind(serde_json::json!({"source_participant_ids":[deleted_participant,other_participant]}).to_string())
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO semantic_memories(character_id,conversation_id,memory_type,content,embedding,metadata) VALUES(?,?,'semantic','向量个人记忆','[0.1]',?)",
+        )
+        .bind(character_id)
+        .bind(conversation_id)
+        .bind(serde_json::json!({"source_participant_ids":[deleted_participant]}).to_string())
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO relationships(character_id,user_id) VALUES(?,?)")
+            .bind(character_id)
+            .bind(deleted_user_id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+
+        participant_repo.delete_user(deleted_user_id).await.unwrap();
+
+        let user_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id=?")
+            .bind(deleted_user_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(user_rows, 0);
+        let participant: (String, String, String, Option<i64>) = sqlx::query_as(
+            "SELECT external_id,display_name,metadata,user_id FROM participants WHERE id=?",
+        )
+        .bind(deleted_participant)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert!(participant.0.starts_with("deleted-user-"));
+        assert_eq!(participant.1, "已删除用户");
+        assert_eq!(participant.2, "{}");
+        assert_eq!(participant.3, None);
+        let private_conversation: (String, Option<String>, i64) = sqlx::query_as(
+            r#"SELECT c.external_id,c.name,b.proactive_enabled
+                 FROM conversations c
+                 JOIN conversation_bindings b ON b.conversation_id=c.id
+                WHERE c.id=?"#,
+        )
+        .bind(private_conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert!(private_conversation
+            .0
+            .starts_with("deleted-user-conversation-"));
+        assert_eq!(private_conversation.1.as_deref(), Some("已删除用户"));
+        assert_eq!(private_conversation.2, 0);
+
+        let messages: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT id,content,metadata FROM messages WHERE id IN (?,?) ORDER BY id",
+        )
+        .bind(deleted_message_id)
+        .bind(other_message_id)
+        .fetch_all(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].1,
+            serde_json::json!("历史正文保留，账号 920001 曾写下的内容").to_string()
+        );
+        assert!(!messages[0].2.contains("920001"));
+        assert!(!messages[0].2.contains("旧账号昵称"));
+        let other_metadata: serde_json::Value = serde_json::from_str(&messages[1].2).unwrap();
+        assert_eq!(other_metadata["mentions"], serde_json::json!([920003]));
+        assert_eq!(other_metadata["external_sender_id"], "920002");
+
+        let outbox_payload: String = sqlx::query_scalar(
+            "SELECT payload FROM outbox_events WHERE event_uuid='delete-user-event'",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let outbox_payload: serde_json::Value = serde_json::from_str(&outbox_payload).unwrap();
+        assert_eq!(
+            outbox_payload["content"],
+            "历史正文保留，账号 920001 曾写下的内容"
+        );
+        assert!(outbox_payload["metadata"]["external_sender_id"].is_null());
+        assert_eq!(outbox_payload["metadata"]["display_name"], "已删除用户");
+        assert_eq!(
+            outbox_payload["metadata"]["mentions"],
+            serde_json::json!([])
+        );
+
+        let remaining_memories: Vec<String> =
+            sqlx::query_scalar("SELECT content FROM memories ORDER BY id")
+                .fetch_all(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(remaining_memories, vec!["其他用户的记忆"]);
+        let semantic_memory_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM semantic_memories")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(semantic_memory_count, 0);
+        let blacklist_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM blacklist_entries WHERE target='920001' AND target_type='user'",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(blacklist_count, 0);
+        let relationship_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relationships WHERE user_id=?")
+                .bind(deleted_user_id)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(relationship_count, 0);
+        let foreign_key_violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(storage.pool())
+                .await
+                .unwrap();
+        assert!(foreign_key_violations.is_empty());
+
+        let missing = participant_repo.delete_user(deleted_user_id).await;
+        assert!(matches!(
+            missing,
+            Err(crate::error::RepositoryError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_user_rolls_back_anonymization_if_database_delete_fails() {
+        let storage = setup_storage().await;
+        let participant_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+        let conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type,external_id) VALUES('group','delete-rollback-test') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let participant_id = participant_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id,
+                external_id: "930001".into(),
+                display_name: "保留昵称".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform":"onebot_qq"}),
+            })
+            .await
+            .unwrap();
+        let user_id: i64 = sqlx::query_scalar("SELECT user_id FROM participants WHERE id=?")
+            .bind(participant_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_user_delete BEFORE DELETE ON users BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END",
+        )
+        .execute(storage.pool())
+        .await
+        .unwrap();
+
+        assert!(participant_repo.delete_user(user_id).await.is_err());
+        let participant: (String, String, Option<i64>) =
+            sqlx::query_as("SELECT external_id,display_name,user_id FROM participants WHERE id=?")
+                .bind(participant_id)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            participant,
+            ("930001".into(), "保留昵称".into(), Some(user_id))
+        );
     }
 
     #[tokio::test]
