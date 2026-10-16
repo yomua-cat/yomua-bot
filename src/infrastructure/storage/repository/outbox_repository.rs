@@ -8,6 +8,12 @@ use crate::domain::outbox::{OutboxEvent, OutboxStatus};
 use crate::domain::repository::OutboxRepository;
 use crate::error::RepositoryError;
 
+/// 进程在持有租约期间崩溃时，最多允许重新领取的次数。
+///
+/// 该值必须与 OutboxDispatcher 的默认上限一致。恢复流程在同一事务中把
+/// 已达到上限的过期事件置为 dead_letter，避免它们再次阻塞同一会话的后续事件。
+const DEFAULT_MAX_RETRY_ATTEMPTS: i32 = 3;
+
 /// P0: OutboxRow 使用结构体而不是元组，因为 sqlx 的 FromRow
 /// 只支持最多 16 个元素的元组，而 outbox_events 有 17 列。
 #[derive(Debug, FromRow)]
@@ -348,28 +354,57 @@ impl OutboxRepository for SqliteOutboxRepository {
 
     async fn recover_expired_processing(&self) -> Result<i64, RepositoryError> {
         let now = Utc::now().to_rfc3339();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // P0/P1 fix: 不再重置 attempts。
-        // attempts 表示"claim cycles"（成功进入 processing 的次数）。
-        // recovery 不重置，以便 MAX_RETRY_ATTEMPTS 提供真正的有限语义：
-        // claim → crash → recovery → claim → ... → MAX_RETRY_ATTEMPTS → dead_letter
-        //
-        // P0: 同时清除 lease_token，以便新的 claim 可以获取新的 ownership。
-        let result = sqlx::query(
+        // attempts 统计成功领取 processing 的次数，恢复不能把它清零。
+        // 达到上限的任务必须在本事务中进入 dead_letter，否则同一 ordering_key
+        // 会被永久卡住，后续事件也无法继续。
+        let dead_lettered = sqlx::query(
+            r#"
+            UPDATE outbox_events
+            SET status = 'dead_letter',
+                last_error = COALESCE(last_error, '租约过期且已达到最大尝试次数'),
+                locked_until = NULL,
+                lease_token = NULL,
+                processed_at = ?
+            WHERE status = 'processing'
+              AND locked_until <= ?
+              AND attempts >= ?
+            "#,
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(DEFAULT_MAX_RETRY_ATTEMPTS)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let pending = sqlx::query(
             r#"
             UPDATE outbox_events
             SET status = 'pending',
                 locked_until = NULL,
                 lease_token = NULL
-            WHERE status = 'processing' AND locked_until <= ?
+            WHERE status = 'processing'
+              AND locked_until <= ?
+              AND attempts < ?
             "#,
         )
         .bind(&now)
-        .execute(&self.pool)
+        .bind(DEFAULT_MAX_RETRY_ATTEMPTS)
+        .execute(&mut *tx)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        Ok(result.rows_affected() as i64)
+        tx.commit()
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok((dead_lettered.rows_affected() + pending.rows_affected()) as i64)
     }
 
     async fn find_by_uuid(&self, event_uuid: &str) -> Result<Option<OutboxEvent>, RepositoryError> {

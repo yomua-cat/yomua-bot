@@ -186,18 +186,10 @@ impl ConnectionShared {
         // Draining the HashMap to take ownership of the values.
         let requests: Vec<_> = pending.drain().map(|(_, v)| v).collect();
         drop(pending);
-        for req in requests {
-            // Send error response through the oneshot channel.
-            // If the receiver has been dropped (caller timed out), this will fail silently.
-            let _ = req.response_tx.send(ActionResponse {
-                id: req.id,
-                action: req.action,
-                status: "failed".to_string(),
-                retcode: None,
-                data: None,
-                error: Some("连接已断开".to_string()),
-            });
-        }
+        // 连接断开时没有平台回执，不能伪造一个 `failed` 响应。
+        // 直接丢弃发送端，让 `send_action` 收到 oneshot 关闭并转换为
+        // `SendUnknown`；只有平台明确返回失败时才允许安全重试。
+        drop(requests);
         count
     }
 }

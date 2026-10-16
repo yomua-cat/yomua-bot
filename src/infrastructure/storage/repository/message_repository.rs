@@ -119,18 +119,20 @@ impl MessageRepository for SqliteMessageRepository {
         &self,
         message_id: i64,
     ) -> Result<Option<crate::domain::message::ReplyTask>, RepositoryError> {
-        let row: Option<(String, Option<String>, Option<String>)> =
-            sqlx::query_as("SELECT status,content,error FROM reply_tasks WHERE message_id=?")
-                .bind(message_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        row.map(|(status, content, error)| {
+        let row: Option<(String, Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT status,content,error,platform_message_id FROM reply_tasks WHERE message_id=?",
+        )
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(status, content, error, platform_message_id)| {
             let status = serde_json::from_value(serde_json::json!(status))
                 .map_err(|e| RepositoryError::Internal(format!("回复任务状态无效：{e}")))?;
             Ok(crate::domain::message::ReplyTask {
                 status,
                 content,
                 error,
+                platform_message_id,
             })
         })
         .transpose()

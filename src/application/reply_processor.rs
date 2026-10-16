@@ -30,6 +30,8 @@ use crate::domain::outbox::ProcessingOutcome;
 use crate::domain::repository::ParticipantRepository;
 use crate::error::RuntimeError;
 
+const ASSISTANT_HISTORY_REPAIR_PREFIX: &str = "消息已发送但 assistant 历史落库失败";
+
 /// 单次回复最长允许的拟人化延迟（毫秒）。
 ///
 /// 行为引擎给出的延时（用于模拟输入间隔）可能较大；为了不让一条普通消息
@@ -319,6 +321,85 @@ impl ReplyProcessor {
         }
         Ok(())
     }
+
+    /// 幂等保存 assistant 历史。
+    ///
+    /// 发送 API 成功后，历史写入可能因数据库瞬时故障失败。调用方会把任务
+    /// 标记为可识别的 unknown，随后由 outbox 重试进入这里；先按 reply_task
+    /// 元数据查重，避免恢复时重复插入 assistant 消息。
+    async fn persist_assistant_history(
+        &self,
+        event: &MessageReceivedEvent,
+        character: &crate::domain::character::Character,
+        content: &str,
+        platform_message_id: Option<i64>,
+    ) -> Result<(), RuntimeError> {
+        let Some(repo) = &self.message_repo else {
+            return Ok(());
+        };
+        let recent = repo.find_recent(event.conversation_id, 200).await?;
+        if recent.iter().any(|message| {
+            message
+                .metadata
+                .get("reply_task")
+                .and_then(|value| value.as_i64())
+                == Some(event.message_id)
+                && message
+                    .metadata
+                    .get("author_kind")
+                    .and_then(|value| value.as_str())
+                    == Some("assistant")
+        }) {
+            return Ok(());
+        }
+
+        let assistant_external_id = self
+            .bot_self_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| format!("character:{}", event.character_id));
+        let assistant_sender_id = if let Some(participant) = self
+            .participant_repo
+            .find_by_external_id(event.conversation_id, &assistant_external_id)
+            .await?
+        {
+            participant.id
+        } else {
+            let participant = crate::domain::conversation::Participant {
+                id: 0,
+                conversation_id: event.conversation_id,
+                external_id: assistant_external_id,
+                display_name: character.definition.name.clone(),
+                role: crate::domain::conversation::ParticipantRole::Character,
+                metadata: serde_json::json!({
+                    "author_kind": "assistant",
+                    "character_id": event.character_id,
+                }),
+            };
+            self.participant_repo.insert(&participant).await?
+        };
+        let now = Utc::now();
+        let message = crate::domain::message::Message {
+            id: 0,
+            conversation_id: event.conversation_id,
+            sender_id: assistant_sender_id,
+            content: crate::domain::message::MessageContent::Text(content.to_string()),
+            timestamp: now,
+            reply_to: Some(event.message_id),
+            mentions: vec![],
+            attachments: vec![],
+            metadata: serde_json::json!({
+                "author_kind":"assistant",
+                "reply_task":event.message_id
+            }),
+            active_character_id: Some(event.character_id),
+            platform_message_id,
+            conversation_sequence: Some(event.conversation_sequence),
+            occurred_at: Some(now),
+            ingested_at: Some(now),
+        };
+        repo.insert(&message).await?;
+        Ok(())
+    }
     async fn current_binding(
         &self,
         event: &MessageReceivedEvent,
@@ -355,6 +436,65 @@ impl ReplyProcessor {
         event: &MessageReceivedEvent,
         lease: Option<&str>,
     ) -> Result<(), RuntimeError> {
+        // 恢复时先处理上一次可能中断的发送状态，再检查绑定和过期时间。
+        // 这样切换角色或任务过期不会把 Sending 任务遗留成可重复发送的状态。
+        let stored = if let Some(repo) = &self.message_repo {
+            if event.message_id > 0 {
+                repo.reply_task(event.message_id).await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if stored
+            .as_ref()
+            .is_some_and(|task| task.status == ReplyTaskStatus::Sending)
+        {
+            if let Some(repo) = &self.message_repo {
+                if let Some(task) = stored.as_ref() {
+                    if let (Some(content), Some(platform_message_id)) =
+                        (task.content.as_deref(), task.platform_message_id)
+                    {
+                        // 已经拿到平台消息 ID，平台发送确定成功；这里只补写本地历史，
+                        // 不再重新调用发送接口。
+                        let character = self.runtime.refresh_character(event.character_id).await?;
+                        self.persist_assistant_history(
+                            event,
+                            &character,
+                            content,
+                            Some(platform_message_id),
+                        )
+                        .await?;
+                        repo.save_reply_task_delivery(
+                            event.message_id,
+                            event.character_id,
+                            ReplyTaskStatus::Sent,
+                            None,
+                            None,
+                            Some(platform_message_id),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+                let changed = repo
+                    .mark_reply_task_unknown_if_sending(
+                        event.message_id,
+                        event.character_id,
+                        "进程在发送平台回执前退出，发送结果未知，需要核查",
+                    )
+                    .await?;
+                if changed {
+                    tracing::warn!(
+                        message_id = event.message_id,
+                        "恢复发送中回复任务并标记为 unknown"
+                    );
+                }
+            }
+            return Ok(());
+        }
+
         let Some(binding) = self.current_binding(event).await? else {
             self.save_task(event, ReplyTaskStatus::Cancelled, None)
                 .await?;
@@ -385,40 +525,36 @@ impl ReplyProcessor {
                 .await?;
             return Ok(());
         }
-        let stored = if let Some(repo) = &self.message_repo {
-            if event.message_id > 0 {
-                repo.reply_task(event.message_id).await?
-            } else {
-                None
+        if stored.as_ref().is_some_and(|task| {
+            task.status == ReplyTaskStatus::Unknown
+                && task
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with(ASSISTANT_HISTORY_REPAIR_PREFIX))
+        }) {
+            let content = stored
+                .as_ref()
+                .and_then(|task| task.content.as_deref())
+                .ok_or_else(|| RuntimeError::Internal("历史修复任务缺少回复内容".into()))?;
+            self.persist_assistant_history(event, &character, content, None)
+                .await?;
+            if let Some(repo) = &self.message_repo {
+                repo.save_reply_task_delivery(
+                    event.message_id,
+                    event.character_id,
+                    ReplyTaskStatus::Sent,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
             }
-        } else {
-            None
-        };
-        if stored
-            .as_ref()
-            .is_some_and(|task| task.status.is_terminal())
-        {
             return Ok(());
         }
         if stored
             .as_ref()
-            .is_some_and(|task| task.status == ReplyTaskStatus::Sending)
+            .is_some_and(|task| task.status.is_terminal())
         {
-            if let Some(repo) = &self.message_repo {
-                let changed = repo
-                    .mark_reply_task_unknown_if_sending(
-                        event.message_id,
-                        event.character_id,
-                        "进程在发送平台回执前退出，发送结果未知，需要核查",
-                    )
-                    .await?;
-                if changed {
-                    tracing::warn!(
-                        message_id = event.message_id,
-                        "恢复发送中回复任务并标记为 unknown"
-                    );
-                }
-            }
             return Ok(());
         }
         let stable_user_key = event
@@ -580,6 +716,32 @@ impl ReplyProcessor {
                     .and_then(|data| data.get("message_id"))
                     .and_then(|value| value.as_i64());
                 if let Some(repo) = &self.message_repo {
+                    // 先持久化正文和平台消息 ID，但保持 sending。若本地历史写入
+                    // 失败，重启后可据此补写，而不需要再次发送。
+                    repo.save_reply_task_delivery(
+                        event.message_id,
+                        event.character_id,
+                        ReplyTaskStatus::Sending,
+                        Some(&content),
+                        None,
+                        platform_message_id,
+                    )
+                    .await?;
+                    if let Err(error) = self
+                        .persist_assistant_history(event, &character, &content, platform_message_id)
+                        .await
+                    {
+                        repo.save_reply_task_delivery(
+                            event.message_id,
+                            event.character_id,
+                            ReplyTaskStatus::Sending,
+                            Some(&content),
+                            Some(&format!("{ASSISTANT_HISTORY_REPAIR_PREFIX}: {error}")),
+                            platform_message_id,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
                     repo.save_reply_task_delivery(
                         event.message_id,
                         event.character_id,
@@ -618,49 +780,6 @@ impl ReplyProcessor {
                 tracing::error!(conversation_id=event.conversation_id,message_id=event.message_id,error=%e,"发送结果未知，停止自动补发，等待核查");
                 return Ok(());
             }
-        }
-        if let Some(repo) = &self.message_repo {
-            let assistant_external_id = self
-                .bot_self_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| format!("character:{}", event.character_id));
-            let assistant_sender_id = if let Some(participant) = self
-                .participant_repo
-                .find_by_external_id(event.conversation_id, &assistant_external_id)
-                .await?
-            {
-                participant.id
-            } else {
-                let participant = crate::domain::conversation::Participant {
-                    id: 0,
-                    conversation_id: event.conversation_id,
-                    external_id: assistant_external_id,
-                    display_name: character.definition.name.clone(),
-                    role: crate::domain::conversation::ParticipantRole::Character,
-                    metadata: serde_json::json!({
-                        "author_kind": "assistant",
-                        "character_id": event.character_id,
-                    }),
-                };
-                self.participant_repo.insert(&participant).await?
-            };
-            let message = crate::domain::message::Message {
-                id: 0,
-                conversation_id: event.conversation_id,
-                sender_id: assistant_sender_id,
-                content: crate::domain::message::MessageContent::Text(content),
-                timestamp: Utc::now(),
-                reply_to: Some(event.message_id),
-                mentions: vec![],
-                attachments: vec![],
-                metadata: serde_json::json!({"author_kind":"assistant","reply_task":event.message_id}),
-                active_character_id: Some(event.character_id),
-                platform_message_id: None,
-                conversation_sequence: Some(event.conversation_sequence),
-                occurred_at: Some(Utc::now()),
-                ingested_at: Some(Utc::now()),
-            };
-            repo.insert(&message).await?;
         }
         Ok(())
     }

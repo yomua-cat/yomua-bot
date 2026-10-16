@@ -173,6 +173,8 @@ pub struct ReplyTask {
     pub status: ReplyTaskStatus,
     pub content: Option<String>,
     pub error: Option<String>,
+    /// 平台已返回的消息 ID；任务仍为 sending 时可据此补写 assistant 历史。
+    pub platform_message_id: Option<i64>,
 }
 
 /// 发送结果未知、需要人工核查的平台消息任务。

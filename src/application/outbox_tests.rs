@@ -150,7 +150,12 @@ impl OutboxRepository for MemOutboxRepo {
             if e.status == OutboxStatus::Processing
                 && e.locked_until.map(|l| l <= now).unwrap_or(false)
             {
-                e.status = OutboxStatus::Pending;
+                if e.attempts >= 3 {
+                    e.status = OutboxStatus::DeadLetter;
+                    e.processed_at = Some(now);
+                } else {
+                    e.status = OutboxStatus::Pending;
+                }
                 e.locked_until = None;
                 e.lease_token = None;
                 // P0/P1: 不重置 attempts，保持单调递增
@@ -1360,7 +1365,7 @@ mod outbox_ownership_tests {
         assert!(claimed2.attempts > claimed1.attempts);
     }
 
-    /// 测试 8: MAX_RETRY_ATTEMPTS triggers dead_letter
+    /// 测试 8: 租约恢复达到最大领取次数后进入 dead_letter
     #[tokio::test]
     async fn test_max_retry_attempts_triggers_dead_letter() {
         let storage = SqliteStorage::open_in_memory()
@@ -1372,9 +1377,12 @@ mod outbox_ownership_tests {
 
         let event = make_test_event("max-attempts-test", 1, 1);
         repo.add_outbox_event(event).await.expect("add failed");
+        repo.add_outbox_event(make_test_event("max-attempts-next", 1, 2))
+            .await
+            .expect("add next event failed");
 
-        // Claim 5 times (MAX_RETRY_ATTEMPTS = 5)
-        for i in 1..=5 {
+        // 三次领取都因租约过期后，恢复流程应原子地终结事件。
+        for i in 1..=3 {
             let claimed = repo
                 .claim_next_event(30)
                 .await
@@ -1391,17 +1399,20 @@ mod outbox_ownership_tests {
                 .expect("recover failed");
         }
 
-        // 第 6 次 claim 后，attempts = 6，超过 MAX_RETRY_ATTEMPTS(5)
-        // 但是否进入 dead_letter 取决于 dispatcher 的逻辑，不是 repository 的逻辑
-        // Repository 只是记录 attempts
-
-        // 验证 attempts 已经达到上限
         let final_event = repo
             .find_by_uuid("max-attempts-test")
             .await
             .expect("find failed")
             .expect("event not found");
-        assert_eq!(final_event.attempts, 5); // 最后一次 claim 的 attempts
-        assert_eq!(final_event.status, OutboxStatus::Pending);
+        assert_eq!(final_event.attempts, 3);
+        assert_eq!(final_event.status, OutboxStatus::DeadLetter);
+
+        // dead_letter 必须解除 ordering_key 阻塞，后续事件可以继续领取。
+        let next = repo
+            .claim_next_event(30)
+            .await
+            .expect("claim next failed")
+            .expect("next event remained blocked");
+        assert_eq!(next.event_uuid, "max-attempts-next");
     }
 }
