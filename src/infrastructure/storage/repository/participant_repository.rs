@@ -152,22 +152,27 @@ impl ParticipantRepository for SqliteParticipantRepository {
             return Ok(target_user_id);
         }
         let mut tx = self.pool.begin().await?;
-        let identities: Vec<(String, String)> = sqlx::query_as(
-            "SELECT platform, external_id FROM users WHERE id IN (?, ?) ORDER BY id",
-        )
-        .bind(source_user_id)
-        .bind(target_user_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        if identities.len() != 2 {
-            return Err(RepositoryError::NotFound("待合并用户不存在".into()));
-        }
-        if identities[0].0 != identities[1].0 {
+        let source_identity: Option<(String, String)> =
+            sqlx::query_as("SELECT platform, external_id FROM users WHERE id = ?")
+                .bind(source_user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let target_identity: Option<(String, String)> =
+            sqlx::query_as("SELECT platform, external_id FROM users WHERE id = ?")
+                .bind(target_user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((source_platform, source_external_id)) = source_identity else {
+            return Err(RepositoryError::NotFound("来源用户不存在".into()));
+        };
+        let Some((target_platform, _target_external_id)) = target_identity else {
+            return Err(RepositoryError::NotFound("目标用户不存在".into()));
+        };
+        if source_platform != target_platform {
             return Err(RepositoryError::Database(
                 "只能合并同一平台的全域用户".into(),
             ));
         }
-        let source_external_id = identities[0].1.clone();
 
         // 先清理历史副本中的源账号标识。消息正文保留，作者仍通过 sender_id
         // 和归并后的 user_id 可追溯，但旧平台 ID、昵称和适配器元数据不再泄露。

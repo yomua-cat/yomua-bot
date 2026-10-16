@@ -2434,6 +2434,79 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn merge_users_uses_explicit_source_when_source_id_is_greater() {
+        let storage = setup_storage().await;
+        let participant_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+        let conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type,external_id) VALUES('private','920001') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+
+        // 先创建目标，再创建来源，确保 source_user_id > target_user_id。
+        let target_participant = participant_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id,
+                external_id: "920001".into(),
+                display_name: "目标账号".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let source_participant = participant_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id,
+                external_id: "920002".into(),
+                display_name: "来源账号".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let target_user: i64 = sqlx::query_scalar("SELECT user_id FROM participants WHERE id=?")
+            .bind(target_participant)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        let source_user: i64 = sqlx::query_scalar("SELECT user_id FROM participants WHERE id=?")
+            .bind(source_participant)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert!(source_user > target_user);
+
+        participant_repo
+            .merge_users(source_user, target_user)
+            .await
+            .unwrap();
+
+        let source_participant_identity: (String, String) =
+            sqlx::query_as("SELECT external_id, display_name FROM participants WHERE id=?")
+                .bind(source_participant)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert!(source_participant_identity.0.starts_with("merged-user-"));
+        assert_eq!(source_participant_identity.1, "已合并用户");
+
+        let target_participant_identity: (String, String) =
+            sqlx::query_as("SELECT external_id, display_name FROM participants WHERE id=?")
+                .bind(target_participant)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(target_participant_identity.0, "920001");
+        assert_eq!(target_participant_identity.1, "目标账号");
+    }
+
+    #[tokio::test]
     async fn delete_user_removes_memories_and_anonymizes_history_atomically() {
         let storage = setup_storage().await;
         let participant_repo =
