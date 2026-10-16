@@ -2796,6 +2796,38 @@ async fn test_session_delete_all() {
 }
 
 #[tokio::test]
+async fn test_session_delete_all_cancels_pending_outbox_events() {
+    let env = create_env().await;
+    let payload = serde_json::json!({"conversation_id": env.conv_a_id, "message_id": 999});
+    sqlx::query(
+        "INSERT INTO outbox_events (event_uuid, entity_id, entity_type, event_type, payload, ordering_key, ordering_seq, status) VALUES (?, ?, 'messages', 'MessageAccepted', ?, ?, 1, 'pending')",
+    )
+    .bind("session-delete-pending-event")
+    .bind(999_i64)
+    .bind(payload.to_string())
+    .bind(env.conv_a_id.to_string())
+    .execute(env.storage.pool())
+    .await
+    .expect("插入测试 outbox 事件失败");
+
+    let resp = send_json(
+        &env.socket_path,
+        &serde_json::json!({ "version": 1, "id": 506, "request": { "operation": "session_delete_all", "params": {} } }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp["ok"], true, "删除会话应成功: {resp}");
+
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM outbox_events WHERE event_uuid='session-delete-pending-event'",
+    )
+    .fetch_one(env.storage.pool())
+    .await
+    .expect("查询 outbox 状态失败");
+    assert_eq!(status, "dead_letter", "会话删除必须终止待处理事件");
+}
+
+#[tokio::test]
 async fn test_session_delete_all_empty() {
     let env = create_env().await;
 
