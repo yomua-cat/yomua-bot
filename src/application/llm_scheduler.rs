@@ -295,6 +295,10 @@ impl DefaultLlmScheduler {
             .unwrap_or("");
         let route = self.route_requests(&request)?;
         let mut last_error = None;
+        // 预算是整条备用链共享的输出 token 预算。每次发起请求前先预留
+        // 本次允许的最大输出，因为 Provider 失败时没有可用的 usage 可供回收。
+        // 这样网络失败后切换备用模型也不会重新获得完整预算。
+        let mut remaining_budget = route.budget_tokens;
         let attempt_limit = route.max_attempts.min(route.models.len());
         for model in route.models.iter().take(attempt_limit) {
             let provider = providers.get(&model.provider).ok_or_else(|| {
@@ -307,12 +311,16 @@ impl DefaultLlmScheduler {
                     .map_err(|_| RuntimeError::Config("模型输出上限超过协议支持范围".into()))?;
                 attempt.max_tokens = Some(attempt.max_tokens.unwrap_or(max_output).min(max_output));
             }
-            if let Some(budget) = route.budget_tokens {
-                let remaining = budget;
+            if let Some(remaining) = remaining_budget {
                 if remaining == 0 {
                     break;
                 }
-                attempt.max_tokens = Some(attempt.max_tokens.unwrap_or(remaining).min(remaining));
+                let reserved = attempt.max_tokens.unwrap_or(remaining).min(remaining);
+                if reserved == 0 {
+                    break;
+                }
+                attempt.max_tokens = Some(reserved);
+                remaining_budget = Some(remaining - reserved);
             }
             tracing::debug!(target = "llm", role, provider = %model.provider, model = %model.model, "尝试 LLM 路由");
             match provider.generate(attempt).await {
@@ -394,6 +402,8 @@ mod tests {
         expected_model: Option<String>,
         /// 记录实际收到的 model 值
         captured_model: std::sync::Mutex<Option<Option<String>>>,
+        /// 记录每次调用收到的最大输出 token 上限。
+        captured_max_tokens: std::sync::Mutex<Vec<Option<u32>>>,
     }
 
     impl FakeProvider {
@@ -405,6 +415,7 @@ mod tests {
                 name: name.to_string(),
                 expected_model: None,
                 captured_model: std::sync::Mutex::new(None),
+                captured_max_tokens: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -425,12 +436,20 @@ mod tests {
         fn take_captured_model(&self) -> Option<Option<String>> {
             self.captured_model.lock().unwrap().take()
         }
+
+        fn captured_max_tokens(&self) -> Vec<Option<u32>> {
+            self.captured_max_tokens.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
     impl LlmProvider for FakeProvider {
         async fn generate(&self, request: LlmRequest) -> Result<LlmResponse, RuntimeError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.captured_max_tokens
+                .lock()
+                .unwrap()
+                .push(request.max_tokens);
             if self.fail {
                 return Err(RuntimeError::HttpError("temporary provider failure".into()));
             }
@@ -994,7 +1013,7 @@ mod tests {
                         provider: "backup".into(),
                         model: "backup-model".into(),
                         context_window: Some(8192),
-                        max_output_tokens: Some(256),
+                        max_output_tokens: Some(512),
                     },
                 ],
                 max_attempts: 2,
@@ -1010,5 +1029,7 @@ mod tests {
         assert_eq!(response.content, "prio=1");
         assert_eq!(primary.call_count(), 1);
         assert_eq!(backup.call_count(), 1);
+        assert_eq!(primary.captured_max_tokens(), vec![Some(256)]);
+        assert_eq!(backup.captured_max_tokens(), vec![Some(256)]);
     }
 }
