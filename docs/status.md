@@ -7,7 +7,7 @@
 | 检查 | 结果 | 边界 |
 | --- | --- | --- |
 | `cargo check --locked --all-targets --offline` | 通过 | 当前本机工具链和锁文件 |
-| `cargo test --locked --all-targets` | 通过 | 库 437 个、主程序 5 个、ctl 36 个、alpha 集成 8 个、控制集成 83 个通过；15 个插件 Unix socket 测试按标记忽略 |
+| `cargo test --locked --all-targets` | 通过 | 库 439 个、主程序 5 个、ctl 36 个、alpha 集成 8 个、控制集成 83 个通过；15 个插件 Unix socket 测试按标记忽略 |
 | 插件 Unix socket 测试显式运行 | 通过 | `--ignored` 下 15 个测试全部通过；普通 CI 仍按 `#[ignore]` 标记单独记录 |
 | `cargo fmt --all -- --check` | 通过 | 当前工作树 |
 | `cargo clippy --locked --offline --all-targets --all-features -- -D warnings` | 通过 | 当前工作树，包含测试目标 |
@@ -34,6 +34,7 @@
 - 关系交互按来源消息幂等记录，Outbox 重试不会重复增加熟悉度。
 - 全域用户身份已落地：`users` 以 `(platform, external_id)` 唯一，用户参与者通过 `participants.user_id` 关联；关系数据库主键和领域对象均使用 `(character_id, user_id)`，会话 `participant_id` 只作为解析入口。同一平台用户跨群/私聊共享关系。旧关系迁移会按既定规则合并并有 SQLite 回归测试覆盖。
 - 用户参与者写入时由仓储和 SQLite 触发器共同补齐全域身份；删除后的历史占位改为 `system` 角色，因此正常 `user` 参与者不会留下空 `user_id`。
+- 用户合并会按显式来源和目标身份读取平台账号，不依赖数据库 ID 排序；状态控制中会话状态与心情写入使用同一 SQLite 事务，任一部分失败都会整体回滚。
 - 关系交互幂等表也已从 `participant_id` 迁移为 `user_id`；旧数据按参与者映射到全域用户，重复的同一来源消息只保留一条，避免跨会话重复累计熟悉度。
 - OneBot 当前把平台命名空间写为 `onebot_qq`，外部 QQ 号只作为该命名空间内的 ID；相同外部 ID 在不同平台会生成不同全域用户。关系服务的入口仍以会话 `participant_id` 定位，再由仓储映射到 `user_id`，这是内部适配边界，不是第二套用户身份。
 - 记忆表增加可空 `user_id`；候选记忆会从来源 participant 回填用户归属，上下文按角色、当前会话和全域用户范围检索。没有可靠来源的旧记忆保持无用户归属，不会被错误绑定。
