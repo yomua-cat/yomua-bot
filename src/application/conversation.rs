@@ -74,6 +74,21 @@ impl ConversationManager {
         Ok(id)
     }
 
+    /// 只查找已经存在的会话，不创建新记录。
+    ///
+    /// 该入口用于平台回声、对账和其他不会创建业务身份的事件。
+    pub async fn find_existing_conversation(
+        &self,
+        conversation_type: ConversationType,
+        external_id: &str,
+    ) -> Result<Option<i64>, RuntimeError> {
+        Ok(self
+            .conversation_repo
+            .find_by_external_id_and_type(external_id, conversation_type)
+            .await?
+            .map(|conversation| conversation.id))
+    }
+
     /// 在指定会话内按外部发起者 ID 查找或创建参与者，返回核心参与者 ID。
     ///
     /// `display_name` 仅在首次创建参与者时使用。
@@ -110,6 +125,19 @@ impl ConversationManager {
         };
         let id = self.participant_repo.insert(&participant).await?;
         Ok(id)
+    }
+
+    /// 只查找会话内已有参与者，不创建身份记录。
+    pub async fn find_existing_participant(
+        &self,
+        conversation_id: i64,
+        external_id: &str,
+    ) -> Result<Option<i64>, RuntimeError> {
+        Ok(self
+            .participant_repo
+            .find_by_external_id(conversation_id, external_id)
+            .await?
+            .map(|participant| participant.id))
     }
 
     /// 解析一条入站消息的外部发起者 / 会话，并返回核心 ID 元组。

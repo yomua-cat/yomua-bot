@@ -593,6 +593,17 @@ fn handle_state_set(handle: &RuntimeHandle, id: u64, params: serde_json::Value) 
                 result["conversation_id"] = serde_json::json!(cid);
 
                 let patch_conv = obj.contains_key("energy") || obj.contains_key("stress");
+                // 先完成所有输入校验，再进行任意写入，避免 mood 参数错误时
+                // energy/stress 已经落库而命令却返回失败。
+                let parsed_mood = if let Some(value) = obj.get("mood") {
+                    Some(
+                        value
+                            .as_f64()
+                            .ok_or_else(|| RuntimeError::Internal("mood 必须是数字".to_string()))?,
+                    )
+                } else {
+                    None
+                };
                 if patch_conv {
                     let mut state: ConversationState = handle
                         .conversation_state_repo
@@ -622,11 +633,7 @@ fn handle_state_set(handle: &RuntimeHandle, id: u64, params: serde_json::Value) 
                         .map_err(|e| RuntimeError::Internal(e.to_string()))?;
                 }
 
-                if obj.contains_key("mood") {
-                    let mood_value = obj
-                        .get("mood")
-                        .and_then(|v| v.as_f64())
-                        .ok_or_else(|| RuntimeError::Internal("mood 必须是数字".to_string()))?;
+                if let Some(mood_value) = parsed_mood {
                     let mut mood: Mood = handle
                         .mood_repo
                         .find_by_character_and_conversation(character_id, cid)
@@ -1442,7 +1449,37 @@ fn handle_reply_unknown_retry(
         let message_id = params
             .get("message_id")
             .and_then(|value| value.as_i64())
-            .ok_or_else(|| RuntimeError::Internal("缺少 message_id".into()))?;
+            .ok_or_else(|| RuntimeError::Internal("参数错误：缺少 message_id".into()))?;
+        let task = handle
+            .message_repo
+            .find_unknown_reply_task(message_id)
+            .await?
+            .ok_or_else(|| RuntimeError::Internal("未找到 unknown 回复任务".into()))?;
+        let platform_message_id = task.platform_message_id.ok_or_else(|| {
+            RuntimeError::Internal("该任务没有平台消息 ID，只能人工核查，禁止自动重试".into())
+        })?;
+        let response = handle.adapter.get_message(platform_message_id).await?;
+        if response.is_ok() {
+            handle
+                .message_repo
+                .confirm_unknown_reply_task(message_id, platform_message_id)
+                .await?;
+            return Ok(ControlResponse::ok(
+                id,
+                serde_json::json!({
+                    "message_id": message_id,
+                    "platform_message_id": platform_message_id,
+                    "status": "confirmed_sent",
+                    "queued": false,
+                    "message": "平台已确认消息发送，未重新排队"
+                }),
+            ));
+        }
+        if !response_explicitly_confirms_not_sent(&response) {
+            return Err(RuntimeError::Internal(
+                "平台未明确确认消息未发送，保持 unknown，禁止自动重试".into(),
+            ));
+        }
         let changed = handle
             .message_repo
             .requeue_unknown_reply_task(message_id)
@@ -1456,8 +1493,9 @@ fn handle_reply_unknown_retry(
             id,
             serde_json::json!({
                 "message_id": message_id,
+                "platform_message_id": platform_message_id,
                 "status": "queued",
-                "message": "已重新排队；只有明确确认平台未发送后才应执行此命令"
+                "message": "平台已明确确认未发送，已重新排队"
             }),
         ))
     })

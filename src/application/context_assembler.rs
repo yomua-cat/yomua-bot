@@ -451,7 +451,7 @@ impl ContextAssembler {
                 } else {
                     LlmRole::User
                 };
-                let content = match &msg.content {
+                let base_content = match &msg.content {
                     crate::domain::message::MessageContent::Text(t) => {
                         if role == LlmRole::User {
                             format!(
@@ -471,6 +471,29 @@ impl ContextAssembler {
                         }
                     }
                     _ => String::from("[非文本消息]"),
+                };
+                let content = if let Some(reply_to) = msg.reply_to {
+                    let quoted = ctx
+                        .recent_messages
+                        .iter()
+                        .find(|candidate| candidate.id == reply_to);
+                    match quoted {
+                        Some(target) => {
+                            let author = target
+                                .metadata
+                                .get("display_name")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("未知发言者");
+                            let quoted_text = match &target.content {
+                                crate::domain::message::MessageContent::Text(text) => text.as_str(),
+                                _ => "[非文本消息]",
+                            };
+                            format!("[引用 {} 的消息：{}] {}", author, quoted_text, base_content)
+                        }
+                        None => base_content,
+                    }
+                } else {
+                    base_content
                 };
                 LlmMessage { role, content }
             })

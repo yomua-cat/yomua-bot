@@ -414,6 +414,18 @@ impl ReplyProcessor {
         event: &MessageReceivedEvent,
         lease: Option<&str>,
     ) -> Result<(), RuntimeError> {
+        // 会话或消息可能已在 Outbox 领取后被删除。此时事件已经失效，
+        // 必须在任何关系、记忆或模型调用前直接确认，避免删除后的副作用。
+        if let Some(repo) = &self.message_repo {
+            if event.message_id > 0 && repo.find_by_id(event.message_id).await?.is_none() {
+                tracing::debug!(
+                    conversation_id = event.conversation_id,
+                    message_id = event.message_id,
+                    "源消息已删除，跳过失效 Outbox 事件"
+                );
+                return Ok(());
+            }
+        }
         // 恢复时先处理上一次可能中断的发送状态，再检查绑定和过期时间。
         // 这样切换角色或任务过期不会把 Sending 任务遗留成可重复发送的状态。
         let stored = if let Some(repo) = &self.message_repo {

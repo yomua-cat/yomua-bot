@@ -431,13 +431,11 @@ impl InboundProcessor {
         // self_id 来自平台事件本身，比本地可选配置更可靠。自身回声只记录平台
         // 对账信息，不进入命令、关系、记忆或回复链路；assistant 历史由出站路径落库。
         if inbound.is_self_echo {
-            if let Ok((conversation_id, _)) = self
+            if let Ok(Some(conversation_id)) = self
                 .conversation_manager
-                .resolve(
+                .find_existing_conversation(
                     inbound.conversation_type,
                     &inbound.external_conversation_id,
-                    &inbound.external_sender_id,
-                    &inbound.display_name,
                 )
                 .await
             {
@@ -502,32 +500,37 @@ impl InboundProcessor {
             }
         }
 
-        // 解析外部 ID → 核心 ID。
-        let resolved = match self
-            .conversation_manager
-            .resolve(
-                inbound.conversation_type,
-                &inbound.external_conversation_id,
-                &inbound.external_sender_id,
-                &inbound.display_name,
-            )
-            .await
-        {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!(target: "adapter", error = %e, "解析会话/参与者失败");
-                return;
-            }
-        };
-        let (conversation_id, sender_id) = resolved;
-
         // 硬性约束 B：指令消息在发布位截流——不发布 MessageReceived（不落库、
         // 不进角色上下文、不进插件 message 订阅），改为发布 CommandReceived。
-        if let Some(command) = crate::application::command::classify(
+        let classified_command = crate::application::command::classify(
             &inbound.content,
             inbound.is_mentioned,
             inbound.conversation_type,
-        ) {
+        );
+        if let Some(command) = classified_command {
+            let Some(conversation_id) = self
+                .conversation_manager
+                .find_existing_conversation(
+                    inbound.conversation_type,
+                    &inbound.external_conversation_id,
+                )
+                .await
+                .ok()
+                .flatten()
+            else {
+                tracing::debug!(target: "adapter", "忽略未绑定会话中的管理指令");
+                return;
+            };
+            let Some(sender_id) = self
+                .conversation_manager
+                .find_existing_participant(conversation_id, &inbound.external_sender_id)
+                .await
+                .ok()
+                .flatten()
+            else {
+                tracing::debug!(target: "adapter", conversation_id, "忽略未知参与者的管理指令");
+                return;
+            };
             match self
                 .acceptance_service
                 .claim_command_message(conversation_id, inbound.platform_message_id)
@@ -562,6 +565,24 @@ impl InboundProcessor {
             tracing::info!(target: "adapter", conversation_id, receivers, "收到系统指令，已截流发布 CommandReceived（不落库、不进角色上下文）");
             return;
         }
+
+        // 解析外部 ID → 核心 ID。普通消息允许按需创建会话和参与者。
+        let (conversation_id, sender_id) = match self
+            .conversation_manager
+            .resolve(
+                inbound.conversation_type,
+                &inbound.external_conversation_id,
+                &inbound.external_sender_id,
+                &inbound.display_name,
+            )
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(target: "adapter", error = %e, "解析会话/参与者失败");
+                return;
+            }
+        };
 
         // C2-4: 通过 BindingManager 确定 active character
         // 与 ReplyProcessor 行为一致：无绑定时会话不处理（不落库、不进角色上下文）
@@ -696,9 +717,15 @@ mod tests {
         }
         async fn find_by_external_id(
             &self,
-            _id: &str,
+            id: &str,
         ) -> Result<Option<Conversation>, RepositoryError> {
-            Ok(None)
+            Ok(self
+                .convs
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|conversation| conversation.external_id == id)
+                .cloned())
         }
         async fn find_all(&self) -> Result<Vec<Conversation>, RepositoryError> {
             Ok(self.convs.lock().unwrap().clone())
@@ -728,7 +755,14 @@ mod tests {
             _conversation_id: i64,
             _external_id: &str,
         ) -> Result<Option<Participant>, RepositoryError> {
-            Ok(None)
+            Ok(Some(Participant {
+                id: 1,
+                conversation_id: 1,
+                external_id: "900001".to_string(),
+                display_name: "测试用户".to_string(),
+                role: crate::domain::conversation::ParticipantRole::User,
+                metadata: serde_json::json!({}),
+            }))
         }
         async fn find_by_conversation_id(
             &self,
@@ -745,7 +779,24 @@ mod tests {
     fn processor() -> InboundProcessor {
         let conversation_manager = ConversationManager::new(
             Arc::new(MemConversationRepo {
-                convs: StdMutex::new(vec![]),
+                convs: StdMutex::new(vec![
+                    Conversation {
+                        id: 1,
+                        conversation_type: crate::domain::conversation::ConversationType::Group,
+                        external_id: "500000".to_string(),
+                        name: None,
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                    },
+                    Conversation {
+                        id: 2,
+                        conversation_type: crate::domain::conversation::ConversationType::Private,
+                        external_id: "555".to_string(),
+                        name: None,
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                    },
+                ]),
             }),
             Arc::new(MemParticipantRepo),
         );

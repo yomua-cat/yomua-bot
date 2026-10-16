@@ -685,7 +685,7 @@ impl MessageRepository for SqliteMessageRepository {
                WHERE conversation_id = ?
                  AND active_character_id = ?
                  AND conversation_sequence < ?
-               ORDER BY conversation_sequence DESC
+               ORDER BY conversation_sequence DESC, id DESC
                LIMIT ?"#,
         )
         .bind(conversation_id)
@@ -716,7 +716,7 @@ impl MessageRepository for SqliteMessageRepository {
                     occurred_at, ingested_at
                FROM messages
                WHERE conversation_id = ?
-               ORDER BY conversation_sequence DESC
+               ORDER BY conversation_sequence DESC, id DESC
                LIMIT ?"#,
         )
         .bind(conversation_id)
@@ -836,6 +836,19 @@ impl MessageRepository for SqliteMessageRepository {
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let message_id = result.last_insert_rowid();
+
+        // 引用事件可能先于被引用消息到达。目标消息入库后，回填同一会话中
+        // 已保存的平台引用，避免上下文永久丢失本地外键。
+        if let Some(platform_message_id) = platform_message_id {
+            sqlx::query(
+                "UPDATE messages SET reply_to = ? WHERE conversation_id = ? AND reply_to IS NULL AND json_extract(metadata, '$.reply_to_platform_message_id') = ?",
+            )
+            .bind(message_id)
+            .bind(conversation_id)
+            .bind(platform_message_id)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         payload["message_id"] = serde_json::json!(message_id);
         payload["conversation_sequence"] = serde_json::json!(conversation_sequence);

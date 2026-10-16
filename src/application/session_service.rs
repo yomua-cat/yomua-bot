@@ -73,6 +73,24 @@ impl SessionService {
 
         let conv_ids: Vec<i64> = conv_ids.into_iter().map(|(id,)| id).collect();
 
+        // 会话删除必须同时终止尚未完成的持久事件，防止删除后仍触发模型、
+        // 关系和记忆副作用。payload 中保存了 MessageAccepted 的会话 ID。
+        let placeholders = std::iter::repeat("?")
+            .take(conv_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let cancel_sql = format!(
+            "UPDATE outbox_events SET status='dead_letter', last_error=? WHERE status IN ('pending','retry_wait','processing') AND json_extract(payload, '$.conversation_id') IN ({placeholders})"
+        );
+        let mut cancel_query = sqlx::query(&cancel_sql).bind("会话已删除");
+        for conversation_id in &conv_ids {
+            cancel_query = cancel_query.bind(conversation_id);
+        }
+        cancel_query
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("取消会话事件: {}", e)))?;
+
         // 删除该角色的 bindings（cascade 会清理 conversation_states, moods, behavior_states）
         sqlx::query("DELETE FROM conversation_bindings WHERE character_id = ?")
             .bind(character_id)
@@ -119,6 +137,13 @@ impl SessionService {
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| RuntimeError::Internal(format!("统计会话: {}", e)))?;
+
+        sqlx::query(
+            "UPDATE outbox_events SET status='dead_letter', last_error='会话已删除' WHERE status IN ('pending','retry_wait','processing') AND json_extract(payload, '$.conversation_id') IN (SELECT id FROM conversations)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("取消会话事件: {}", e)))?;
 
         // 删除所有会话（cascade 删除 messages, participants, conversation_bindings 等）
         sqlx::query("DELETE FROM conversations")

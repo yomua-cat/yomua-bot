@@ -23,7 +23,7 @@
 flowchart TD
     A[OneBot WebSocket 入站] --> B[转换事件、解析会话和参与者]
     B --> C{系统指令}
-    C -->|是| D[EventBus CommandReceived]
+    C -->|是| D[已有会话/身份检查后发布 CommandReceived]
     D --> E[管理员校验及指令处理]
     C -->|否| F[查询会话角色绑定]
     F --> G[MessageAcceptanceService]
@@ -34,16 +34,16 @@ flowchart TD
     K --> L[ReplyProcessor]
     L --> M[状态与关系、规则决策、上下文、回复生成]
     M --> N[ActionDispatcher → OneBot]
-    H --> O[EventBus MessageReceived → 观察者与插件]
+    H --> O[EventBus MessageAccepted → 观察者与插件]
 ```
 
-入站实现见[OneBot 适配器](../src/adapters/onebot/mod.rs)。系统指令先截流，管理员身份依据 `admin_users`；普通消息无角色绑定时不进入消息落库及回复流程，但会话与发送者可能已经创建。
+入站实现见[OneBot 适配器](../src/adapters/onebot/mod.rs)。系统指令先截流，只对已有会话和参与者发布 `CommandReceived`，避免无效指令制造孤儿身份；普通消息无角色绑定时不进入消息落库及回复流程，但允许按需创建会话与发送者。
 
 [消息接受服务](../src/application/message_acceptance.rs)调用[消息仓储](../src/infrastructure/storage/repository/message_repository.rs)，在同一事务内递增会话序号并写入消息和 Outbox 行。广播事件保留给插件和观察者；普通消息回复只由 Outbox Dispatcher/Processor 链路处理。
 
 [OutboxDispatcher](../src/application/outbox_dispatcher.rs)轮询、领取租约并等待消费者应答；[OutboxProcessor](../src/application/outbox_processor.rs)把 payload 转交[回复处理器](../src/application/reply_processor.rs)。租约、轮询和最大重试次数是代码默认值，当前没有对应 TOML 字段。消费者成功后标记完成，失败可转入等待重试或死信；永久失败事件记录后不会阻塞同一会话后续事件。
 
-这条链路不构成端到端可靠投递保证：当前 payload、错误传播、角色归属和外部回执仍有明确缺口。完成状态只能按实际实现解释，不能据此推断 QQ 用户已收到消息。
+这条链路不构成端到端可靠投递保证：QQ 管理指令回复尚未接入持久回复任务，普通消息的未知外部回执也可能缺少平台消息 ID。完成状态只能按实际实现解释，不能据此推断 QQ 用户已收到消息。
 
 ## 角色与状态边界
 
