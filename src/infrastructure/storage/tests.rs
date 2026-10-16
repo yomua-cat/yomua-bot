@@ -173,6 +173,31 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn migration_rejects_duplicate_conversation_identity_before_replacing_index() {
+        let storage = setup_storage().await;
+        sqlx::query("DROP INDEX idx_conversations_external_type")
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations(conversation_type,external_id) VALUES('group','duplicate-identity'),('group','duplicate-identity')",
+        )
+        .execute(storage.pool())
+        .await
+        .unwrap();
+
+        let error = storage.migrate().await.unwrap_err().to_string();
+        assert!(error.contains("重复会话身份"), "实际错误：{error}");
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_conversations_external_type'",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(index_count, 0, "迁移失败时不应伪造新索引已创建");
+    }
+
+    #[tokio::test]
     async fn test_allocate_sequence_uses_sqlite_atomic_update() {
         let storage = setup_storage().await;
         let repo = crate::infrastructure::storage::repository::SqliteConversationRepository::new(
@@ -1126,6 +1151,107 @@ mod storage_tests {
                 .await
                 .unwrap();
         assert!(stored_user_id.is_some());
+
+        // 向量检索必须使用同一套会话与共享边界，不能因为走了 semantic_memories
+        // 就绕过普通记忆查询的可见性规则。
+        let user_a = stored_user_id.unwrap();
+        memory_repo
+            .insert_semantic(
+                character_id,
+                Some(conversation_a),
+                "semantic",
+                "向量共享事实",
+                &[1.0, 0.0],
+                0.9,
+                &serde_json::json!({"shared": true, "user_id": user_a}).to_string(),
+            )
+            .await
+            .unwrap();
+        memory_repo
+            .insert_semantic(
+                character_id,
+                Some(conversation_a),
+                "semantic",
+                "向量私密经历",
+                &[1.0, 0.0],
+                0.9,
+                &serde_json::json!({"shared": false, "user_id": user_a}).to_string(),
+            )
+            .await
+            .unwrap();
+
+        let vector_cross_session = memory_repo
+            .search_visible_by_embedding(
+                character_id,
+                conversation_b,
+                Some(user_a),
+                &[1.0, 0.0],
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vector_cross_session
+                .iter()
+                .map(|item| item.memory.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["向量共享事实"]
+        );
+
+        // 用户请求本身只留下待确认记录，不应立即改变跨会话读取范围。
+        memory_repo
+            .request_sharing_policy(character_id, 1, Some("不要带到其他会话"))
+            .await
+            .unwrap();
+        let still_visible = memory_repo
+            .find_visible_for_participant(character_id, conversation_b, participant_b, 10)
+            .await
+            .unwrap();
+        assert!(still_visible
+            .iter()
+            .any(|memory| memory.content == "小明喜欢猫"));
+
+        // 管理员确认后，只阻止未来的跨会话检索；来源会话仍然可读。
+        memory_repo
+            .confirm_sharing_policy(character_id, 1, Some("确认隐私禁用"))
+            .await
+            .unwrap();
+        let blocked = memory_repo
+            .find_visible_for_participant(character_id, conversation_b, participant_b, 10)
+            .await
+            .unwrap();
+        assert!(!blocked.iter().any(|memory| memory.content == "小明喜欢猫"));
+        let vector_blocked = memory_repo
+            .search_visible_by_embedding(
+                character_id,
+                conversation_b,
+                Some(user_a),
+                &[1.0, 0.0],
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(vector_blocked.is_empty());
+        let source_visible = memory_repo
+            .find_visible_for_participant(character_id, conversation_a, participant_a, 10)
+            .await
+            .unwrap();
+        assert!(source_visible
+            .iter()
+            .any(|memory| memory.content == "小明喜欢猫"));
+
+        // 取消策略后重新允许未来跨会话读取。
+        memory_repo
+            .cancel_sharing_policy(character_id, 1, Some("用户撤回禁用"))
+            .await
+            .unwrap();
+        let restored = memory_repo
+            .find_visible_for_participant(character_id, conversation_b, participant_b, 10)
+            .await
+            .unwrap();
+        assert!(restored.iter().any(|memory| memory.content == "小明喜欢猫"));
     }
 
     #[tokio::test]
@@ -1264,6 +1390,63 @@ mod storage_tests {
         });
         memory_repo.insert(&inference).await.unwrap();
         assert_eq!(memory_repo.promote_safe_candidates(10).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn promoted_candidate_remains_idempotent_for_same_source() {
+        let storage = setup_storage().await;
+        let memory_repo = crate::infrastructure::storage::repository::SqliteMemoryRepository::new(
+            storage.pool().clone(),
+        );
+        let character_id: i64 =
+            sqlx::query_scalar("INSERT INTO characters(name) VALUES('来源幂等') RETURNING id")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+
+        let mut candidate = Memory::new(
+            character_id,
+            None,
+            MemoryType::Semantic,
+            "我喜欢茶".to_string(),
+            0.8,
+        );
+        candidate.metadata = serde_json::json!({
+            "kind": "statement",
+            "status": "candidate",
+            "source_message_id": 9001,
+            "candidate_confidence": 0.95,
+            "shared": true,
+        });
+
+        let first_id = memory_repo
+            .insert_candidate_once(&candidate)
+            .await
+            .unwrap()
+            .expect("首次处理应创建候选");
+        assert_eq!(memory_repo.promote_safe_candidates(10).await.unwrap(), 1);
+
+        let retry = memory_repo.insert_candidate_once(&candidate).await.unwrap();
+        assert!(retry.is_none(), "正式记忆仍应阻止同来源重试");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memories WHERE character_id=? AND json_extract(metadata, '$.source_message_id')= ?",
+        )
+        .bind(character_id)
+        .bind(9001_i64)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT json_extract(metadata, '$.status') FROM memories WHERE id=?"
+            )
+            .bind(first_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap(),
+            "formal"
+        );
     }
 
     #[tokio::test]
@@ -2111,11 +2294,16 @@ mod storage_tests {
             .await
             .unwrap();
         let source_message_id: i64 = sqlx::query_scalar(
-            "INSERT INTO messages(conversation_id,sender_id,content) VALUES(?,?,?) RETURNING id",
+            "INSERT INTO messages(conversation_id,sender_id,content,metadata) VALUES(?,?,?,?) RETURNING id",
         )
         .bind(conversation_id)
         .bind(source)
         .bind("{}")
+        .bind(serde_json::json!({
+            "external_sender_id": "910001",
+            "display_name": "旧号",
+            "mentions": ["910001", "910002"]
+        }).to_string())
         .fetch_one(storage.pool())
         .await
         .unwrap();
@@ -2164,6 +2352,29 @@ mod storage_tests {
             .await
             .unwrap();
         assert_eq!(source_binding, target_user);
+        let source_identity: (String, String, String) = sqlx::query_as(
+            "SELECT external_id, display_name, metadata FROM participants WHERE id=?",
+        )
+        .bind(source)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert!(source_identity.0.starts_with("merged-user-"));
+        assert_eq!(source_identity.1, "已合并用户");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&source_identity.2).unwrap(),
+            serde_json::json!({"merged_into_user_id": target_user})
+        );
+        let merged_metadata: String =
+            sqlx::query_scalar("SELECT metadata FROM messages WHERE id=?")
+                .bind(source_message_id)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let merged_metadata: serde_json::Value = serde_json::from_str(&merged_metadata).unwrap();
+        assert!(merged_metadata["external_sender_id"].is_null());
+        assert!(merged_metadata["display_name"] == "已合并用户");
+        assert_eq!(merged_metadata["mentions"], serde_json::json!(["910002"]));
 
         let interaction_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM relationship_interactions WHERE character_id=? AND user_id=? AND source_message_id=?",

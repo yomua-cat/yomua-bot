@@ -190,10 +190,17 @@ impl OutboxDispatcher {
         let ordering_key = event.ordering_key.clone();
         let ordering_seq = event.ordering_seq;
         // P0: 提取并保留 lease_token，用于后续的 ownership 验证
-        let lease_token = event
-            .lease_token
-            .clone()
-            .expect("claim 的事件必须包含 lease_token");
+        let Some(lease_token) = event.lease_token.clone() else {
+            // 仓储契约要求 claim 返回 lease_token，但这里不能因为数据库中
+            // 出现损坏事件而让常驻调度任务 panic。事件会保持 processing，
+            // 由租约过期恢复路径处理；同时记录明确错误供运维排查。
+            error!(
+                target: "outbox",
+                event_uuid = %event_uuid,
+                "claim 返回了缺少 lease_token 的事件，跳过本轮处理"
+            );
+            return Err(());
+        };
         let processing_timeout_secs = self.config.processing_timeout_secs.max(1);
 
         debug!(

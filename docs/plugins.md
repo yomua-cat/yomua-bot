@@ -71,6 +71,6 @@ RPC 请求使用 `id`、`method`、`params`，响应使用相同 `id`、`ok`、`
 | `plugin_data.get/set/delete/list` | 无需声明；宿主按插件名隔离 |
 | `scheduler.create` | 当前拒绝，即使声明权限 |
 
-例如 `permissions = ["message.read", "character.read"]`。权限名必须使用清单支持的 dotted 名称。`message.read` 当前有实际处理器；参数、返回值和作用域应按[PluginApi](../src/application/plugin_api.rs)核对，授权规则见[权限模块](../src/infrastructure/plugin/permissions.rs)。
+例如 `permissions = ["message.read", "character.read"]`。权限名必须使用清单支持的 dotted 名称。读取接口必须带明确范围：`message.read` 使用 `conversation_id`，`character.read` 使用 `character_id`，`binding.read` 使用 `conversation_id`，`relationship.read` 使用 `character_id` 和全域 `user_id`。插件不能通过省略范围参数读取全局数据。参数、返回值和作用域应按[PluginApi](../src/application/plugin_api.rs)核对，授权规则见[权限模块](../src/infrastructure/plugin/permissions.rs)。
 
 当前角色状态 API 面向全局精力、压力和活动；不能据此假定具备全部会话状态管理。插件 LLM 请求仍受 LLM 开关与 `conversation` 路由约束。`memory.read` 必须提供当前 `conversation_id`，核心先按会话可见范围排除候选和其他会话记忆；默认返回脱敏摘要，只有显式 `raw: true` 才返回原文。

@@ -694,6 +694,7 @@ mod tests {
         Memory {
             id,
             character_id: 1,
+            user_id: None,
             conversation_id: Some(10),
             memory_type: crate::domain::memory::MemoryType::Episodic,
             content: format!("记忆-{id}"),
@@ -902,6 +903,7 @@ mod tests {
         let cat_mem = Memory {
             id: 3,
             character_id: 1,
+            user_id: None,
             conversation_id: Some(10),
             memory_type: crate::domain::memory::MemoryType::Semantic,
             content: "用户喜欢猫".to_string(),

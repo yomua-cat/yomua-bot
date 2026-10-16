@@ -152,14 +152,127 @@ impl ParticipantRepository for SqliteParticipantRepository {
             return Ok(target_user_id);
         }
         let mut tx = self.pool.begin().await?;
-        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id IN (?, ?)")
-            .bind(source_user_id)
-            .bind(target_user_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        if exists != 2 {
+        let identities: Vec<(String, String)> = sqlx::query_as(
+            "SELECT platform, external_id FROM users WHERE id IN (?, ?) ORDER BY id",
+        )
+        .bind(source_user_id)
+        .bind(target_user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if identities.len() != 2 {
             return Err(RepositoryError::NotFound("待合并用户不存在".into()));
         }
+        if identities[0].0 != identities[1].0 {
+            return Err(RepositoryError::Database(
+                "只能合并同一平台的全域用户".into(),
+            ));
+        }
+        let source_external_id = identities[0].1.clone();
+
+        // 先清理历史副本中的源账号标识。消息正文保留，作者仍通过 sender_id
+        // 和归并后的 user_id 可追溯，但旧平台 ID、昵称和适配器元数据不再泄露。
+        sqlx::query(
+            r#"UPDATE messages
+                  SET metadata = json_remove(
+                      json_set(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                               '$.author_kind', 'user', '$.display_name', '已合并用户'),
+                      '$.external_sender_id', '$.user_id', '$.platform', '$.stable_user_key')
+                WHERE sender_id IN (SELECT id FROM participants WHERE user_id = ?)"#,
+        )
+        .bind(source_user_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE messages
+                  SET metadata = json_set(
+                      CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                      '$.mentions', json(COALESCE((
+                          SELECT json_group_array(value)
+                            FROM json_each(CASE WHEN json_valid(messages.metadata) THEN messages.metadata ELSE '{}' END, '$.mentions')
+                           WHERE CAST(value AS TEXT) <> ?
+                      ), '[]')))
+                WHERE json_valid(metadata)
+                  AND json_type(metadata, '$.mentions') = 'array'
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(metadata, '$.mentions')
+                       WHERE CAST(value AS TEXT) = ?
+                  )"#,
+        )
+        .bind(&source_external_id)
+        .bind(&source_external_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE outbox_events
+                  SET payload = json_remove(
+                      json_set(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,
+                               '$.metadata.author_kind', 'user',
+                               '$.metadata.display_name', '已合并用户'),
+                      '$.metadata.external_sender_id', '$.metadata.user_id', '$.metadata.platform', '$.metadata.stable_user_key')
+                WHERE entity_type = 'messages'
+                  AND entity_id IN (
+                      SELECT id FROM messages
+                       WHERE sender_id IN (SELECT id FROM participants WHERE user_id = ?)
+                  )
+                  AND json_valid(payload)"#,
+        )
+        .bind(source_user_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE outbox_events
+                  SET payload = json_set(
+                      payload, '$.metadata.mentions', json(COALESCE((
+                          SELECT json_group_array(value)
+                            FROM json_each(payload, '$.metadata.mentions')
+                           WHERE CAST(value AS TEXT) <> ?
+                      ), '[]')))
+                WHERE json_valid(payload)
+                  AND json_type(payload, '$.metadata.mentions') = 'array'
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(payload, '$.metadata.mentions')
+                       WHERE CAST(value AS TEXT) = ?
+                  )"#,
+        )
+        .bind(&source_external_id)
+        .bind(&source_external_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // 旧私聊路由不能继续使用已经合并的账号 ID。
+        sqlx::query(
+            r#"UPDATE conversation_bindings
+                  SET proactive_enabled = 0
+                WHERE conversation_id IN (
+                    SELECT id FROM conversations
+                     WHERE conversation_type = 'private' AND external_id = ?
+                )"#,
+        )
+        .bind(&source_external_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE conversations
+                  SET external_id = 'merged-user-conversation-' || id,
+                      name = '已合并用户'
+                WHERE conversation_type = 'private' AND external_id = ?"#,
+        )
+        .bind(&source_external_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // 在切换 user_id 前匿名化源参与者，否则后续条件已无法再定位源身份。
+        sqlx::query(
+            r#"UPDATE participants
+                  SET external_id = 'merged-user-' || id,
+                      display_name = '已合并用户',
+                      metadata = json_object('merged_into_user_id', ?)
+                WHERE user_id = ?"#,
+        )
+        .bind(target_user_id)
+        .bind(source_user_id)
+        .execute(&mut *tx)
+        .await?;
 
         // 关系和记忆按 user_id 归并；关系状态由迁移同样的规则合并。
         sqlx::query("UPDATE participants SET user_id = ? WHERE user_id = ?")
@@ -168,6 +281,11 @@ impl ParticipantRepository for SqliteParticipantRepository {
             .execute(&mut *tx)
             .await?;
         sqlx::query("UPDATE memories SET user_id = ? WHERE user_id = ?")
+            .bind(target_user_id)
+            .bind(source_user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE semantic_memories SET user_id = ? WHERE user_id = ?")
             .bind(target_user_id)
             .bind(source_user_id)
             .execute(&mut *tx)
@@ -259,14 +377,16 @@ impl ParticipantRepository for SqliteParticipantRepository {
         .bind(user_id)
         .bind(user_id)
         .bind(user_id)
+        .bind(user_id)
         .execute(&mut *tx)
         .await?;
 
         // 向量记忆有独立存储表，不受普通记忆删除影响；按来源参与者一并清理。
         sqlx::query(
             r#"DELETE FROM semantic_memories
-                WHERE json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
-                                   '$.user_id') = ?
+                WHERE user_id = ?
+                   OR json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                                   '$.user_id') = CAST(? AS TEXT)
                    OR json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
                                    '$.source_participant_id') IN
                       (SELECT id FROM participants WHERE user_id = ?)

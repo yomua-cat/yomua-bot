@@ -15,14 +15,14 @@
 - `cargo check --locked --all-targets --offline`：通过。
 - `cargo test --locked --all-targets --no-run --offline`：通过编译检查。
 - `cargo fmt --all -- --check`：通过。
-- `cargo test --locked --all-targets --offline`：库 426 个、主程序 5 个、ctl 34 个、alpha 集成 8 个、控制集成 80 个通过；插件 Unix socket 测试按 `#[ignore]` 标记跳过。
+- `cargo test --locked --all-targets`：库 434 个、主程序 5 个、ctl 36 个、alpha 集成 8 个、控制集成 82 个通过；插件 Unix socket 测试按 `#[ignore]` 标记跳过。
 - `cargo test --locked --lib infrastructure::plugin::transport::tests --offline -- --ignored --test-threads=1`：15 个插件 Unix socket 测试全部通过。
 - 临时 Unix socket 模拟服务配合真实 `yomua-bot-ctl status --raw`：通过，确认发送的是版本化 `ControlEnvelope`，不含旧 `cmd` 字段。
 - CLI 解析测试：覆盖一段、二段、三段命令、短别名归一化和危险命令确认。
 - SQLite 存储测试：覆盖平台消息去重、稳定用户关系、角色归属历史和记忆可见范围。
 - 配置模板验证：首次启动在临时目录生成 `runtime.toml`、`onebot.toml`、`llm.toml`、`decision.toml`；可选 OneBot 字段留空时仍可解析，真实配置密钥未参与验证。
 
-本次核查的基线为：库 426 个通过、主程序 5 个、ctl 34 个、alpha 集成 8 个、控制集成 80 个；另有 15 个插件 Unix socket 测试在普通全目标测试中按 `#[ignore]` 跳过，并通过显式 `--ignored` 运行。
+本次核查的基线为：库 434 个通过、主程序 5 个、ctl 36 个、alpha 集成 8 个、控制集成 82 个；另有 15 个插件 Unix socket 测试在普通全目标测试中按 `#[ignore]` 跳过，并通过显式 `--ignored` 运行。
 
 ## 已实现的重点行为
 
@@ -32,6 +32,7 @@
 - 角色切换或停用后，发送前会再次检查绑定和启用状态。
 - 记忆候选以 `candidate` 状态保存，普通入站消息按来源消息幂等生成；候选不会直接进入正式可见记忆或默认 ctl 列表；事实/关系默认共享，具体经历默认保留会话范围。
 - 共享记忆可以在其他会话进入角色的内部上下文，但回复不得主动暴露来源会话、原始群聊或内部记忆标识；需要用带来源的提示词和真实聊天场景单独验收这一点。
+- 跨会话隐私策略可以这样验收：先执行 `memory sharing request <character-id> <user-id> --reason "用户请求"`，确认跨会话仍可读；再执行 `memory sharing confirm <character-id> <user-id> --confirm`，确认其他会话不再读到该用户的共享记忆，而来源会话仍可读；最后执行 `memory sharing cancel <character-id> <user-id> --confirm`，确认跨会话恢复。三条命令只返回状态和计数，不返回记忆正文。
 - ctl 的 `memory list` 默认只返回记忆摘要和不可逆指纹；只有显式 `--raw` 才读取原文。
 - `memory update` 不默认返回记忆原文；它先持久化 pending 审计，再把自然语言意图交给配置的 decision LLM，程序只接受受限的 `replace`、`append`、`no_change` 建议并做并发版本检查。未配置可用模型时明确返回 `MEMORY_EDIT_UNAVAILABLE`；pending/failed/rejected/applied 状态保留在记忆元数据中。
 - `user delete <ID> --confirm` 删除与用户关联的普通/向量记忆及关系，将历史参与者匿名化并清除消息/outbox 元数据、私聊路由和用户黑名单中的旧 QQ 号和昵称；历史消息正文及消息引用保留。测试同时验证非目标用户数据不变、私聊主动发言关闭、外键无孤儿和数据库失败时完整回滚。
@@ -66,7 +67,7 @@
 
 - 连续消息在回复任务边界冻结：普通消息等待 1.5 秒，@ 消息等待 0.5 秒；原消息逐条保存，生成期间新消息留给下一轮。仍需用真实 OneBot 流量验证时序和体验。
 - `unknown` 发送结果记录为终态并等待核查。先执行 `reply unknown list`；有平台消息 ID 时再执行 `reply unknown check <消息ID>`。平台明确返回未找到时会自动重新排队；没有平台消息 ID 或查询失败都不能当作未发送证明，此时才使用 `reply unknown retry <消息ID> --confirm`。
-- 记忆候选的自动后台确认、自然语言修改请求消费和用户隐私禁用管理尚未完成；当前 ctl 只提供摘要查询、显式原文读取、删除和修改请求登记。
+- 记忆候选的自动后台确认、自然语言修改请求消费和矛盾修订尚未完成；当前 ctl 提供摘要查询、显式原文读取、删除、修改请求登记，以及跨会话隐私策略的请求、确认和取消。
 - 世界书暂不参与上下文组装。
 - 决策模型通过独立 `decision.toml` 接入，支持主模型、备用链、调用次数和本次 token 预算；具体开源模型、部署位置和价格仍需填写后按真实摘要测量。
 - 当前 8GB M2 的桌面负载不适合常驻本地决策模型；后续应优先采用远程或局域网 sidecar，本地实验限制为单模型、短上下文、单并发和关闭缓存。

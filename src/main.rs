@@ -314,8 +314,8 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     // 4. 建立仓库。
     let repos = build_repos(pool);
 
-    // G1 启动检测：同一会话存在多个角色绑定为脏数据（历史数据或人工修改遗留），
-    // 仅 warn 不自动删除；行为层取第一个绑定。
+    // G1 启动检测：迁移阶段已经拒绝多角色绑定；这里保留运行时防线，
+    // 发现外部手工修改造成的脏数据时直接阻止启动。
     check_binding_dirtiness(&repos.binding_repo)
         .await
         .map_err(|e| RuntimeError::Internal(format!("启动检测失败: {e}")))?;
@@ -1010,8 +1010,10 @@ fn build_repos(pool: SqlitePool) -> Repos {
     }
 }
 
-/// G1 启动检测：同一会话存在多个角色绑定为脏数据（历史数据或人工修改遗留），
-/// 仅 warn 不自动删除；行为层取第一个绑定。
+/// G1 启动检测：同一会话必须只有一个角色绑定。
+///
+/// 迁移和应用服务都应维护这一约束；若数据库被外部工具直接改坏，
+/// 启动必须失败，不能静默选择任意角色继续运行。
 async fn check_binding_dirtiness(
     binding_repo: &Arc<dyn CharacterBindingRepository>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1020,16 +1022,21 @@ async fn check_binding_dirtiness(
     for b in &all_bindings {
         *conv_counts.entry(b.conversation_id).or_insert(0) += 1;
     }
-    let mut dirty = 0;
+    let mut dirty = Vec::new();
     for (conv, count) in conv_counts {
         if count > 1 {
-            dirty += 1;
-            tracing::warn!(target: "runtime", conversation_id = conv, count, "会话存在多个角色绑定（脏数据），行为层将取第一个绑定");
+            dirty.push((conv, count));
         }
     }
-    if dirty == 0 {
-        tracing::info!(target: "runtime", "会话绑定检查通过：所有会话均为单角色绑定");
+    if !dirty.is_empty() {
+        let details = dirty
+            .iter()
+            .map(|(conversation_id, count)| format!("会话 {conversation_id} 有 {count} 个绑定"))
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(format!("检测到无效的角色绑定：{details}，请先清理数据库").into());
     }
+    tracing::info!(target: "runtime", "会话绑定检查通过：所有会话均为单角色绑定");
     Ok(())
 }
 

@@ -437,6 +437,20 @@ impl ReplyProcessor {
         } else {
             None
         };
+        // Outbox 是持久化事件流，事件本身可能在任务已经落入终态后再次投递。
+        // 尤其是连续消息合并时，首条任务会把同批后续消息标记为 Ignored；
+        // 这些消息对应的 Outbox 事件仍然必须被确认，但不能再次触发模型或发送。
+        if stored.as_ref().is_some_and(|task| {
+            matches!(
+                task.status,
+                ReplyTaskStatus::Sent
+                    | ReplyTaskStatus::Ignored
+                    | ReplyTaskStatus::Cancelled
+                    | ReplyTaskStatus::Expired
+            )
+        }) {
+            return Ok(());
+        }
         if stored
             .as_ref()
             .is_some_and(|task| task.status == ReplyTaskStatus::Sending)
@@ -1144,6 +1158,7 @@ mod tests {
 
     struct MemMessageRepo {
         messages: Mutex<Vec<Message>>,
+        reply_tasks: Mutex<HashMap<i64, crate::domain::message::ReplyTask>>,
     }
     #[async_trait]
     impl MessageRepository for MemMessageRepo {
@@ -1196,6 +1211,67 @@ mod tests {
             _conversation_id: i64,
         ) -> Result<Option<chrono::DateTime<chrono::Utc>>, RepositoryError> {
             Ok(None)
+        }
+        async fn reply_task(
+            &self,
+            message_id: i64,
+        ) -> Result<Option<crate::domain::message::ReplyTask>, RepositoryError> {
+            Ok(self.reply_tasks.lock().unwrap().get(&message_id).cloned())
+        }
+        async fn save_reply_task(
+            &self,
+            message_id: i64,
+            _character_id: i64,
+            status: ReplyTaskStatus,
+            content: Option<&str>,
+        ) -> Result<(), RepositoryError> {
+            let mut tasks = self.reply_tasks.lock().unwrap();
+            let task = tasks
+                .entry(message_id)
+                .or_insert(crate::domain::message::ReplyTask {
+                    status,
+                    content: None,
+                    error: None,
+                    platform_message_id: None,
+                });
+            task.status = status;
+            if content.is_some() {
+                task.content = content.map(str::to_string);
+            }
+            Ok(())
+        }
+        async fn save_reply_task_error(
+            &self,
+            message_id: i64,
+            character_id: i64,
+            status: ReplyTaskStatus,
+            content: Option<&str>,
+            error: Option<&str>,
+        ) -> Result<(), RepositoryError> {
+            self.save_reply_task(message_id, character_id, status, content)
+                .await?;
+            if let Some(task) = self.reply_tasks.lock().unwrap().get_mut(&message_id) {
+                task.error = error.map(str::to_string);
+            }
+            Ok(())
+        }
+        async fn save_reply_task_delivery(
+            &self,
+            message_id: i64,
+            character_id: i64,
+            status: ReplyTaskStatus,
+            content: Option<&str>,
+            error: Option<&str>,
+            platform_message_id: Option<i64>,
+        ) -> Result<(), RepositoryError> {
+            self.save_reply_task_error(message_id, character_id, status, content, error)
+                .await?;
+            if let Some(task) = self.reply_tasks.lock().unwrap().get_mut(&message_id) {
+                if platform_message_id.is_some() {
+                    task.platform_message_id = platform_message_id;
+                }
+            }
+            Ok(())
         }
     }
 
@@ -1517,6 +1593,7 @@ mod tests {
         Arc<MemParticipantRepo>,
         Arc<MemConversationStateRepo>,
         Arc<MemBehaviorStateRepo>,
+        Arc<MemMessageRepo>,
     );
 
     async fn wire(onbot_conv: bool, use_llm: bool) -> Wiring {
@@ -1574,6 +1651,7 @@ mod tests {
         });
         let message_repo = Arc::new(MemMessageRepo {
             messages: Mutex::new(vec![]),
+            reply_tasks: Mutex::new(HashMap::new()),
         });
         let memory_repo = Arc::new(MemMemoryRepo);
         let relationship_repo = Arc::new(MemRelationshipRepo {
@@ -1732,20 +1810,23 @@ mod tests {
             context_assembler,
         ));
 
-        let processor = Arc::new(ReplyProcessor::new(
-            runtime,
-            binding_manager,
-            decision_orchestrator,
-            cognition,
-            relationship_service,
-            mood_service,
-            memory_service,
-            action_dispatcher,
-            bus,
-            delay_executor,
-            participant_repo.clone(),
-            Some(111111), // bot_self_id for tests
-        ));
+        let processor = Arc::new(
+            ReplyProcessor::new(
+                runtime,
+                binding_manager,
+                decision_orchestrator,
+                cognition,
+                relationship_service,
+                mood_service,
+                memory_service,
+                action_dispatcher,
+                bus,
+                delay_executor,
+                participant_repo.clone(),
+                Some(111111), // bot_self_id for tests
+            )
+            .with_message_repository(message_repo.clone()),
+        );
 
         (
             processor,
@@ -1758,6 +1839,7 @@ mod tests {
             participant_repo,
             conversation_state_repo,
             behavior_state_repo,
+            message_repo,
         )
     }
 
@@ -1781,7 +1863,7 @@ mod tests {
     #[tokio::test]
     async fn no_binding_ignores_message() {
         // 覆盖空绑定场景：清空 bindings，process 应正常返回且不发送。
-        let (processor, adapter, _, _, _, _, binding_repo, _, _, _) = wire(false, false).await;
+        let (processor, adapter, _, _, _, _, binding_repo, _, _, _, _) = wire(false, false).await;
         binding_repo.bindings.lock().unwrap().clear();
         processor
             .process(&received_event(true))
@@ -1792,7 +1874,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_llm_keeps_message_without_fake_reply() {
-        let (processor, adapter, provider, mood_repo, rel_repo, state_repo, _, _, _, _) =
+        let (processor, adapter, provider, mood_repo, rel_repo, state_repo, _, _, _, _, _) =
             wire(false, false).await;
         processor
             .process(&received_event(true))
@@ -1809,8 +1891,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_reply_task_is_idempotent_and_skips_generation() {
+        let (processor, adapter, provider, _, _, _, _, _, _, _, message_repo) =
+            wire(false, true).await;
+        message_repo.reply_tasks.lock().unwrap().insert(
+            42,
+            crate::domain::message::ReplyTask {
+                status: ReplyTaskStatus::Ignored,
+                content: None,
+                error: None,
+                platform_message_id: None,
+            },
+        );
+        let mut event = received_event(true);
+        event.message_id = 42;
+
+        processor
+            .process(&event)
+            .await
+            .expect("终态回复任务重复投递应直接确认");
+        assert_eq!(*provider.calls.lock().unwrap(), 0);
+        assert!(adapter.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn enabled_llm_uses_provider_reply() {
-        let (processor, adapter, provider, _, _, _, _, _, _, _) = wire(false, true).await;
+        let (processor, adapter, provider, _, _, _, _, _, _, _, _) = wire(false, true).await;
         processor
             .process(&received_event(true))
             .await
@@ -1827,7 +1933,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_conversation_routes_to_group_adapter() {
-        let (processor, adapter, _, _, _, _, _, _, _, _) = wire(true, true).await;
+        let (processor, adapter, _, _, _, _, _, _, _, _, _) = wire(true, true).await;
         processor
             .process(&received_event(true))
             .await
@@ -1910,7 +2016,7 @@ mod tests {
             release: Arc::new(Mutex::new(Some(release_rx))),
         });
 
-        let (processor, adapter, _, _, _, _, _, _, _, _) =
+        let (processor, adapter, _, _, _, _, _, _, _, _, _) =
             wire_with_delay(false, true, controlled).await;
 
         // 在任务中处理消息（MentionOnly + mentioned → delay 1600 > 0）。
@@ -1947,7 +2053,7 @@ mod tests {
         let recording: Arc<dyn DelayExecutor> = Arc::new(RecordingDelay {
             delays: recorded.clone(),
         });
-        let (processor, adapter, _, _, _, _, _, _, _, _) =
+        let (processor, adapter, _, _, _, _, _, _, _, _, _) =
             wire_with_delay(false, true, recording).await;
 
         processor
@@ -1955,8 +2061,8 @@ mod tests {
             .await
             .expect("处理应成功");
 
-        // MentionOnly + @ 消息使用当前决策延迟；普通消息不会额外改变关系状态。
-        assert_eq!(*recorded.lock().unwrap(), vec![1600]);
+        // 先等待 @ 消息的短暂合并窗口，再等待行为决策给出的拟人化延迟。
+        assert_eq!(*recorded.lock().unwrap(), vec![MENTION_BATCH_WAIT_MS, 1600]);
         assert_eq!(adapter.sent.lock().unwrap().len(), 1);
     }
 }

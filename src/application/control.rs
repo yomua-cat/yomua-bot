@@ -246,6 +246,21 @@ impl CommandRegistry {
             handle_memory_update,
         );
         registry.register(
+            control_schema::MEMORY_SHARING_REQUEST,
+            "记录跨会话记忆禁用请求",
+            handle_memory_sharing_request,
+        );
+        registry.register(
+            control_schema::MEMORY_SHARING_CONFIRM,
+            "确认跨会话记忆禁用请求",
+            handle_memory_sharing_confirm,
+        );
+        registry.register(
+            control_schema::MEMORY_SHARING_CANCEL,
+            "取消跨会话记忆禁用策略",
+            handle_memory_sharing_cancel,
+        );
+        registry.register(
             control_schema::REPLY_UNKNOWN_LIST,
             "列出发送结果未知、等待核查的回复任务",
             handle_reply_unknown_list,
@@ -1790,6 +1805,123 @@ fn memory_fingerprint(content: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+fn sharing_policy_params(
+    params: &serde_json::Value,
+) -> Result<(i64, i64, Option<&str>), ControlResponse> {
+    let Some(obj) = params.as_object() else {
+        return Err(ControlResponse::err(
+            0,
+            ControlErrorDetail::new("INVALID_PARAMS", "params 必须是 JSON 对象"),
+        ));
+    };
+    let character_id = obj.get("character_id").and_then(|value| value.as_i64());
+    let user_id = obj.get("user_id").and_then(|value| value.as_i64());
+    match (character_id, user_id) {
+        (Some(character_id), Some(user_id)) if character_id > 0 && user_id > 0 => Ok((
+            character_id,
+            user_id,
+            obj.get("reason").and_then(|value| value.as_str()),
+        )),
+        _ => Err(ControlResponse::err(
+            0,
+            ControlErrorDetail::new("INVALID_PARAMS", "缺少或非法参数 character_id / user_id"),
+        )),
+    }
+}
+
+fn handle_memory_sharing_request(
+    handle: &RuntimeHandle,
+    id: u64,
+    params: serde_json::Value,
+) -> CommandFuture {
+    let handle = handle.clone();
+    Box::pin(async move {
+        let (character_id, user_id, reason) = match sharing_policy_params(&params) {
+            Ok(value) => value,
+            Err(mut response) => {
+                response.id = id;
+                return Ok(response);
+            }
+        };
+        handle
+            .memory_repo
+            .request_sharing_policy(character_id, user_id, reason)
+            .await
+            .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+        Ok(ControlResponse::ok(
+            id,
+            serde_json::json!({
+                "character_id": character_id,
+                "user_id": user_id,
+                "status": "requested",
+                "message": "已记录请求；只有管理员确认后才会停止未来跨会话检索"
+            }),
+        ))
+    })
+}
+
+fn handle_memory_sharing_confirm(
+    handle: &RuntimeHandle,
+    id: u64,
+    params: serde_json::Value,
+) -> CommandFuture {
+    let handle = handle.clone();
+    Box::pin(async move {
+        let (character_id, user_id, reason) = match sharing_policy_params(&params) {
+            Ok(value) => value,
+            Err(mut response) => {
+                response.id = id;
+                return Ok(response);
+            }
+        };
+        handle
+            .memory_repo
+            .confirm_sharing_policy(character_id, user_id, reason)
+            .await
+            .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+        Ok(ControlResponse::ok(
+            id,
+            serde_json::json!({
+                "character_id": character_id,
+                "user_id": user_id,
+                "status": "confirmed",
+                "message": "已确认；未来跨会话检索将阻止该用户的共享记忆"
+            }),
+        ))
+    })
+}
+
+fn handle_memory_sharing_cancel(
+    handle: &RuntimeHandle,
+    id: u64,
+    params: serde_json::Value,
+) -> CommandFuture {
+    let handle = handle.clone();
+    Box::pin(async move {
+        let (character_id, user_id, reason) = match sharing_policy_params(&params) {
+            Ok(value) => value,
+            Err(mut response) => {
+                response.id = id;
+                return Ok(response);
+            }
+        };
+        handle
+            .memory_repo
+            .cancel_sharing_policy(character_id, user_id, reason)
+            .await
+            .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+        Ok(ControlResponse::ok(
+            id,
+            serde_json::json!({
+                "character_id": character_id,
+                "user_id": user_id,
+                "status": "cancelled",
+                "message": "已取消禁用策略；未来允许重新共享"
+            }),
+        ))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 会话删除处理器
 // ---------------------------------------------------------------------------
@@ -2970,6 +3102,20 @@ mod transport_tests {
         assert!(!names.contains(&"character_list"));
         assert!(!names.contains(&"state-get"));
         assert!(!registry.handlers.contains_key("character_list"));
+    }
+
+    #[test]
+    fn every_schema_command_has_one_builtin_handler() {
+        let registry = CommandRegistry::builtin();
+        let descriptions = registry.descriptions();
+        assert_eq!(descriptions.len(), control_schema::specs().len());
+        for spec in control_schema::specs() {
+            assert!(
+                registry.handlers.contains_key(spec.name),
+                "schema 命令 {} 没有服务端 handler",
+                spec.name
+            );
+        }
     }
 
     #[tokio::test]

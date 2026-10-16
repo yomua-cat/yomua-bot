@@ -116,6 +116,26 @@ impl RelationshipRepository for SqliteRelationshipRepository {
         rows.into_iter().map(parse_relationship_row).collect()
     }
 
+    async fn find_by_user_id(
+        &self,
+        character_id: i64,
+        user_id: i64,
+    ) -> Result<Option<Relationship>, RepositoryError> {
+        let row = sqlx::query_as::<_, RelationshipRow>(
+            r#"SELECT r.character_id, r.user_id,
+                      (SELECT MIN(p.id) FROM participants p WHERE p.user_id=r.user_id AND p.role='user'),
+                      r.familiarity, r.affection, r.trust, r.respect, r.annoyance, r.intimacy,
+                      r.interaction_count, r.last_interaction, r.created_at, r.updated_at
+                 FROM relationships r
+                WHERE r.character_id=? AND r.user_id=?"#,
+        )
+        .bind(character_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(parse_relationship_row).transpose()
+    }
+
     async fn find_by_stable_user_key(
         &self,
         character_id: i64,

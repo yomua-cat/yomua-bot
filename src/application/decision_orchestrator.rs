@@ -145,7 +145,16 @@ impl DecisionOrchestrator {
                 // 无 override
             }
             SuggestReply => {
-                if !context.behavior_config.in_mute_window {
+                let hard_reply_blocked = match context.situation {
+                    DecisionSituation::Response { is_mentioned, .. } => {
+                        !is_mentioned
+                            && (context.behavior_config.reply_mode
+                                == crate::domain::character::ReplyMode::MentionOnly
+                                || context.behavior_config.in_mute_window)
+                    }
+                    DecisionSituation::Proactive => true,
+                };
+                if !hard_reply_blocked {
                     behavior.action = crate::domain::behavior::BehaviorAction::Reply;
                 }
             }
@@ -424,6 +433,44 @@ mod tests {
 
         // Hard mention constraint wins over the advisory override.
         assert_eq!(result.action, BehaviorAction::Reply);
+    }
+
+    #[tokio::test]
+    async fn suggest_reply_cannot_bypass_mention_only_constraint() {
+        let mut output = sample_output();
+        output.input.is_mentioned = false;
+        output.input.binding.as_mut().unwrap().reply_mode = ReplyMode::MentionOnly;
+        output.decision = BehaviorDecision {
+            action: BehaviorAction::Ignore,
+            priority: Priority::Normal,
+            cognition_level: CognitionLevel::None,
+            delay_ms: 0,
+            reason: "MentionOnly 模式且未被提及，忽略".to_string(),
+            decided_at: Utc::now(),
+        };
+        let evaluator = Arc::new(MockDecisionEvaluator { output });
+        let trigger = Arc::new(AlwaysRequiredTrigger);
+        let pipeline = Arc::new(
+            DecisionLlmPipeline::new(
+                Arc::new(FailingDecisionLlmService),
+                None,
+                DecisionResultValidator::new(2_000, 60_000),
+                Arc::new(crate::domain::decision::DefaultOverridePolicy),
+            )
+            .with_override_result(DecisionResult {
+                action: DecisionAction::SuggestReply,
+                reasoning: Some("模型建议参与".to_string()),
+                confidence: Some(0.99),
+            }),
+        );
+        let orchestrator = DecisionOrchestrator::new(evaluator, trigger, Some(pipeline));
+
+        let result = orchestrator
+            .evaluate_response(1, 10, "普通群消息", false, Some(1))
+            .await
+            .unwrap();
+
+        assert_eq!(result.action, BehaviorAction::Ignore);
     }
 
     // -------------------------------------------------------------------------

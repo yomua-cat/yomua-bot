@@ -1215,6 +1215,7 @@ async fn test_character_memory_isolation() {
     let mem_a = Memory {
         id: 0,
         character_id: cid,
+        user_id: None,
         conversation_id: Some(env.conv_a_id),
         memory_type: MemoryType::Episodic,
         content: "A 记得用户喜欢猫".to_string(),
@@ -1233,6 +1234,7 @@ async fn test_character_memory_isolation() {
     let mem_b = Memory {
         id: 0,
         character_id: char_b_id,
+        user_id: None,
         conversation_id: Some(env.conv_a_id),
         memory_type: MemoryType::Episodic,
         content: "B 记得用户讨厌狗".to_string(),
@@ -3253,6 +3255,7 @@ async fn test_memory_conversation_id_set_null_on_delete() {
     let memory = Memory {
         id: 0,
         character_id: char1_id,
+        user_id: None,
         conversation_id: Some(conv1_id),
         memory_type: MemoryType::Episodic,
         content: "test memory".to_string(),
@@ -3892,6 +3895,7 @@ async fn test_memory_list_global() {
     let m1 = Memory {
         id: 0,
         character_id: env.character_id,
+        user_id: None,
         conversation_id: Some(env.conv_a_id),
         memory_type: MemoryType::Episodic,
         content: "test episodic".to_string(),
@@ -3904,6 +3908,7 @@ async fn test_memory_list_global() {
     let m2 = Memory {
         id: 0,
         character_id: env.character_id,
+        user_id: None,
         conversation_id: None,
         memory_type: MemoryType::System,
         content: "test system".to_string(),
@@ -3937,6 +3942,7 @@ async fn test_memory_list_by_character() {
     let m = Memory {
         id: 0,
         character_id: env.character_id,
+        user_id: None,
         conversation_id: None,
         memory_type: MemoryType::Semantic,
         content: "character filtered".to_string(),
@@ -3970,6 +3976,7 @@ async fn test_memory_list_by_conversation() {
     let m = Memory {
         id: 0,
         character_id: env.character_id,
+        user_id: None,
         conversation_id: Some(env.conv_a_id),
         memory_type: MemoryType::Episodic,
         content: "conversation filtered".to_string(),
@@ -4004,6 +4011,7 @@ async fn test_memory_list_by_type() {
     let m1 = Memory {
         id: 0,
         character_id: env.character_id,
+        user_id: None,
         conversation_id: None,
         memory_type: MemoryType::Episodic,
         content: "episodic content".to_string(),
@@ -4016,6 +4024,7 @@ async fn test_memory_list_by_type() {
     let m2 = Memory {
         id: 0,
         character_id: env.character_id,
+        user_id: None,
         conversation_id: None,
         memory_type: MemoryType::Semantic,
         content: "semantic content".to_string(),
@@ -4059,6 +4068,7 @@ async fn test_memory_list_type_limit_ordering() {
         let m = Memory {
             id: 0,
             character_id: env.character_id,
+            user_id: None,
             conversation_id: None,
             memory_type: MemoryType::Episodic,
             content: format!("episodic {}", i),
@@ -4075,6 +4085,7 @@ async fn test_memory_list_type_limit_ordering() {
     let sm = Memory {
         id: 0,
         character_id: env.character_id,
+        user_id: None,
         conversation_id: None,
         memory_type: MemoryType::Semantic,
         content: "semantic should not appear".to_string(),
@@ -4116,6 +4127,7 @@ async fn test_memory_list_filter_combination() {
     let m1 = Memory {
         id: 0,
         character_id: env.character_id,
+        user_id: None,
         conversation_id: Some(env.conv_a_id),
         memory_type: MemoryType::Episodic,
         content: "match all three".to_string(),
@@ -4131,6 +4143,7 @@ async fn test_memory_list_filter_combination() {
     let m2 = Memory {
         id: 0,
         character_id: env.character_id,
+        user_id: None,
         conversation_id: Some(env.conv_a_id),
         memory_type: MemoryType::Semantic,
         content: "wrong type".to_string(),
@@ -4185,6 +4198,7 @@ async fn test_memory_delete_success() {
     let m = Memory {
         id: 0,
         character_id: env.character_id,
+        user_id: None,
         conversation_id: None,
         memory_type: MemoryType::Semantic,
         content: "to be deleted".to_string(),
@@ -4216,6 +4230,7 @@ async fn test_memory_update_applies_validated_model_suggestion() {
     let m = Memory {
         id: 0,
         character_id: env.character_id,
+        user_id: None,
         conversation_id: Some(env.conv_a_id),
         memory_type: MemoryType::Semantic,
         content: "candidate fact".to_string(),
@@ -4254,6 +4269,7 @@ async fn test_memory_list_hides_content_until_raw_is_requested() {
     let memory = Memory {
         id: 0,
         character_id: env.character_id,
+        user_id: None,
         conversation_id: Some(env.conv_a_id),
         memory_type: MemoryType::Semantic,
         content: "这是不应默认显示的隐私内容".to_string(),
@@ -4323,6 +4339,7 @@ async fn test_memory_delete_leaves_semantic_memories_untouched() {
     let mem = Memory {
         id: 0,
         character_id: env.character_id,
+        user_id: None,
         conversation_id: None,
         memory_type: MemoryType::Episodic,
         content: "regular memory to delete".to_string(),

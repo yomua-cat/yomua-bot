@@ -57,24 +57,24 @@ flowchart TD
 | User | `(platform, external_id)` | 跨会话稳定的平台用户身份；支持审计合并与删除 |
 | Participant | Conversation × external_id | 会话内显示名、作者身份和消息归属，不能替代 User |
 | Relationship | Character × User | 关系数值与跨会话交互记录；领域对象保存 `user_id`，会话 `participant_id` 只用于入站解析；交互幂等表同样按 `user_id` 归并 |
-| Memory | Character × 可选 User，可附会话 | 记忆来源和用户归属；跨会话只召回当前用户明确共享的记忆，且只作为角色内部上下文使用，不向用户透露来源会话；非共享经历留在来源会话，候选记忆仍不可见 |
+| Memory | Character × 可选 User，可附会话 | 记忆来源和用户归属；稳定事实和关系信息默认可跨会话召回，且只作为角色内部上下文使用，不向用户透露来源会话；确认禁用策略后停止未来跨会话检索，非共享经历留在来源会话，候选记忆仍不可见 |
 | CharacterBinding | Conversation → Character | 回复模式、主动行为、静默时段等绑定设置 |
 
 [领域模型](../src/domain/character.rs)与[情绪模型](../src/domain/emotion.rs)定义状态。[角色运行时](../src/application/runtime.rs)按需加载并缓存角色，以每角色锁保护状态更新。控制命令直接写仓储时与缓存同步的关系仍需整顿。
 
-当前绑定管理目标是每会话一个角色；历史重复绑定会在启动时警告。接收时记录的角色 ID 与消费时重新读取绑定的处理方式仍需统一。
+当前绑定管理强制每会话一个角色；迁移发现重复绑定会拒绝启动并要求先明确保留项。接收时记录的角色 ID 与消费时重新读取绑定的方式共同参与发送前校验，绑定版本变化会取消旧任务。
 
 ## 决策、上下文与模型
 
 [规则行为引擎](../src/application/behavior_engine.rs)结合回复模式、提及、静默时段、状态和关系决定是否回复及延迟。[决策编排器](../src/application/decision_orchestrator.rs)以规则结果为基线；`decision.toml` 启用后接入 advisory 决策模型，模型输出必须经过验证器和硬约束策略。
 
-[ContextBuilder](../src/application/context.rs)加载角色归属的历史、Lorebook、记忆、关系及会话情绪；关系查询会先把当前 participant 映射到全域 User，跨会话记忆只纳入该 User 明确共享的内容，并只进入角色内部上下文，不把来源会话写入对用户可见的回复，其他记忆限于来源会话。[CharacterHistoryProvider](../src/application/character_history.rs)负责历史归属和序号边界。[ContextAssembler](../src/application/context_assembler.rs)估算 token、预留输出空间并按层降级，需要已知的 `context_window`。主程序从 `llm.toml` 的 `[options]` 读取预算，即使使用多模型配置也是如此。
+[ContextBuilder](../src/application/context.rs)加载角色归属的历史、Lorebook、记忆、关系及会话情绪；关系查询会先把当前 participant 映射到全域 User，跨会话记忆默认纳入该 User 的稳定事实和关系信息，确认禁用策略后由数据库层排除，并只进入角色内部上下文，不把来源会话写入对用户可见的回复，其他记忆限于来源会话。[CharacterHistoryProvider](../src/application/character_history.rs)负责历史归属和序号边界。[ContextAssembler](../src/application/context_assembler.rs)估算 token、预留输出空间并按层降级，需要已知的 `context_window`。主程序从 `llm.toml` 的 `[options]` 读取预算，即使使用多模型配置也是如此。
 
 全域用户删除由 `ParticipantRepository` 在 SQLite 事务内执行：删除该用户来源的普通/向量记忆和关系数据，匿名化会话参与者、OneBot 私聊路由、消息/outbox 作者元数据与用户黑名单，再删除 `users` 身份。为保留历史审计与引用，消息行、正文和内部引用关系保留；历史作者显示为“已删除用户”，旧私聊主动发言会关闭。任何步骤失败都会回滚整笔删除。
 
 [认知层](../src/application/cognition.rs)通过[调度器](../src/application/llm_scheduler.rs)发起请求，HTTP 实现在[OpenAI-compatible Provider](../src/infrastructure/llm/openai_compatible.rs)。Provider 连接与对话模型来自 `llm.toml`，独立决策模型来自 `decision.toml`，同一 Provider 可复用多个模型。LLM 关闭时保留消息并跳过生成，不发送伪造回复；启用后模型或上下文错误会按 Outbox 失败路径处理。
 
-主程序没有给 ContextBuilder 注入 embedding scheduler，因此当前对话上下文使用关键词 Lorebook 与记忆检索。存在语义存储或混合检索接口不代表对话已经使用 RAG。
+主程序没有给 ContextBuilder 注入 embedding scheduler，因此当前对话上下文使用关键词 Lorebook 与记忆检索。向量检索接口若被调用，必须带当前会话和稳定用户身份，由 SQL 先限制可见范围后再排序；存在语义存储或混合检索接口不代表对话已经使用 RAG。
 
 ## 后台任务与持久化
 

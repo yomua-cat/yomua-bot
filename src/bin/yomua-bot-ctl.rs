@@ -44,6 +44,7 @@ pub struct CommandOptions {
     // 状态与角色操作
     pub character_id: Option<i64>,
     pub conversation_id: Option<i64>,
+    pub user_id: Option<i64>,
     // 修改状态
     pub mood: Option<f64>,
     pub energy: Option<f64>,
@@ -197,6 +198,18 @@ impl ParsedCommand {
                                 .get(i)
                                 .and_then(|v| v.parse().ok())
                                 .ok_or_else(|| "--conversation 需要一个正整数".to_string())?,
+                        );
+                    }
+                    "user" | "user-id" => {
+                        i += 1;
+                        if tokens.get(i).is_none_or(|value| value.starts_with("--")) {
+                            return Err("--user 需要一个正整数".to_string());
+                        }
+                        opts.user_id = Some(
+                            tokens
+                                .get(i)
+                                .and_then(|v| v.parse().ok())
+                                .ok_or_else(|| "--user 需要一个正整数".to_string())?,
                         );
                     }
                     "mood" => {
@@ -902,6 +915,7 @@ fn build_request(
         (opts.offset.is_some(), "offset"),
         (opts.character_id.is_some(), "character"),
         (opts.conversation_id.is_some(), "conversation"),
+        (opts.user_id.is_some(), "user"),
         (opts.memory_type.is_some(), "type"),
         (opts.memory_id.is_some(), "memory-id"),
         (opts.memory_instruction.is_some(), "instruction"),
@@ -960,6 +974,20 @@ fn build_request(
             if let Some(arg) = args.first() {
                 if let Ok(v) = arg.parse() {
                     opts.memory_id = Some(v);
+                }
+            }
+        }
+        ControlOperation::MemorySharingRequest
+        | ControlOperation::MemorySharingConfirm
+        | ControlOperation::MemorySharingCancel => {
+            if let Some(arg) = args.first() {
+                if let Ok(v) = arg.parse() {
+                    opts.character_id = Some(v);
+                }
+            }
+            if let Some(arg) = args.get(1) {
+                if let Ok(v) = arg.parse() {
+                    opts.user_id = Some(v);
                 }
             }
         }
@@ -1048,7 +1076,7 @@ fn build_request(
             let char_id = opts
                 .id
                 .or(opts.character_id)
-                .ok_or_else(|| "需要 --character <角色ID>".to_string())?;
+                .ok_or_else(|| "需要 <character-id>".to_string())?;
             let mut p = serde_json::Map::new();
             p.insert("character_id".to_string(), json!(char_id));
             if let Some(cid) = opts.conversation_id {
@@ -1162,6 +1190,27 @@ fn build_request(
                 .ok_or_else(|| "需要 --instruction <中文修改说明>".to_string())?;
             p.insert("instruction".to_string(), json!(instruction));
             Ok(("memory update", serde_json::Value::Object(p)))
+        }
+        ControlOperation::MemorySharingRequest
+        | ControlOperation::MemorySharingConfirm
+        | ControlOperation::MemorySharingCancel => {
+            let character_id = opts
+                .character_id
+                .ok_or_else(|| "需要 <character-id>".to_string())?;
+            let user_id = opts.user_id.ok_or_else(|| "需要 <user-id>".to_string())?;
+            let mut p = serde_json::Map::new();
+            p.insert("character_id".to_string(), json!(character_id));
+            p.insert("user_id".to_string(), json!(user_id));
+            if let Some(reason) = opts.reason.as_ref() {
+                p.insert("reason".to_string(), json!(reason));
+            }
+            let name = match builtin {
+                ControlOperation::MemorySharingRequest => "memory sharing request",
+                ControlOperation::MemorySharingConfirm => "memory sharing confirm",
+                ControlOperation::MemorySharingCancel => "memory sharing cancel",
+                _ => unreachable!(),
+            };
+            Ok((name, serde_json::Value::Object(p)))
         }
         ControlOperation::ReplyUnknownList => {
             let mut p = serde_json::Map::new();
@@ -2100,6 +2149,20 @@ mod tests {
     }
 
     #[test]
+    fn state_get_requires_the_documented_positional_character_id() {
+        let parsed = ParsedCommand::parse(&["character", "state", "get", "--conversation", "3"])
+            .expect("词法解析可以先保留待校验参数");
+        let error = build_request(
+            ControlOperation::CharacterStateGet,
+            &parsed.opts,
+            &parsed.args,
+            1,
+        )
+        .expect_err("最终请求构造必须拒绝缺少角色位置参数");
+        assert!(error.contains("位置参数"));
+    }
+
+    #[test]
     fn test_parse_state_set() {
         let tokens = vec![
             "state",
@@ -2283,6 +2346,35 @@ mod tests {
         .unwrap();
         assert_eq!(cmd, "memory list");
         assert!(request.is_object());
+    }
+
+    #[test]
+    fn memory_sharing_commands_build_structured_requests() {
+        let command = command_from_path(&[
+            "memory".to_string(),
+            "sharing".to_string(),
+            "confirm".to_string(),
+        ])
+        .expect("共享策略命令应可解析");
+        assert_eq!(command, ControlOperation::MemorySharingConfirm);
+        assert!(
+            yomua_bot::application::control_schema::requires_confirmation(command.canonical_name())
+        );
+
+        let (name, request) = build_request(
+            ControlOperation::MemorySharingRequest,
+            &CommandOptions {
+                reason: Some("用户隐私请求".into()),
+                ..Default::default()
+            },
+            &["7".into(), "11".into()],
+            1,
+        )
+        .expect("共享策略请求应构造成功");
+        assert_eq!(name, "memory sharing request");
+        assert_eq!(request["character_id"], 7);
+        assert_eq!(request["user_id"], 11);
+        assert_eq!(request["reason"], "用户隐私请求");
     }
 
     #[test]

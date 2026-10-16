@@ -21,6 +21,9 @@ pub struct Memory {
     pub id: i64,
     pub character_id: i64,
 
+    /// 该记忆关联的全域用户；系统记忆或无法可靠归属的旧数据可为空。
+    pub user_id: Option<i64>,
+
     /// 该记忆来源的会话（若有）。
     pub conversation_id: Option<i64>,
 
@@ -75,6 +78,7 @@ impl Memory {
         Self {
             id: 0, // 由存储自动生成
             character_id,
+            user_id: None,
             conversation_id,
             memory_type,
             content,

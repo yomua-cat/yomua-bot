@@ -626,6 +626,39 @@ pub trait MemoryRepository: Send + Sync {
             .await
     }
 
+    /// 记录用户提出的跨会话记忆禁用请求。
+    ///
+    /// 请求本身不会立即改变检索范围；只有显式确认后，生产仓储才会
+    /// 在跨会话查询中屏蔽该角色与用户的共享记忆。
+    async fn request_sharing_policy(
+        &self,
+        _character_id: i64,
+        _user_id: i64,
+        _reason: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::NotImplemented("记忆共享禁用请求".into()))
+    }
+
+    /// 确认跨会话记忆禁用请求。
+    async fn confirm_sharing_policy(
+        &self,
+        _character_id: i64,
+        _user_id: i64,
+        _reason: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::NotImplemented("记忆共享禁用确认".into()))
+    }
+
+    /// 取消已有的跨会话记忆禁用策略。
+    async fn cancel_sharing_policy(
+        &self,
+        _character_id: i64,
+        _user_id: i64,
+        _reason: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::NotImplemented("记忆共享禁用取消".into()))
+    }
+
     async fn find_by_character_id(
         &self,
         character_id: i64,
@@ -695,14 +728,27 @@ pub trait MemoryRepository: Send + Sync {
         limit: i64,
     ) -> Result<Vec<Memory>, RepositoryError>;
 
-    async fn search_by_embedding(
+    /// 在数据库层按当前会话和稳定用户身份限制可见范围后，再进行向量排序。
+    ///
+    /// `user_id` 为空时只能读取当前会话来源；传入用户身份后，才允许额外
+    /// 读取标记为 shared 的跨会话记忆，并且仍受已确认的共享禁用策略限制。
+    async fn search_visible_by_embedding(
         &self,
         character_id: i64,
+        conversation_id: i64,
+        user_id: Option<i64>,
         query_embedding: &[f32],
         memory_type: Option<&str>,
         limit: i64,
     ) -> Result<Vec<SemanticMatchResult>, RepositoryError> {
-        let _ = (character_id, query_embedding, memory_type, limit);
+        let _ = (
+            character_id,
+            conversation_id,
+            user_id,
+            query_embedding,
+            memory_type,
+            limit,
+        );
         Ok(Vec::new())
     }
 
@@ -749,6 +795,15 @@ pub trait RelationshipRepository: Send + Sync {
         &self,
         character_id: i64,
     ) -> Result<Vec<Relationship>, RepositoryError>;
+    /// 按全域用户 ID 查找关系。插件和控制面等跨会话调用必须使用此接口，
+    /// 不得把会话内 participant_id 当作稳定身份。
+    async fn find_by_user_id(
+        &self,
+        _character_id: i64,
+        _user_id: i64,
+    ) -> Result<Option<Relationship>, RepositoryError> {
+        Ok(None)
+    }
     /// 按稳定平台用户键查找跨会话关系。
     async fn find_by_stable_user_key(
         &self,

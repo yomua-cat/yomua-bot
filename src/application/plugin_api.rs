@@ -171,26 +171,15 @@ impl PluginApi {
         &self,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        match optional_i64(&params, "character_id")? {
-            Some(character_id) => {
-                let character = self
-                    .character_repo
-                    .find_by_id(character_id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                match character {
-                    Some(c) => to_json(&c),
-                    None => Ok(serde_json::Value::Null),
-                }
-            }
-            None => {
-                let characters = self
-                    .character_repo
-                    .find_all()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                to_json(&characters)
-            }
+        let character_id = require_i64(&params, "character_id")?;
+        let character = self
+            .character_repo
+            .find_by_id(character_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        match character {
+            Some(c) => to_json(&c),
+            None => Ok(serde_json::Value::Null),
         }
     }
 
@@ -294,11 +283,12 @@ impl PluginApi {
 
     async fn api_binding_read(
         &self,
-        _params: serde_json::Value,
+        params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        let conversation_id = require_i64(&params, "conversation_id")?;
         let bindings = self
             .binding_repo
-            .find_all()
+            .find_by_conversation_id(conversation_id)
             .await
             .map_err(|e| e.to_string())?;
         to_json(&bindings)
@@ -445,26 +435,15 @@ impl PluginApi {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let character_id = require_i64(&params, "character_id")?;
-        match optional_i64(&params, "participant_id")? {
-            Some(participant_id) => {
-                let relationship = self
-                    .relationship_repo
-                    .find(character_id, participant_id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                match relationship {
-                    Some(r) => to_json(&r),
-                    None => Ok(serde_json::Value::Null),
-                }
-            }
-            None => {
-                let relationships = self
-                    .relationship_repo
-                    .find_by_character_id(character_id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                to_json(&relationships)
-            }
+        let user_id = require_i64(&params, "user_id")?;
+        let relationship = self
+            .relationship_repo
+            .find_by_user_id(character_id, user_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        match relationship {
+            Some(r) => to_json(&r),
+            None => Ok(serde_json::Value::Null),
         }
     }
 
@@ -893,9 +872,11 @@ mod tests {
         ) -> Result<Vec<Memory>, RepositoryError> {
             Ok(Vec::new())
         }
-        async fn search_by_embedding(
+        async fn search_visible_by_embedding(
             &self,
             _character_id: i64,
+            _conversation_id: i64,
+            _user_id: Option<i64>,
             _query_embedding: &[f32],
             _memory_type: Option<&str>,
             _limit: i64,
@@ -947,6 +928,19 @@ mod tests {
                 .filter(|r| r.character_id == character_id)
                 .cloned()
                 .collect())
+        }
+        async fn find_by_user_id(
+            &self,
+            character_id: i64,
+            user_id: i64,
+        ) -> Result<Option<Relationship>, RepositoryError> {
+            Ok(self
+                .rels
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.character_id == character_id && r.user_id == user_id)
+                .cloned())
         }
         async fn upsert(&self, relationship: &Relationship) -> Result<(), RepositoryError> {
             let mut all = self.rels.lock().unwrap();
@@ -1255,6 +1249,7 @@ mod tests {
                     PluginPermission::CharacterRead,
                     PluginPermission::CharacterStateRead,
                     PluginPermission::CharacterStateWrite,
+                    PluginPermission::BindingRead,
                     PluginPermission::MemoryRead,
                     PluginPermission::MemoryWrite,
                     PluginPermission::RelationshipRead,
@@ -1556,7 +1551,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn character_read_all_and_by_id_and_null() {
+    async fn character_read_requires_scope_and_reads_by_id() {
         let h = build_harness(true).await;
         h.character_repo
             .insert(&sample_character(1, "Alice"))
@@ -1567,12 +1562,12 @@ mod tests {
             .await
             .unwrap();
 
-        let all = h
+        let missing_scope = h
             .api
             .dispatch("alpha", "character.read", serde_json::json!({}))
             .await
-            .unwrap();
-        assert_eq!(all.as_array().unwrap().len(), 2);
+            .unwrap_err();
+        assert_eq!(missing_scope, "缺少参数：character_id");
 
         let one = h
             .api
@@ -1625,6 +1620,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("禁止直接修改核心运行状态"));
+    }
+
+    #[tokio::test]
+    async fn binding_read_requires_conversation_scope() {
+        let h = build_harness(true).await;
+        let err = h
+            .api
+            .dispatch("alpha", "binding.read", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "缺少参数：conversation_id");
     }
 
     #[tokio::test]
@@ -1796,7 +1802,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn relationship_read_single_and_all() {
+    async fn relationship_read_requires_global_user_scope() {
         let h = build_harness(true).await;
         h.relationship_repo
             .rels
@@ -1809,7 +1815,7 @@ mod tests {
             .unwrap()
             .push(Relationship::new(1, 11));
 
-        let all = h
+        let missing_user = h
             .api
             .dispatch(
                 "alpha",
@@ -1817,15 +1823,15 @@ mod tests {
                 serde_json::json!({ "character_id": 1 }),
             )
             .await
-            .unwrap();
-        assert_eq!(all.as_array().unwrap().len(), 2);
+            .unwrap_err();
+        assert_eq!(missing_user, "缺少参数：user_id");
 
         let one = h
             .api
             .dispatch(
                 "alpha",
                 "relationship.read",
-                serde_json::json!({ "character_id": 1, "participant_id": 11 }),
+                serde_json::json!({ "character_id": 1, "user_id": 11 }),
             )
             .await
             .unwrap();
@@ -1836,7 +1842,7 @@ mod tests {
             .dispatch(
                 "alpha",
                 "relationship.read",
-                serde_json::json!({ "character_id": 1, "participant_id": 99 }),
+                serde_json::json!({ "character_id": 1, "user_id": 99 }),
             )
             .await
             .unwrap();

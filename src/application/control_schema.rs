@@ -35,6 +35,9 @@ pub enum ControlOperation {
     MemoryList,
     MemoryDelete,
     MemoryUpdate,
+    MemorySharingRequest,
+    MemorySharingConfirm,
+    MemorySharingCancel,
     ReplyUnknownList,
     ReplyUnknownCheck,
     ReplyUnknownRetry,
@@ -68,6 +71,9 @@ impl ControlOperation {
             Self::MemoryList => MEMORY_LIST,
             Self::MemoryDelete => MEMORY_DELETE,
             Self::MemoryUpdate => MEMORY_UPDATE,
+            Self::MemorySharingRequest => MEMORY_SHARING_REQUEST,
+            Self::MemorySharingConfirm => MEMORY_SHARING_CONFIRM,
+            Self::MemorySharingCancel => MEMORY_SHARING_CANCEL,
             Self::ReplyUnknownList => REPLY_UNKNOWN_LIST,
             Self::ReplyUnknownCheck => REPLY_UNKNOWN_CHECK,
             Self::ReplyUnknownRetry => REPLY_UNKNOWN_RETRY,
@@ -102,6 +108,9 @@ impl ControlOperation {
             MEMORY_LIST => Some(Self::MemoryList),
             MEMORY_DELETE => Some(Self::MemoryDelete),
             MEMORY_UPDATE => Some(Self::MemoryUpdate),
+            MEMORY_SHARING_REQUEST => Some(Self::MemorySharingRequest),
+            MEMORY_SHARING_CONFIRM => Some(Self::MemorySharingConfirm),
+            MEMORY_SHARING_CANCEL => Some(Self::MemorySharingCancel),
             REPLY_UNKNOWN_LIST => Some(Self::ReplyUnknownList),
             REPLY_UNKNOWN_CHECK => Some(Self::ReplyUnknownCheck),
             REPLY_UNKNOWN_RETRY => Some(Self::ReplyUnknownRetry),
@@ -177,6 +186,7 @@ pub mod options {
     ];
     pub const MEMORY_LIST: &[&str] = &["character", "conversation", "type", "limit"];
     pub const MEMORY_UPDATE: &[&str] = &["instruction"];
+    pub const MEMORY_SHARING: &[&str] = &["character", "user", "reason"];
     pub const BLACKLIST_REASON: &[&str] = &["reason"];
     pub const BLACKLIST_BAN: &[&str] = &["duration", "reason"];
     pub const REPLY_UNKNOWN_LIST: &[&str] = &["limit"];
@@ -205,6 +215,9 @@ pub const BLACKLIST_BAN: &str = "blacklist ban";
 pub const MEMORY_LIST: &str = "memory list";
 pub const MEMORY_DELETE: &str = "memory delete";
 pub const MEMORY_UPDATE: &str = "memory update";
+pub const MEMORY_SHARING_REQUEST: &str = "memory sharing request";
+pub const MEMORY_SHARING_CONFIRM: &str = "memory sharing confirm";
+pub const MEMORY_SHARING_CANCEL: &str = "memory sharing cancel";
 pub const REPLY_UNKNOWN_LIST: &str = "reply unknown list";
 pub const REPLY_UNKNOWN_CHECK: &str = "reply unknown check";
 pub const REPLY_UNKNOWN_RETRY: &str = "reply unknown retry";
@@ -352,7 +365,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             description: "查询角色状态",
             destructive: false,
             requires_confirmation: false,
-            positional_min: 0,
+            positional_min: 1,
             positional_max: 1,
             allowed_options: options::CONVERSATION,
             supports_raw: true,
@@ -490,6 +503,42 @@ pub fn specs() -> &'static [ControlCommandSpec] {
             supports_raw: false,
         },
         ControlCommandSpec {
+            name: MEMORY_SHARING_REQUEST,
+            usage: "memory sharing request <character-id> <user-id> [--reason <text>]",
+            group: "记忆",
+            description: "记录用户提出的跨会话记忆禁用请求",
+            destructive: false,
+            requires_confirmation: false,
+            positional_min: 2,
+            positional_max: 2,
+            allowed_options: options::MEMORY_SHARING,
+            supports_raw: false,
+        },
+        ControlCommandSpec {
+            name: MEMORY_SHARING_CONFIRM,
+            usage: "memory sharing confirm <character-id> <user-id> --confirm [--reason <text>]",
+            group: "记忆",
+            description: "确认跨会话记忆禁用请求",
+            destructive: true,
+            requires_confirmation: true,
+            positional_min: 2,
+            positional_max: 2,
+            allowed_options: options::MEMORY_SHARING,
+            supports_raw: false,
+        },
+        ControlCommandSpec {
+            name: MEMORY_SHARING_CANCEL,
+            usage: "memory sharing cancel <character-id> <user-id> --confirm [--reason <text>]",
+            group: "记忆",
+            description: "取消跨会话记忆禁用策略",
+            destructive: true,
+            requires_confirmation: true,
+            positional_min: 2,
+            positional_max: 2,
+            allowed_options: options::MEMORY_SHARING,
+            supports_raw: false,
+        },
+        ControlCommandSpec {
             name: REPLY_UNKNOWN_LIST,
             usage: "reply unknown list [--limit N] [--raw]",
             group: "发送",
@@ -579,6 +628,9 @@ pub fn aliases(canonical: &str) -> &'static [&'static str] {
         MEMORY_LIST => &["m list", "mem list"],
         MEMORY_DELETE => &["m delete", "mem delete"],
         MEMORY_UPDATE => &["m update", "mem update"],
+        MEMORY_SHARING_REQUEST => &["m sharing request", "memory share request"],
+        MEMORY_SHARING_CONFIRM => &["m sharing confirm", "memory share confirm"],
+        MEMORY_SHARING_CANCEL => &["m sharing cancel", "memory share cancel"],
         REPLY_UNKNOWN_LIST => &["reply pending list"],
         REPLY_UNKNOWN_CHECK => &["reply pending check"],
         REPLY_UNKNOWN_RETRY => &["reply pending retry"],

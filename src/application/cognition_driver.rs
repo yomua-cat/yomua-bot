@@ -678,9 +678,11 @@ mod tests {
         ) -> Result<Vec<crate::domain::memory::Memory>, RepositoryError> {
             Ok(vec![])
         }
-        async fn search_by_embedding(
+        async fn search_visible_by_embedding(
             &self,
             _character_id: i64,
+            _conversation_id: i64,
+            _user_id: Option<i64>,
             _query_embedding: &[f32],
             _memory_type: Option<&str>,
             _limit: i64,
