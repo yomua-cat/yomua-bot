@@ -133,7 +133,7 @@ model_instance = "dialogue"
 
 Provider 只登记连接地址、密钥和超时；同一个 Provider 可以被多个 model instance 复用。model instance 只填写模型名和能力，URL 不重复写。对话和插件聊天使用 `conversation`；后台认知使用 `cognition`。
 
-`fallback_model_instances` 按顺序尝试，`max_attempts` 限制本次请求最多尝试的模型数，`budget_tokens` 是主模型与备用模型共享的本次请求 token 上限。只有网络错误、超时、HTTP 429 或 5xx 会切换备用模型；认证失败、参数错误和响应格式错误会立即返回。每次请求只生成一次，备用模型只在尚未得到有效响应时使用。
+`fallback_model_instances` 按顺序尝试，`max_attempts` 限制本次请求最多尝试的模型数，`budget_tokens` 是主模型与备用模型共享的本次请求输出 token 上限。调度器会在每次尝试前保守预留本次允许的最大输出；网络失败且没有可用用量数据时，已预留额度不会回收，以避免备用链超过上限。只有网络错误、超时、HTTP 429 或 5xx 会切换备用模型；认证失败、参数错误和响应格式错误会立即返回。每次请求只生成一次，备用模型只在尚未得到有效响应时使用。
 
 Grok 不需要专用代码。把 xAI 的 OpenAI-compatible 地址配置成一个 Provider，再为不同 Grok 模型各建一个 model instance 即可。
 
@@ -162,7 +162,7 @@ max_attempts = 2
 budget_tokens = 1024
 ```
 
-`decision.toml` 的备用链同样只在网络错误、超时、HTTP 429 或 5xx 时切换。决策模型只返回结构化建议，规则引擎和程序校验仍拥有最终裁决权。
+`decision.toml` 的备用链同样共享本次请求的输出 token 上限，并只在网络错误、超时、HTTP 429 或 5xx 时切换。决策模型只返回结构化建议，规则引擎和程序校验仍拥有最终裁决权。
 
 ## 修改与重载
 

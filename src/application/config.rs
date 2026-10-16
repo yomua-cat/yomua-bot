@@ -127,7 +127,7 @@ pub struct LlmRoleConfig {
     #[serde(default)]
     pub max_attempts: Option<usize>,
 
-    /// 此任务单次请求允许消耗的总 token 数；备用模型共享该上限。
+    /// 此任务单次请求允许生成的输出 token 上限；备用模型共享该上限。
     #[serde(default)]
     pub budget_tokens: Option<u32>,
 }

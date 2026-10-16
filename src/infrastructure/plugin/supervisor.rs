@@ -641,6 +641,9 @@ async fn monitor_instance(
                         core.registry.clear_conn(&name);
                         // 已死子进程的 pid 立即清掉（Crashed/重试前不残留）。
                         core.registry.set_pid(&name, None);
+                        // stop() 可能在本分支清理前拿到句柄；即使实例是异常退出，
+                        // 也必须通知等待者，避免 stop() 无谓等待完整超时。
+                        inst.handle.done.notify_waiters();
                         return Trigger::Failed(format!("进程退出（码 {}）", exit_code(&status)));
                     }
                     Ok(None) => {
@@ -656,6 +659,7 @@ async fn monitor_instance(
                         let _ = (&mut inst.server_task).await;
                         core.registry.clear_conn(&name);
                         core.registry.set_pid(&name, None);
+                        inst.handle.done.notify_waiters();
                         return Trigger::Failed(format!("轮询子进程失败：{e}"));
                     }
                 }
@@ -677,6 +681,7 @@ async fn monitor_instance(
                 inst.server_task.abort();
                 let _ = (&mut inst.server_task).await;
                 core.registry.clear_conn(&name);
+                inst.handle.done.notify_waiters();
                 return Trigger::Failed(reason);
             }
             _ = &mut inst.attached_rx, if !attached_done => {
@@ -696,6 +701,7 @@ async fn monitor_instance(
                 inst.server_task.abort();
                 let _ = (&mut inst.server_task).await;
                 core.registry.clear_conn(&name);
+                inst.handle.done.notify_waiters();
                 return Trigger::Failed(format!(
                     "启动超时：{}ms 内未完成握手",
                     core.cfg.handshake_timeout.as_millis()
