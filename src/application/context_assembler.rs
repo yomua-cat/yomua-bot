@@ -440,6 +440,17 @@ impl ContextAssembler {
         ctx: &ConversationContext,
         _current_user_participant_id: i64,
     ) -> Vec<LlmMessage> {
+        let external_id = |metadata: &serde_json::Value, fallback: i64| {
+            metadata
+                .get("external_sender_id")
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| value.as_i64().map(|id| id.to_string()))
+                })
+                .unwrap_or_else(|| fallback.to_string())
+        };
         ctx.recent_messages
             .iter()
             .map(|msg| {
@@ -460,10 +471,7 @@ impl ContextAssembler {
                                     .get("display_name")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("群成员"),
-                                msg.metadata
-                                    .get("external_sender_id")
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_else(|| msg.sender_id.to_string()),
+                                external_id(&msg.metadata, msg.sender_id),
                                 t
                             )
                         } else {
@@ -1023,6 +1031,7 @@ mod tests {
         // messages 应包含 history (M1, M2) + 历史后指令 + current ("你好！")
         assert_eq!(result.messages.len(), 4);
         assert!(result.messages[0].content.contains("M1")); // User
+        assert_eq!(result.messages[0].content, "[小明 | 用户 99] M1");
         assert_eq!(result.messages[1].content, "M2"); // Assistant
         assert_eq!(result.messages[2].content, "请以 Alice 的身份回答"); // Post-history instruction
         assert_eq!(result.messages[3].content, "你好！"); // Current
