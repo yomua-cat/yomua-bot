@@ -129,6 +129,12 @@ impl MemoryService {
             "status": "candidate",
             "verification": "pending",
             "candidate_reason": "确定性规则命中，等待后台确认",
+            // 直接陈述类候选才允许走程序自动确认；事件类信息仍需更严格的
+            // 后台语义审核，避免把随口一说固化成长期事实。
+            "candidate_confidence": match candidate.memory_type {
+                MemoryType::Relationship | MemoryType::Semantic => 0.9,
+                MemoryType::Episodic | MemoryType::System => 0.6,
+            },
             "visibility": if candidate.memory_type == MemoryType::Episodic { "conversation" } else { "shared" },
             "shared": candidate.memory_type != MemoryType::Episodic,
         });

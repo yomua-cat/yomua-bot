@@ -27,6 +27,7 @@ impl MemoryRepository for SqliteMemoryRepository {
                 WHERE COALESCE(json_extract(metadata, '$.status'), 'formal') = 'candidate'
                   AND json_extract(metadata, '$.kind') = 'statement'
                   AND json_extract(metadata, '$.source_message_id') IS NOT NULL
+                  AND COALESCE(json_extract(metadata, '$.candidate_confidence'), 0) >= 0.8
                   AND importance >= 0.5
                 ORDER BY importance DESC, created_at ASC, id ASC
                 LIMIT ?"#,
@@ -50,7 +51,7 @@ impl MemoryRepository for SqliteMemoryRepository {
                           '$.status', 'formal',
                           '$.verification', 'program_confirmed',
                           '$.confirmed_at', ?,
-                          '$.confirmation_reason', '有来源的确定性陈述候选，满足最低重要度'
+                          '$.confirmation_reason', '有来源的确定性陈述候选，置信度和重要度满足程序门槛'
                       )
                     WHERE id = ?
                       AND COALESCE(json_extract(metadata, '$.status'), 'formal') = 'candidate'"#,

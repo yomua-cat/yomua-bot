@@ -86,6 +86,41 @@ pub trait BehaviorStateRepository: Send + Sync {
         conversation_id: i64,
         state: &BehaviorState,
     ) -> Result<(), RepositoryError>;
+
+    /// 原子预留一次主动发言额度。
+    ///
+    /// 生产实现必须在同一事务中检查冷却和每日额度并写入新状态，避免
+    /// 多个后台 tick 同时通过检查后重复排队。内存测试仓储使用默认实现。
+    async fn try_reserve_proactive(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        now: chrono::DateTime<chrono::Utc>,
+        cooldown: chrono::Duration,
+        daily_limit: u32,
+    ) -> Result<bool, RepositoryError> {
+        let mut state = self
+            .find_by_character_and_conversation(character_id, conversation_id)
+            .await?
+            .unwrap_or_default();
+        let today = now.date_naive();
+        if state.proactive_count_date != Some(today) {
+            state.proactive_count_date = Some(today);
+            state.proactive_count = 0;
+        }
+        if state.proactive_count >= daily_limit
+            || state
+                .last_proactive_at
+                .is_some_and(|last| now.signed_duration_since(last) < cooldown)
+        {
+            return Ok(false);
+        }
+        state.proactive_count += 1;
+        state.last_proactive_at = Some(now);
+        state.last_updated = now;
+        self.upsert(character_id, conversation_id, &state).await?;
+        Ok(true)
+    }
 }
 
 // ---------------------------------------------------------------------------

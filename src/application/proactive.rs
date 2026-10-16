@@ -178,13 +178,20 @@ impl ProactiveDriver {
             return Ok(());
         }
         if let Some(scheduler) = &self.reply_scheduler {
-            let today = now.date_naive();
-            let mut new_behavior_state = behavior_state.unwrap_or_default();
-            if new_behavior_state.proactive_count_date != Some(today) {
-                new_behavior_state.proactive_count_date = Some(today);
-                new_behavior_state.proactive_count = 0;
-            }
-            if new_behavior_state.proactive_count >= self.daily_limit {
+            let cooldown = chrono::Duration::from_std(self.cooldown)
+                .map_err(|e| DomainError::Internal(format!("冷却时长无效: {e}")))?;
+            let reserved = self
+                .behavior_state_repo
+                .try_reserve_proactive(
+                    binding.character_id,
+                    binding.conversation_id,
+                    now,
+                    cooldown,
+                    self.daily_limit,
+                )
+                .await
+                .map_err(|e| DomainError::Internal(format!("主动额度预留失败: {e}")))?;
+            if !reserved {
                 return Ok(());
             }
             scheduler
@@ -195,17 +202,6 @@ impl ProactiveDriver {
                 )
                 .await
                 .map_err(|e| DomainError::Internal(e.to_string()))?;
-            new_behavior_state.proactive_count += 1;
-            new_behavior_state.last_proactive_at = Some(now);
-            new_behavior_state.last_updated = now;
-            self.behavior_state_repo
-                .upsert(
-                    binding.character_id,
-                    binding.conversation_id,
-                    &new_behavior_state,
-                )
-                .await
-                .map_err(|e| DomainError::Internal(format!("主动状态落库失败: {e}")))?;
         } else {
             return Ok(());
         }

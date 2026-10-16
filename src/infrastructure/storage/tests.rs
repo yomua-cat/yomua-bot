@@ -1234,6 +1234,7 @@ mod storage_tests {
             "kind": "statement",
             "status": "candidate",
             "source_message_id": 42,
+            "candidate_confidence": 0.9,
             "shared": true,
         });
         memory_repo.insert(&candidate).await.unwrap();
@@ -3111,6 +3112,29 @@ mod storage_tests {
         let saved = loaded2.last_proactive_at.expect("应能读回主动时间");
         assert!((saved - t).num_seconds().abs() <= 1, "主动时间应接近写入值");
         assert_eq!(loaded2.proactive_count, 3);
+
+        // 额度预留必须在仓储层同时检查冷却和每日上限；第二次立即预留应失败。
+        let reserve_now = chrono::Utc::now() + chrono::Duration::minutes(6);
+        assert!(bs_repo
+            .try_reserve_proactive(
+                char_id,
+                conv_id,
+                reserve_now,
+                chrono::Duration::minutes(10),
+                10,
+            )
+            .await
+            .unwrap());
+        assert!(!bs_repo
+            .try_reserve_proactive(
+                char_id,
+                conv_id,
+                reserve_now + chrono::Duration::seconds(1),
+                chrono::Duration::minutes(10),
+                10,
+            )
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

@@ -551,11 +551,16 @@ impl ReplyProcessor {
             .metadata
             .get("external_sender_id")
             .and_then(|value| value.as_str());
+        let synthetic_proactive = event
+            .metadata
+            .get("author_kind")
+            .and_then(|value| value.as_str())
+            == Some("system");
         let relationship_participant_id = self
             .relationship_service
             .canonical_participant_id(event.character_id, event.sender_id, stable_user_key)
             .await?;
-        if event.message_id > 0 {
+        if event.message_id > 0 && !synthetic_proactive {
             self.memory_service
                 .extract_and_store(
                     event.character_id,
@@ -567,7 +572,7 @@ impl ReplyProcessor {
                 )
                 .await?;
         }
-        if event.message_id > 0 {
+        if event.message_id > 0 && !synthetic_proactive {
             match self
                 .relationship_service
                 .record_interaction_once(
