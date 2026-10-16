@@ -23,6 +23,8 @@
 
 use sqlx::SqlitePool;
 
+use crate::domain::character::ConversationState;
+use crate::domain::emotion::Mood;
 use crate::error::RuntimeError;
 
 /// 会话删除服务。
@@ -34,6 +36,69 @@ pub struct SessionService {
 impl SessionService {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// 原子更新会话范围的角色状态。
+    ///
+    /// `ConversationState` 和 `Mood` 属于同一个控制操作；调用方已经完成
+    /// 所有输入校验后，两个 upsert 必须一起提交，避免 ctl 返回失败但只写入
+    /// 其中一半。传入 `None` 的部分保持不变。
+    pub async fn upsert_conversation_state_and_mood(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        conversation_state: Option<&ConversationState>,
+        mood: Option<&Mood>,
+    ) -> Result<(), RuntimeError> {
+        if conversation_state.is_none() && mood.is_none() {
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("状态事务开始失败: {e}")))?;
+
+        if let Some(state) = conversation_state {
+            sqlx::query(
+                r#"INSERT INTO conversation_states (character_id, conversation_id, energy, stress, last_updated)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(character_id, conversation_id) DO UPDATE SET
+                     energy = excluded.energy,
+                     stress = excluded.stress,
+                     last_updated = excluded.last_updated"#,
+            )
+            .bind(character_id)
+            .bind(conversation_id)
+            .bind(state.energy)
+            .bind(state.stress)
+            .bind(state.last_updated.to_rfc3339())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("写入会话状态失败: {e}")))?;
+        }
+
+        if let Some(mood) = mood {
+            sqlx::query(
+                r#"INSERT INTO moods (character_id, conversation_id, value, last_updated)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(character_id, conversation_id) DO UPDATE SET
+                     value = excluded.value,
+                     last_updated = excluded.last_updated"#,
+            )
+            .bind(character_id)
+            .bind(conversation_id)
+            .bind(mood.value)
+            .bind(mood.last_updated.to_rfc3339())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("写入心情失败: {e}")))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("状态事务提交失败: {e}")))?;
+        Ok(())
     }
 
     /// 删除指定角色关联的所有会话数据。
@@ -155,5 +220,48 @@ impl SessionService {
             .map_err(|e| RuntimeError::Internal(format!("提交失败: {}", e)))?;
 
         Ok(before.0 as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::storage::SqliteStorage;
+    use chrono::Utc;
+
+    #[tokio::test]
+    async fn scoped_state_update_rolls_back_when_mood_write_fails() {
+        let storage = SqliteStorage::open_in_memory().await.unwrap();
+        storage.migrate().await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_mood_write BEFORE INSERT ON moods BEGIN SELECT RAISE(ABORT, 'forced mood failure'); END",
+        )
+        .execute(storage.pool())
+        .await
+        .unwrap();
+
+        let service = SessionService::new(storage.pool().clone());
+        let now = Utc::now();
+        let state = ConversationState {
+            energy: 70.0,
+            stress: 20.0,
+            last_updated: now,
+        };
+        let mood = Mood {
+            value: 80.0,
+            last_updated: now,
+        };
+
+        assert!(service
+            .upsert_conversation_state_and_mood(1, 2, Some(&state), Some(&mood))
+            .await
+            .is_err());
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM conversation_states WHERE character_id = 1 AND conversation_id = 2",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(count.0, 0, "心情写入失败时会话状态也必须回滚");
     }
 }

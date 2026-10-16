@@ -604,7 +604,7 @@ fn handle_state_set(handle: &RuntimeHandle, id: u64, params: serde_json::Value) 
                 } else {
                     None
                 };
-                if patch_conv {
+                let next_conversation_state = if patch_conv {
                     let mut state: ConversationState = handle
                         .conversation_state_repo
                         .find_by_character_and_conversation(character_id, cid)
@@ -624,16 +624,14 @@ fn handle_state_set(handle: &RuntimeHandle, id: u64, params: serde_json::Value) 
                     }
 
                     let state = state.clamped();
-                    handle
-                        .conversation_state_repo
-                        .upsert(character_id, cid, &state)
-                        .await
-                        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
                     result["conversation_state"] = serde_json::to_value(&state)
                         .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-                }
+                    Some(state)
+                } else {
+                    None
+                };
 
-                if let Some(mood_value) = parsed_mood {
+                let next_mood = if let Some(mood_value) = parsed_mood {
                     let mut mood: Mood = handle
                         .mood_repo
                         .find_by_character_and_conversation(character_id, cid)
@@ -642,14 +640,22 @@ fn handle_state_set(handle: &RuntimeHandle, id: u64, params: serde_json::Value) 
                         .unwrap_or_default();
                     mood.value = mood_value;
                     let mood = mood.clamped();
-                    handle
-                        .mood_repo
-                        .upsert(character_id, cid, &mood)
-                        .await
-                        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
                     result["mood"] = serde_json::to_value(&mood)
                         .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-                }
+                    Some(mood)
+                } else {
+                    None
+                };
+
+                handle
+                    .session_service
+                    .upsert_conversation_state_and_mood(
+                        character_id,
+                        cid,
+                        next_conversation_state.as_ref(),
+                        next_mood.as_ref(),
+                    )
+                    .await?;
             }
         }
 
