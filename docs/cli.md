@@ -72,7 +72,7 @@ ctl 按命令校验参数：选项只对声明的命令开放，`status --energy
 | `blacklist ban <外部用户ID> --duration 30m [--reason 文本] --confirm` | 临时记录，必须指定时长 |
 | `memory list [--character <ID>] [--conversation <ID>] [--type 类型] [--limit N] [--raw]` | 查看记忆摘要；只有显式 `--raw` 才读取原文 |
 | `memory delete <记忆ID> --confirm` | 删除记忆 |
-| `memory update <记忆ID> --instruction "请把这条记忆改成……" --confirm` | 记录自然语言修改请求，由后台处理 |
+| `memory update <记忆ID> --instruction "请把这条记忆改成……" --confirm` | 请求 decision LLM 提出受限修改建议，经程序校验后生效；未配置模型时返回明确错误 |
 | `reply unknown list [--limit N] [--raw]` | 列出发送结果未知、等待平台核查的回复任务；默认只显示元数据，`--raw` 才返回已保存的回复原文 |
 | `reply unknown check <消息ID>` | 若任务保存了平台消息 ID，通过 OneBot `get_msg` 查询；没有平台 ID 时明确返回需要人工核查 |
 | `reply unknown retry <消息ID> --confirm` | 你已确认平台未发送后，清除未知状态并把原任务重新排队；不会根据查询失败自动执行 |

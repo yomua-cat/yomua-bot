@@ -485,6 +485,9 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         mood_repo: repos.mood_repo.clone(),
         conversation_repo: repos.conversation_repo.clone(),
         message_repo: repos.message_repo.clone(),
+        llm_scheduler: app.llm_scheduler.clone().map(|scheduler| {
+            scheduler as Arc<dyn yomua_bot::application::llm_scheduler::LlmScheduler>
+        }),
         started_at: std::time::Instant::now(),
         blacklist_repo: repos.blacklist_repo.clone(),
         session_service: SessionService::new(repos._pool.clone()),

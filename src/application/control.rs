@@ -39,6 +39,7 @@ use tokio::sync::{watch, Notify, RwLock};
 
 use crate::adapters::onebot::{OneBotAdapter, OneBotAdapterImpl};
 use crate::application::config::{ConfigurationBundle, RuntimeConfig};
+use crate::application::llm_scheduler::LlmScheduler;
 use crate::application::runtime::CharacterRuntime;
 use crate::domain::character::ConversationState;
 use crate::domain::emotion::Mood;
@@ -48,6 +49,7 @@ use crate::domain::repository::{
     ConversationStateRepository, MemoryRepository, MessageRepository, MoodRepository,
 };
 use crate::error::RuntimeError;
+use crate::infrastructure::llm::{LlmMessage, LlmRequest, LlmRole};
 use crate::infrastructure::plugin::supervisor::PluginSupervisor;
 use crate::infrastructure::storage::SqliteStorage;
 
@@ -1546,23 +1548,164 @@ fn handle_memory_update(
                 ));
             }
         };
+        let Some(scheduler) = &handle.llm_scheduler else {
+            return Ok(ControlResponse::err(
+                id,
+                ControlErrorDetail::new(
+                    "MEMORY_EDIT_UNAVAILABLE",
+                    "当前未配置可用的模型，无法根据自然语言修改记忆",
+                ),
+            ));
+        };
+
         let requested_at = chrono::Utc::now().to_rfc3339();
         memory.metadata["edit_request"] = serde_json::json!({
             "instruction": instruction,
             "status": "pending",
             "requested_at": requested_at,
         });
-        memory.metadata["updated_by"] = serde_json::Value::String("control_request".to_string());
+
+        // 记忆原文只发送给已配置的 LLM 调度器；响应必须是受限 JSON，
+        // 后续只允许程序审核过的操作落库。
+        let request = LlmRequest {
+            system: Some(
+                "你是记忆修改建议器。只返回 JSON，不要 Markdown，不要解释。格式必须是："
+                    .to_string()
+                    + r#"{"action":"replace|append|no_change","content":"...","reason":"..."}。"#
+                    + "只能根据原记忆和用户意图提出建议；不能删除记忆，不能输出额外字段。",
+            ),
+            messages: vec![LlmMessage {
+                role: LlmRole::User,
+                content: serde_json::json!({
+                    "memory_id": memory.id,
+                    "memory_type": format!("{:?}", memory.memory_type).to_lowercase(),
+                    "current_content": memory.content,
+                    "instruction": instruction,
+                })
+                .to_string(),
+            }],
+            model: None,
+            temperature: Some(0.0),
+            max_tokens: Some(512),
+            priority: 0,
+            metadata: serde_json::json!({
+                "llm_role": "decision",
+                "purpose": "memory_edit_suggestion",
+                "memory_id": memory.id,
+            }),
+        };
+
+        let response = match scheduler.submit(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                memory.metadata["edit_request"] = serde_json::json!({
+                    "instruction": instruction,
+                    "status": "failed",
+                    "requested_at": requested_at,
+                    "error": error.to_string(),
+                });
+                handle.memory_repo.update(&memory).await?;
+                return Err(error);
+            }
+        };
+        let suggestion = match parse_memory_edit_suggestion(&response.content) {
+            Ok(suggestion) => suggestion,
+            Err(error) => {
+                memory.metadata["edit_request"] = serde_json::json!({
+                    "instruction": instruction,
+                    "status": "rejected",
+                    "requested_at": requested_at,
+                    "error": error,
+                });
+                handle.memory_repo.update(&memory).await?;
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("MEMORY_EDIT_REJECTED", error),
+                ));
+            }
+        };
+
+        let old_content = memory.content.clone();
+        match suggestion.action.as_str() {
+            "replace" => memory.content = suggestion.content.clone(),
+            "append" => {
+                memory.content = format!("{}\n{}", memory.content.trim_end(), suggestion.content)
+            }
+            "no_change" => {}
+            _ => unreachable!("parse_memory_edit_suggestion 已校验 action"),
+        }
+        if memory.content.chars().count() > 20_000 {
+            memory.content = old_content;
+            memory.metadata["edit_request"] = serde_json::json!({
+                "instruction": instruction,
+                "status": "rejected",
+                "requested_at": requested_at,
+                "error": "修改后的记忆超过 20000 个字符",
+            });
+            handle.memory_repo.update(&memory).await?;
+            return Ok(ControlResponse::err(
+                id,
+                ControlErrorDetail::new("MEMORY_EDIT_REJECTED", "修改后的记忆过长"),
+            ));
+        }
+        let applied_at = chrono::Utc::now().to_rfc3339();
+        memory.metadata["edit_request"] = serde_json::json!({
+            "instruction": instruction,
+            "status": "applied",
+            "action": suggestion.action,
+            "reason": suggestion.reason,
+            "requested_at": requested_at,
+            "applied_at": applied_at,
+            "model": response.model,
+        });
+        memory.metadata["updated_by"] = serde_json::Value::String("llm_memory_edit".to_string());
         handle.memory_repo.update(&memory).await?;
         Ok(ControlResponse::ok(
             id,
             serde_json::json!({
                 "memory_id": memory.id,
-                "request_recorded": true,
-                "processing": "pending",
+                "updated": true,
+                "action": memory.metadata["edit_request"]["action"],
+                "content_changed": old_content != memory.content,
             }),
         ))
     })
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MemoryEditSuggestion {
+    action: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    reason: String,
+}
+
+fn parse_memory_edit_suggestion(raw: &str) -> Result<MemoryEditSuggestion, String> {
+    let trimmed = raw.trim();
+    let json = trimmed
+        .strip_prefix("```json")
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    let suggestion: MemoryEditSuggestion = serde_json::from_str(json)
+        .map_err(|error| format!("模型没有返回合法的记忆修改 JSON：{error}"))?;
+    if !matches!(
+        suggestion.action.as_str(),
+        "replace" | "append" | "no_change"
+    ) {
+        return Err("模型返回了不允许的修改动作".into());
+    }
+    if suggestion.reason.chars().count() > 2_000 {
+        return Err("模型返回的修改理由过长".into());
+    }
+    if suggestion.action != "no_change" && suggestion.content.trim().is_empty() {
+        return Err("修改动作需要非空 content".into());
+    }
+    if suggestion.content.chars().count() > 20_000 {
+        return Err("模型返回的修改内容过长".into());
+    }
+    Ok(suggestion)
 }
 
 fn memory_fingerprint(content: &str) -> String {
@@ -2142,6 +2285,8 @@ pub struct RuntimeHandle {
     pub conversation_repo: Arc<dyn ConversationRepository>,
     /// 消息仓储（用于查询会话活动状态）。
     pub message_repo: Arc<dyn MessageRepository>,
+    /// 统一 LLM 调度器；控制层只通过它请求受限的记忆修改建议。
+    pub llm_scheduler: Option<Arc<dyn LlmScheduler>>,
     /// 进程启动时刻（单调时钟），用于计算运行时长。
     pub started_at: Instant,
     /// 黑名单仓储。
@@ -2584,6 +2729,33 @@ mod transport_tests {
     fn control_timeouts_leave_room_for_client_response() {
         assert!(CONTROL_IO_TIMEOUT > Duration::from_secs(45));
         assert!(CONTROL_COMMAND_TIMEOUT < Duration::from_secs(45));
+    }
+
+    #[test]
+    fn memory_edit_suggestion_accepts_only_safe_actions() {
+        let suggestion = parse_memory_edit_suggestion(
+            r#"{"action":"replace","content":"用户喜欢猫","reason":"明确事实"}"#,
+        )
+        .expect("合法建议应被接受");
+        assert_eq!(suggestion.action, "replace");
+        assert!(
+            parse_memory_edit_suggestion(r#"{"action":"delete","content":"","reason":""}"#,)
+                .is_err()
+        );
+        assert!(
+            parse_memory_edit_suggestion(r#"{"action":"append","content":"","reason":""}"#,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn memory_edit_suggestion_accepts_fenced_json_without_exposing_extra_fields() {
+        let suggestion = parse_memory_edit_suggestion(
+            "```json\n{\"action\":\"no_change\",\"reason\":\"证据不足\",\"extra\":true}\n```",
+        )
+        .expect("代码围栏中的合法 JSON 应被接受");
+        assert_eq!(suggestion.action, "no_change");
+        assert_eq!(suggestion.reason, "证据不足");
     }
 
     #[test]

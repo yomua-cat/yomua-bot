@@ -40,6 +40,7 @@ use yomua_bot::application::context_assembler::{
 use yomua_bot::application::control::{start_control_service, CommandRegistry, RuntimeHandle};
 use yomua_bot::application::conversation::ConversationManager;
 use yomua_bot::application::event_bus::EventBus;
+use yomua_bot::application::llm_scheduler::LlmScheduler;
 use yomua_bot::application::plugin_api::PluginApi;
 use yomua_bot::application::session_service::SessionService;
 use yomua_bot::domain::character::{
@@ -59,7 +60,9 @@ use yomua_bot::domain::repository::{
     MoodRepository, ParticipantRepository, PluginDataRepository, RelationshipRepository,
 };
 use yomua_bot::error::RuntimeError;
-use yomua_bot::infrastructure::llm::{ApproximateTokenEstimator, FixedModelCapabilities};
+use yomua_bot::infrastructure::llm::{
+    ApproximateTokenEstimator, FixedModelCapabilities, LlmRequest, LlmResponse, TokenUsage,
+};
 use yomua_bot::infrastructure::plugin::registry::PluginRegistry;
 use yomua_bot::infrastructure::plugin::supervisor::{PluginSupervisor, SupervisorConfig};
 use yomua_bot::infrastructure::storage::repository::{
@@ -98,6 +101,30 @@ struct MockConnector;
 impl WsConnector for MockConnector {
     async fn connect(&self, _config: &OneBotConfig) -> Result<Box<dyn WsTransport>, RuntimeError> {
         Ok(Box::new(MockTransport))
+    }
+}
+
+struct MemoryEditTestScheduler;
+
+#[async_trait]
+impl LlmScheduler for MemoryEditTestScheduler {
+    async fn submit(&self, request: LlmRequest) -> Result<LlmResponse, RuntimeError> {
+        assert_eq!(request.metadata["purpose"], "memory_edit_suggestion");
+        Ok(LlmResponse {
+            content: serde_json::json!({
+                "action": "replace",
+                "content": "用户确认喜欢猫",
+                "reason": "测试调度器返回的受限建议"
+            })
+            .to_string(),
+            model: "test-memory-editor".to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+            truncated: false,
+        })
     }
 }
 
@@ -335,6 +362,7 @@ async fn create_env() -> TestEnv {
         mood_repo: mood_repo.clone(),
         conversation_repo: conversation_repo.clone(),
         message_repo: message_repo.clone(),
+        llm_scheduler: Some(Arc::new(MemoryEditTestScheduler)),
         started_at: std::time::Instant::now(),
         blacklist_repo: blacklist_repo.clone(),
         session_service: SessionService::new(pool.clone()),
@@ -4135,7 +4163,7 @@ async fn test_memory_delete_success() {
 }
 
 #[tokio::test]
-async fn test_memory_update_records_private_edit_request() {
+async fn test_memory_update_applies_validated_model_suggestion() {
     let env = create_env().await;
     let m = Memory {
         id: 0,
@@ -4159,20 +4187,17 @@ async fn test_memory_update_records_private_edit_request() {
     )
     .await
     .unwrap();
-    assert_eq!(resp["ok"], true, "记忆修改请求应记录: {resp}");
-    assert_eq!(resp["data"]["request_recorded"], true);
+    assert_eq!(resp["ok"], true, "合法模型建议应通过控制链路生效: {resp}");
+    assert_eq!(resp["data"]["updated"], true);
     let updated = env
         .memory_repo
         .find_by_id(mem_id)
         .await
         .expect("查询更新后的记忆失败")
         .expect("更新后的记忆应存在");
-    assert_eq!(updated.content, "candidate fact");
-    assert_eq!(updated.metadata["edit_request"]["status"], "pending");
-    assert_eq!(
-        updated.metadata["edit_request"]["instruction"],
-        "请把这条记忆改成用户确认喜欢猫"
-    );
+    assert_eq!(updated.content, "用户确认喜欢猫");
+    assert_eq!(updated.metadata["edit_request"]["status"], "applied");
+    assert_eq!(updated.metadata["edit_request"]["action"], "replace");
 }
 
 #[tokio::test]
