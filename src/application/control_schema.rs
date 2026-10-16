@@ -443,7 +443,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: BLACKLIST_BAN,
-            usage: "blacklist ban <qq-id> [--duration <dur>] [--reason <text>] --confirm",
+            usage: "blacklist ban <qq-id> --duration <dur> [--reason <text>] --confirm",
             group: "黑名单",
             description: "临时封禁用户",
             destructive: true,

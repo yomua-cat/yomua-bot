@@ -725,63 +725,64 @@ fn print_client_error(raw: bool, message: &str) {
 // ============================================================================
 
 pub fn parse_duration(s: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
-    let s = s.trim();
-    if s.is_empty() {
+    let Some(secs) = parse_duration_seconds(s)? else {
         return Ok(None);
-    }
-
-    let unit = s.chars().last().unwrap();
-    let value: i64 = s[..s.len() - 1]
-        .parse()
-        .map_err(|_| format!("无效时长格式: {s}"))?;
-
-    let secs = match unit {
-        'm' => value
-            .checked_mul(60)
-            .ok_or_else(|| "时长超出允许范围".to_string())?,
-        'h' => value
-            .checked_mul(3600)
-            .ok_or_else(|| "时长超出允许范围".to_string())?,
-        'd' => value
-            .checked_mul(86400)
-            .ok_or_else(|| "时长超出允许范围".to_string())?,
-        _ => return Err(format!("未知时间单位: {unit}，支持 m/h/d")),
     };
-
-    let expires = chrono::Utc::now() + chrono::Duration::seconds(secs);
+    let expires = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::seconds(secs))
+        .ok_or_else(|| "时长超出允许范围".to_string())?;
     Ok(Some(expires))
 }
 
 /// 将时间长度字符串解析为秒数（用于传给 bot）。
 fn parse_duration_to_secs(s: &str) -> Result<i64, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("时长不能为空".to_string());
+    parse_duration_seconds(s)?.ok_or_else(|| "时长不能为空".to_string())
+}
+
+/// 解析控制命令使用的时长。
+///
+/// 同时接受英文短单位（`s`/`m`/`h`/`d`）和常用中文单位（秒、分钟、小时、天）。
+/// 先去掉完整后缀再解析数字，避免直接按最后一个字节切片导致中文输入 panic。
+fn parse_duration_seconds(s: &str) -> Result<Option<i64>, String> {
+    let input = s.trim().to_lowercase();
+    if input.is_empty() {
+        return Ok(None);
     }
 
-    let unit = s.chars().last().unwrap();
-    let value: i64 = s[..s.len() - 1]
+    const UNITS: &[(&str, i64)] = &[
+        ("分钟", 60),
+        ("小时", 3600),
+        ("秒", 1),
+        ("天", 86400),
+        ("分", 60),
+        ("时", 3600),
+        ("日", 86400),
+        ("min", 60),
+        ("sec", 1),
+        ("hour", 3600),
+        ("day", 86400),
+        ("s", 1),
+        ("m", 60),
+        ("h", 3600),
+        ("d", 86400),
+    ];
+    let Some((number, multiplier)) = UNITS.iter().find_map(|(unit, multiplier)| {
+        input.strip_suffix(unit).map(|number| (number, *multiplier))
+    }) else {
+        return Err(format!("无效时长格式: {s}，支持秒/分钟/小时/天或 s/m/h/d"));
+    };
+
+    let value: i64 = number
+        .trim()
         .parse()
         .map_err(|_| format!("无效时长格式: {s}"))?;
-
     if value <= 0 {
         return Err("时长必须为正数".to_string());
     }
-
-    let secs = match unit {
-        'm' => value
-            .checked_mul(60)
-            .ok_or_else(|| "时长超出允许范围".to_string())?,
-        'h' => value
-            .checked_mul(3600)
-            .ok_or_else(|| "时长超出允许范围".to_string())?,
-        'd' => value
-            .checked_mul(86400)
-            .ok_or_else(|| "时长超出允许范围".to_string())?,
-        _ => return Err(format!("未知时间单位: {unit}，支持 m/h/d")),
-    };
-
-    Ok(secs)
+    value
+        .checked_mul(multiplier)
+        .map(Some)
+        .ok_or_else(|| "时长超出允许范围".to_string())
 }
 
 // ============================================================================
@@ -2198,9 +2199,20 @@ mod tests {
         assert!(parse_duration("1h").is_ok());
         assert!(parse_duration("30m").is_ok());
         assert!(parse_duration("7d").is_ok());
+        assert!(parse_duration("10秒").is_ok());
+        assert!(parse_duration("30分钟").is_ok());
+        assert!(parse_duration("2小时").is_ok());
+        assert!(parse_duration("7天").is_ok());
         assert!(parse_duration("").is_ok());
         let r = parse_duration("1x");
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn duration_parser_rejects_malformed_unicode_without_panicking() {
+        for value in ["秒", "分钟", "小时", "天", "1分钟x", "-1小时", "0秒"] {
+            assert!(parse_duration_to_secs(value).is_err(), "{value}");
+        }
     }
 
     #[test]
@@ -2397,6 +2409,7 @@ mod tests {
             .expect_err("overflowing duration must be rejected");
         assert!(error.contains("超出允许范围"));
         assert!(parse_duration_to_secs("1h").is_ok());
+        assert_eq!(parse_duration_to_secs("30分钟").unwrap(), 1800);
     }
 
     #[test]

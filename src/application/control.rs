@@ -1302,9 +1302,10 @@ fn handle_reply_unknown_check(
                 }),
             ));
         }
-        // get_msg 明确返回了带错误码的失败，才足以证明原发送没有成功；
-        // 这时原子重新排队，避免把网络不确定误判成未发送。
-        let confirmed_not_sent = response.retcode.is_some_and(|code| code != 0);
+        // 只有平台明确说明“这条消息不存在/未发送”时，才能安全重排。
+        // 单独的 retcode 只表示本次核查请求失败，不能证明原发送没有发生；
+        // 网络错误和未知 API 错误必须继续保持 unresolved，避免重复发送。
+        let confirmed_not_sent = response_explicitly_confirms_not_sent(&response);
         let queued = if confirmed_not_sent {
             handle
                 .message_repo
@@ -1327,6 +1328,38 @@ fn handle_reply_unknown_check(
             }),
         ))
     })
+}
+
+/// 判断 `get_msg` 的失败是否明确证明目标消息不存在。
+///
+/// OneBot/NapCat 的错误码并没有跨实现稳定的语义，因此不能仅凭非零
+/// `retcode` 重排 unknown 任务。只有错误文本明确包含“消息不存在/未找到”
+/// 等语义时，才允许进入安全重试路径。
+fn response_explicitly_confirms_not_sent(
+    response: &crate::adapters::onebot::ActionResponse,
+) -> bool {
+    if response.is_ok() {
+        return false;
+    }
+    let message = response.error_message().to_ascii_lowercase();
+    [
+        "消息不存在",
+        "消息未找到",
+        "未找到消息",
+        "消息不存在或已被撤回",
+        "消息未发送",
+        "不存在该消息",
+        "message not found",
+        "msg not found",
+        "message does not exist",
+        "message is not found",
+        "message was not found",
+        "message not sent",
+        "msg not sent",
+        "message was not sent",
+    ]
+    .iter()
+    .any(|marker| message.contains(&marker.to_ascii_lowercase()))
 }
 
 fn handle_reply_unknown_retry(
@@ -2393,8 +2426,10 @@ async fn write_response(
 /// 控制接口每条连接一问一答，JSON 可分片传输，大小与总等待时间均受限。
 pub const CONTROL_REQUEST_LIMIT: usize = 1024 * 1024;
 pub const CONTROL_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
-pub const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(10);
-pub const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+// 客户端等待响应 45 秒；协议读写的单次超时必须更长，不能在长命令完成前
+// 先由服务端读超时。命令处理保留少量响应写入余量。
+pub const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(50);
+pub const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(40);
 
 pub async fn read_control_json<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
     reader: &mut R,
@@ -2506,6 +2541,50 @@ async fn prepare_socket_path(path: &std::path::Path) -> Result<(), RuntimeError>
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+
+    fn action_response(
+        error: Option<&str>,
+        retcode: Option<i32>,
+    ) -> crate::adapters::onebot::ActionResponse {
+        crate::adapters::onebot::ActionResponse {
+            id: 1,
+            action: "get_msg".to_string(),
+            status: "failed".to_string(),
+            retcode,
+            data: None,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn unknown_reply_check_only_requeues_for_explicit_missing_message() {
+        assert!(response_explicitly_confirms_not_sent(&action_response(
+            Some("消息不存在或已被撤回"),
+            Some(100),
+        )));
+        assert!(response_explicitly_confirms_not_sent(&action_response(
+            Some("message not found"),
+            Some(100),
+        )));
+        assert!(!response_explicitly_confirms_not_sent(&action_response(
+            Some("temporary upstream error"),
+            Some(100),
+        )));
+        assert!(!response_explicitly_confirms_not_sent(&action_response(
+            Some("request not sent"),
+            Some(100),
+        )));
+        assert!(!response_explicitly_confirms_not_sent(&action_response(
+            None,
+            Some(100),
+        )));
+    }
+
+    #[test]
+    fn control_timeouts_leave_room_for_client_response() {
+        assert!(CONTROL_IO_TIMEOUT > Duration::from_secs(45));
+        assert!(CONTROL_COMMAND_TIMEOUT < Duration::from_secs(45));
+    }
 
     #[test]
     fn builtin_help_exposes_canonical_names_only() {
