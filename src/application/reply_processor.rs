@@ -156,13 +156,8 @@ impl ReplyProcessor {
         if event.message_id == 0 {
             let mut combined = vec![event.content.clone()];
             for message in batch {
-                self.save_task_for_message(
-                    message.id,
-                    event.character_id,
-                    ReplyTaskStatus::Ignored,
-                    None,
-                )
-                .await?;
+                self.mark_task_ignored_if_pending(message.id, event.character_id)
+                    .await?;
                 if let crate::domain::message::MessageContent::Text(text) = message.content {
                     combined.push(text);
                 }
@@ -181,13 +176,8 @@ impl ReplyProcessor {
                 }
             }
             if message.id != event.message_id {
-                self.save_task_for_message(
-                    message.id,
-                    event.character_id,
-                    ReplyTaskStatus::Ignored,
-                    None,
-                )
-                .await?;
+                self.mark_task_ignored_if_pending(message.id, event.character_id)
+                    .await?;
             }
         }
         let combined = combine_batch_contents(combined);
@@ -198,15 +188,13 @@ impl ReplyProcessor {
         }
     }
 
-    async fn save_task_for_message(
+    async fn mark_task_ignored_if_pending(
         &self,
         message_id: i64,
         character_id: i64,
-        status: ReplyTaskStatus,
-        content: Option<&str>,
     ) -> Result<(), RuntimeError> {
         if let Some(repo) = &self.message_repo {
-            repo.save_reply_task(message_id, character_id, status, content)
+            repo.mark_reply_task_ignored_if_pending(message_id, character_id)
                 .await?;
         }
         Ok(())
@@ -654,8 +642,17 @@ impl ReplyProcessor {
         {
             content
         } else {
-            self.save_task(event, ReplyTaskStatus::Generating, None)
-                .await?;
+            if let Some(repo) = &self.message_repo {
+                if !repo
+                    .claim_reply_task_for_generation(event.message_id, event.character_id)
+                    .await?
+                {
+                    return Ok(());
+                }
+            } else {
+                self.save_task(event, ReplyTaskStatus::Generating, None)
+                    .await?;
+            }
             let content = self
                 .generate_reply(
                     event,

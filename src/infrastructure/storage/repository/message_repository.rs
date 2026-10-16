@@ -95,6 +95,50 @@ fn parse_message_row(row: MessageRow) -> Result<Message, RepositoryError> {
 
 #[async_trait]
 impl MessageRepository for SqliteMessageRepository {
+    async fn record_platform_echo(
+        &self,
+        conversation_id: i64,
+        platform_message_id: i64,
+        sender_external_id: &str,
+        content: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<(), RepositoryError> {
+        if platform_message_id <= 0 {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO platform_message_echoes(conversation_id, platform_message_id, sender_external_id, content, metadata, received_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(conversation_id)
+        .bind(platform_message_id)
+        .bind(sender_external_id)
+        .bind(content)
+        .bind(metadata.to_string())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn claim_command_message(
+        &self,
+        conversation_id: i64,
+        platform_message_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        if platform_message_id <= 0 {
+            return Ok(true);
+        }
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO command_receipts(conversation_id, platform_message_id, received_at) VALUES (?, ?, ?)",
+        )
+        .bind(conversation_id)
+        .bind(platform_message_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn find_cognition_batch(
         &self,
         character_id: i64,
@@ -220,6 +264,52 @@ impl MessageRepository for SqliteMessageRepository {
         sqlx::query("INSERT INTO reply_tasks(message_id,character_id,status,content,error,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET status=excluded.status,content=COALESCE(excluded.content,reply_tasks.content),error=COALESCE(excluded.error,reply_tasks.error),updated_at=excluded.updated_at")
             .bind(message_id).bind(character_id).bind(status.to_string()).bind(content).bind(None::<&str>).bind(chrono::Utc::now().to_rfc3339()).execute(&self.pool).await?;
         Ok(())
+    }
+
+    async fn mark_reply_task_ignored_if_pending(
+        &self,
+        message_id: i64,
+        character_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            r#"INSERT INTO reply_tasks(message_id, character_id, status, content, error, updated_at)
+               VALUES (?, ?, 'ignored', NULL, NULL, ?)
+               ON CONFLICT(message_id) DO UPDATE SET
+                   status = 'ignored',
+                   error = NULL,
+                   updated_at = excluded.updated_at
+               WHERE reply_tasks.character_id = excluded.character_id
+                 AND reply_tasks.status = 'pending'"#,
+        )
+        .bind(message_id)
+        .bind(character_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn claim_reply_task_for_generation(
+        &self,
+        message_id: i64,
+        character_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            r#"INSERT INTO reply_tasks(message_id, character_id, status, content, error, updated_at)
+               VALUES (?, ?, 'generating', NULL, NULL, ?)
+               ON CONFLICT(message_id) DO UPDATE SET
+                   status = 'generating',
+                   error = NULL,
+                   updated_at = excluded.updated_at
+               WHERE reply_tasks.character_id = excluded.character_id
+                 AND reply_tasks.status = 'pending'"#,
+        )
+        .bind(message_id)
+        .bind(character_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
     async fn save_reply_task_error(
         &self,

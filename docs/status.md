@@ -1,13 +1,13 @@
 # 项目现状
 
-本文记录截至 **2026-10-16** 的当前源码证据。项目仍处于开发中；自动化测试通过不等于真实 QQ、外部模型或长期运行已经验收。
+本文记录截至 **2026-10-17** 的当前源码证据。项目仍处于开发中；自动化测试通过不等于真实 QQ、外部模型或长期运行已经验收。
 
 ## 已验证
 
 | 检查 | 结果 | 边界 |
 | --- | --- | --- |
 | `cargo check --locked --all-targets --offline` | 通过 | 当前本机工具链和锁文件 |
-| `cargo test --locked --all-targets` | 通过 | 库 434 个通过、15 个按测试标记忽略；主程序 5 个、ctl 36 个、alpha 集成 8 个、控制集成 82 个通过 |
+| `cargo test --locked --all-targets` | 通过 | 库 437 个通过、15 个按测试标记忽略；主程序 5 个、ctl 36 个、alpha 集成 8 个、控制集成 82 个通过 |
 | 插件 Unix socket 测试显式运行 | 通过 | `--ignored` 下 15 个测试全部通过；普通 CI 仍按 `#[ignore]` 标记单独记录 |
 | `cargo fmt --all -- --check` | 通过 | 当前工作树 |
 | `cargo clippy --locked --offline --all-targets --all-features -- -D warnings` | 通过 | 当前工作树，包含测试目标 |

@@ -302,7 +302,7 @@ impl OneBotAdapter for OneBotAdapterImpl {
         group_id: &str,
         content: &str,
     ) -> Result<ActionResponse, RuntimeError> {
-        let request = build_group_send_request(group_id, content);
+        let request = build_group_send_request(group_id, content)?;
         self.send_action(request).await
     }
 
@@ -311,7 +311,7 @@ impl OneBotAdapter for OneBotAdapterImpl {
         user_id: &str,
         content: &str,
     ) -> Result<ActionResponse, RuntimeError> {
-        let request = build_private_send_request(user_id, content);
+        let request = build_private_send_request(user_id, content)?;
         self.send_action(request).await
     }
 }
@@ -428,9 +428,37 @@ impl InboundProcessor {
             }
         };
 
-        // self_id 来自平台事件本身，比本地可选配置更可靠。自身回声不能进入
-        // 命令、关系、记忆或回复链路；发送后的 assistant 历史由出站路径落库。
+        // self_id 来自平台事件本身，比本地可选配置更可靠。自身回声只记录平台
+        // 对账信息，不进入命令、关系、记忆或回复链路；assistant 历史由出站路径落库。
         if inbound.is_self_echo {
+            if let Ok((conversation_id, _)) = self
+                .conversation_manager
+                .resolve(
+                    inbound.conversation_type,
+                    &inbound.external_conversation_id,
+                    &inbound.external_sender_id,
+                    &inbound.display_name,
+                )
+                .await
+            {
+                if let Err(error) = self
+                    .acceptance_service
+                    .record_platform_echo(
+                        conversation_id,
+                        inbound.platform_message_id,
+                        &inbound.external_sender_id,
+                        &inbound.content,
+                        &serde_json::json!({
+                            "author_kind": "platform_echo",
+                            "content_metadata": inbound.content_metadata,
+                            "reply_to_platform_message_id": inbound.reply_to,
+                        }),
+                    )
+                    .await
+                {
+                    tracing::warn!(target = "adapter", %error, "记录平台回声失败");
+                }
+            }
             tracing::debug!(
                 target: "adapter",
                 platform_message_id = inbound.platform_message_id,
@@ -500,6 +528,26 @@ impl InboundProcessor {
             inbound.is_mentioned,
             inbound.conversation_type,
         ) {
+            match self
+                .acceptance_service
+                .claim_command_message(conversation_id, inbound.platform_message_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(
+                        target: "adapter",
+                        conversation_id,
+                        platform_message_id = inbound.platform_message_id,
+                        "重复投递的管理命令已忽略"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    tracing::error!(target: "adapter", %error, "无法记录管理命令幂等凭证");
+                    return;
+                }
+            }
             let cmd_event = CoreEvent::CommandReceived(CommandReceivedEvent {
                 conversation_id,
                 sender_id,

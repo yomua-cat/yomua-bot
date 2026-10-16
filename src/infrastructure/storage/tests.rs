@@ -490,6 +490,32 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn command_receipt_and_platform_echo_are_idempotent() {
+        let storage = setup_storage().await;
+        let repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        assert!(repo.claim_command_message(7, 100).await.unwrap());
+        assert!(!repo.claim_command_message(7, 100).await.unwrap());
+        assert!(repo.claim_command_message(8, 100).await.unwrap());
+
+        let metadata = serde_json::json!({"author_kind":"platform_echo"});
+        repo.record_platform_echo(7, 200, "bot-1", "已发送", &metadata)
+            .await
+            .unwrap();
+        repo.record_platform_echo(7, 200, "bot-1", "重复回声", &metadata)
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM platform_message_echoes WHERE conversation_id=7 AND platform_message_id=200",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
     async fn test_message_crud() {
         let storage = setup_storage().await;
         let conv_repo =

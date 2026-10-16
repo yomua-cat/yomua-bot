@@ -974,9 +974,10 @@ mod outbox_ownership_tests {
         assert_ne!(token_a, token_b);
 
         // A 尝试 completion（使用旧的 token）
-        repo.mark_completed("ownership-test-1", &token_a)
-            .await
-            .expect("mark_completed failed");
+        assert!(matches!(
+            repo.mark_completed("ownership-test-1", &token_a).await,
+            Err(crate::error::RepositoryError::OwnershipLost)
+        ));
 
         // 验证事件状态：应该是 B 的 processing，不是 completed
         let after_a = repo
@@ -1043,14 +1044,16 @@ mod outbox_ownership_tests {
         assert_ne!(token_a, token_b);
 
         // A 尝试 retry_wait（使用旧 token）
-        repo.mark_retry_wait(
-            "ownership-test-2",
-            &token_a,
-            "stale error",
-            chrono::Utc::now() + chrono::Duration::seconds(10),
-        )
-        .await
-        .expect("mark_retry_wait A failed");
+        assert!(matches!(
+            repo.mark_retry_wait(
+                "ownership-test-2",
+                &token_a,
+                "stale error",
+                chrono::Utc::now() + chrono::Duration::seconds(10),
+            )
+            .await,
+            Err(crate::error::RepositoryError::OwnershipLost)
+        ));
 
         // 验证：事件仍然是 B 的 processing
         let after_a = repo
@@ -1120,9 +1123,11 @@ mod outbox_ownership_tests {
         assert_ne!(token_a, token_b);
 
         // A 尝试 dead_letter（使用旧 token）
-        repo.mark_dead_letter("ownership-test-3", &token_a, "stale error")
-            .await
-            .expect("mark_dead_letter A failed");
+        assert!(matches!(
+            repo.mark_dead_letter("ownership-test-3", &token_a, "stale error")
+                .await,
+            Err(crate::error::RepositoryError::OwnershipLost)
+        ));
 
         // 验证：事件仍然是 B 的 processing
         let after_a = repo
@@ -1222,9 +1227,10 @@ mod outbox_ownership_tests {
         assert!(after_recover.lease_token.is_none());
 
         // 原来的 worker 尝试 completion（使用过期的 token）
-        repo.mark_completed("ownership-test-5", &token)
-            .await
-            .expect("mark_completed should not error");
+        assert!(matches!(
+            repo.mark_completed("ownership-test-5", &token).await,
+            Err(crate::error::RepositoryError::OwnershipLost)
+        ));
 
         // 验证：事件仍然是 pending（没有被完成）
         let after_stale = repo
@@ -1285,9 +1291,10 @@ mod outbox_ownership_tests {
         assert_eq!(current.status, OutboxStatus::Processing);
 
         // A 尝试完成（应该失败）
-        repo.mark_completed("ownership-test-6", &token_a)
-            .await
-            .expect("mark_completed A failed");
+        assert!(matches!(
+            repo.mark_completed("ownership-test-6", &token_a).await,
+            Err(crate::error::RepositoryError::OwnershipLost)
+        ));
         let after_a = repo
             .find_by_uuid("ownership-test-6")
             .await

@@ -168,6 +168,17 @@ impl OutboxDispatcher {
             }
         }
 
+        // 关停时等待已发送到处理器的事件完成 ACK；超时后释放 future，事件
+        // 保持可由租约恢复路径接管，避免静默丢失。
+        let drain = tokio::time::timeout(
+            Duration::from_secs(self.config.processing_timeout_secs.max(1)),
+            async { while work.next().await.is_some() {} },
+        )
+        .await;
+        if drain.is_err() {
+            warn!(target: "outbox", "关停等待调度中的事件超时，剩余任务交由租约恢复");
+        }
+
         info!(target: "outbox", "OutboxDispatcher 已停止");
     }
 
@@ -366,18 +377,23 @@ impl OutboxDispatcher {
                             attempts = event.attempts,
                             "超过最大重试次数，标记为 dead_letter"
                         );
-                        if let Err(e) = self
+                        let marked = if let Err(e) = self
                             .repo
                             .mark_dead_letter(event_uuid, lease_token, &error)
                             .await
                         {
                             error!(target: "outbox", event_uuid = %event_uuid, error = %e, "标记 dead_letter 失败");
-                        }
-                        // 更新活跃 seq 映射（dead_letter 不阻塞后续）
-                        let mut seqs = self.active_seqs.write().await;
-                        let current = seqs.get(ordering_key).copied().unwrap_or(0);
-                        if ordering_seq > current {
-                            seqs.insert(ordering_key.to_string(), ordering_seq);
+                            false
+                        } else {
+                            true
+                        };
+                        if marked {
+                            // 只有当前租约真正完成 dead_letter 才能推进顺序。
+                            let mut seqs = self.active_seqs.write().await;
+                            let current = seqs.get(ordering_key).copied().unwrap_or(0);
+                            if ordering_seq > current {
+                                seqs.insert(ordering_key.to_string(), ordering_seq);
+                            }
                         }
                         return;
                     }

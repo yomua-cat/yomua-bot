@@ -309,25 +309,33 @@ fn strip_cq_codes(input: &str) -> String {
 }
 
 /// 构建一条 OneBot 群消息发送请求。
-pub fn build_group_send_request(group_id: &str, content: &str) -> OutgoingRequest {
-    OutgoingRequest {
+pub fn build_group_send_request(
+    group_id: &str,
+    content: &str,
+) -> Result<OutgoingRequest, RuntimeError> {
+    let group_id = parse_qq_id(group_id)?;
+    Ok(OutgoingRequest {
         action: "send_group_msg".to_string(),
         params: serde_json::json!({
-            "group_id": parse_qq_id(group_id),
+            "group_id": group_id,
             "message": content,
         }),
-    }
+    })
 }
 
 /// 构建一条 OneBot 私聊消息发送请求。
-pub fn build_private_send_request(user_id: &str, content: &str) -> OutgoingRequest {
-    OutgoingRequest {
+pub fn build_private_send_request(
+    user_id: &str,
+    content: &str,
+) -> Result<OutgoingRequest, RuntimeError> {
+    let user_id = parse_qq_id(user_id)?;
+    Ok(OutgoingRequest {
         action: "send_private_msg".to_string(),
         params: serde_json::json!({
-            "user_id": parse_qq_id(user_id),
+            "user_id": user_id,
             "message": content,
         }),
-    }
+    })
 }
 
 /// 构建查询单条 OneBot 平台消息的请求。
@@ -340,9 +348,16 @@ pub fn build_get_message_request(message_id: i64) -> OutgoingRequest {
 
 /// 将数字字符串解析为 i64（OneBot 的群号 / 用户号）。
 ///
-/// 若解析失败则回退为 0（不应发生，因为外部 ID 来自数字字符串）。
-fn parse_qq_id(id: &str) -> i64 {
-    id.trim().parse().unwrap_or(0)
+/// 外部 ID 无法解析时必须拒绝请求，不能静默变成账号 0。
+fn parse_qq_id(id: &str) -> Result<i64, RuntimeError> {
+    let parsed = id
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| RuntimeError::Adapter(format!("无效的 OneBot ID：{id}")))?;
+    if parsed <= 0 {
+        return Err(RuntimeError::Adapter(format!("OneBot ID 必须为正数：{id}")));
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -529,7 +544,7 @@ mod tests {
 
     #[test]
     fn build_group_request() {
-        let req = build_group_send_request("500000", "回复你");
+        let req = build_group_send_request("500000", "回复你").unwrap();
         assert_eq!(req.action, "send_group_msg");
         assert_eq!(req.params["group_id"], 500000);
         assert_eq!(req.params["message"], "回复你");
@@ -537,7 +552,7 @@ mod tests {
 
     #[test]
     fn build_private_request() {
-        let req = build_private_send_request("555", "私聊回复");
+        let req = build_private_send_request("555", "私聊回复").unwrap();
         assert_eq!(req.action, "send_private_msg");
         assert_eq!(req.params["user_id"], 555);
         assert_eq!(req.params["message"], "私聊回复");
@@ -548,5 +563,11 @@ mod tests {
         let req = build_get_message_request(9876);
         assert_eq!(req.action, "get_msg");
         assert_eq!(req.params["message_id"], 9876);
+    }
+
+    #[test]
+    fn invalid_outgoing_id_is_rejected_instead_of_becoming_zero() {
+        assert!(build_group_send_request("not-a-qq", "回复").is_err());
+        assert!(build_private_send_request("0", "回复").is_err());
     }
 }

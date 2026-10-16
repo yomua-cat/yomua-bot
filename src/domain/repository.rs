@@ -278,6 +278,28 @@ pub struct AcceptedMessageResult {
 
 #[async_trait]
 pub trait MessageRepository: Send + Sync {
+    /// 记录平台回声，仅用于出站对账；不会创建 Outbox 事件或触发回复。
+    async fn record_platform_echo(
+        &self,
+        _conversation_id: i64,
+        _platform_message_id: i64,
+        _sender_external_id: &str,
+        _content: &str,
+        _metadata: &serde_json::Value,
+    ) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+
+    /// 领取一个平台命令消息的幂等凭证。
+    /// 返回 false 表示该平台消息已经处理过。
+    async fn claim_command_message(
+        &self,
+        _conversation_id: i64,
+        _platform_message_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        Ok(true)
+    }
+
     async fn find_by_id(&self, id: i64) -> Result<Option<Message>, RepositoryError>;
     /// 持久化生成内容和发送状态；未知发送结果不自动补发。
     async fn find_cognition_batch(
@@ -333,6 +355,47 @@ pub trait MessageRepository: Send + Sync {
         _content: Option<&str>,
     ) -> Result<(), RepositoryError> {
         Err(RepositoryError::NotImplemented("回复任务存储".into()))
+    }
+
+    /// 只在任务尚未开始处理时将其标记为忽略。
+    ///
+    /// 连续消息聚合会并行看到后续消息；生产仓储必须使用条件更新，不能覆盖
+    /// 已经进入生成、发送或终态的任务。默认实现供轻量测试仓储使用。
+    async fn mark_reply_task_ignored_if_pending(
+        &self,
+        message_id: i64,
+        character_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        self.save_reply_task(
+            message_id,
+            character_id,
+            crate::domain::message::ReplyTaskStatus::Ignored,
+            None,
+        )
+        .await
+        .map(|_| true)
+    }
+
+    /// 原子地领取一个尚未开始处理的回复任务。
+    /// 返回 `false` 表示任务已经被其它处理器领取或进入终态。
+    async fn claim_reply_task_for_generation(
+        &self,
+        message_id: i64,
+        character_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        if let Some(task) = self.reply_task(message_id).await? {
+            if task.status != crate::domain::message::ReplyTaskStatus::Pending {
+                return Ok(false);
+            }
+        }
+        self.save_reply_task(
+            message_id,
+            character_id,
+            crate::domain::message::ReplyTaskStatus::Generating,
+            None,
+        )
+        .await
+        .map(|_| true)
     }
     async fn save_reply_task_error(
         &self,
@@ -624,6 +687,31 @@ pub trait MemoryRepository: Send + Sync {
     ) -> Result<Vec<Memory>, RepositoryError> {
         self.find_visible(character_id, conversation_id, limit)
             .await
+    }
+
+    /// 在数据库可见范围内按关键词检索记忆。
+    /// 默认实现用于轻量测试仓储；生产仓储应在范围过滤后再执行关键词查询。
+    async fn search_visible_by_keywords(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        participant_id: i64,
+        keywords: &[String],
+        limit: i64,
+    ) -> Result<Vec<Memory>, RepositoryError> {
+        if keywords.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut items = self
+            .find_visible_for_participant(character_id, conversation_id, participant_id, i64::MAX)
+            .await?;
+        items.retain(|memory| {
+            keywords
+                .iter()
+                .any(|keyword| memory.content.contains(keyword))
+        });
+        items.truncate(limit.max(0) as usize);
+        Ok(items)
     }
 
     /// 记录用户提出的跨会话记忆禁用请求。

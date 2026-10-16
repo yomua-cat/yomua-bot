@@ -133,6 +133,9 @@ pub enum RepositoryError {
 
     #[error("未实现：{0}")]
     NotImplemented(String),
+
+    #[error("仓储所有权已失效")]
+    OwnershipLost,
 }
 
 impl From<sqlx::Error> for RepositoryError {

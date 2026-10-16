@@ -357,7 +357,7 @@ async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
     let conv = Conversation {
         id: 0,
         conversation_type: ConversationType::Group,
-        external_id: "g999".to_string(),
+        external_id: "100000999".to_string(),
         name: Some("测试群".to_string()),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -368,7 +368,7 @@ async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
     let user_part = Participant {
         id: 0,
         conversation_id: conv_id,
-        external_id: "u888".to_string(),
+        external_id: "200000888".to_string(),
         display_name: "测试用户".to_string(),
         role: ParticipantRole::User,
         metadata: serde_json::json!({}),
@@ -380,7 +380,7 @@ async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
         .insert(&Participant {
             id: 0,
             conversation_id: conv_id,
-            external_id: "a111".to_string(),
+            external_id: "300000111".to_string(),
             display_name: "小爱".to_string(),
             role: ParticipantRole::Character,
             metadata: serde_json::json!({}),
@@ -390,7 +390,7 @@ async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
         .insert(&Participant {
             id: 0,
             conversation_id: conv_id,
-            external_id: "b222".to_string(),
+            external_id: "300000222".to_string(),
             display_name: "小冰".to_string(),
             role: ParticipantRole::Character,
             metadata: serde_json::json!({}),
@@ -1148,7 +1148,7 @@ async fn p1_2_cold_start_behavior() {
     let conv = Conversation {
         id: 0,
         conversation_type: ConversationType::Private,
-        external_id: "u_cold".to_string(),
+        external_id: "200000999".to_string(),
         name: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -1158,7 +1158,7 @@ async fn p1_2_cold_start_behavior() {
     let user_part = Participant {
         id: 0,
         conversation_id: conv_id,
-        external_id: "u_cold".to_string(),
+        external_id: "200000999".to_string(),
         display_name: "用户".to_string(),
         role: ParticipantRole::User,
         metadata: serde_json::json!({}),

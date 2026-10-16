@@ -211,21 +211,16 @@ impl ContextBuilder {
                 )
                 .await?;
             let keywords = extract_keywords(&recent_messages_text(&recent_messages));
-            let by_keyword = if keywords.is_empty() {
-                Vec::new()
-            } else {
-                self.memory_repo
-                    .find_visible_for_participant(
-                        character.id,
-                        conversation_id,
-                        participant_id,
-                        limits.memory_limit as i64,
-                    )
-                    .await?
-                    .into_iter()
-                    .filter(|m| keywords.iter().any(|k| m.content.contains(k)))
-                    .collect()
-            };
+            let by_keyword = self
+                .memory_repo
+                .search_visible_by_keywords(
+                    character.id,
+                    conversation_id,
+                    participant_id,
+                    &keywords,
+                    limits.memory_limit as i64,
+                )
+                .await?;
             merge_memories(by_importance, by_keyword, limits.memory_limit)
         };
 

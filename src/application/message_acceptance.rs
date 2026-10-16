@@ -38,6 +38,38 @@ impl MessageAcceptanceService {
         )
         .await
     }
+
+    /// 为不会进入消息 Outbox 的管理命令领取持久幂等凭证。
+    pub async fn claim_command_message(
+        &self,
+        conversation_id: i64,
+        platform_message_id: i64,
+    ) -> Result<bool, RuntimeError> {
+        self.message_repo
+            .claim_command_message(conversation_id, platform_message_id)
+            .await
+            .map_err(RuntimeError::Repository)
+    }
+
+    pub async fn record_platform_echo(
+        &self,
+        conversation_id: i64,
+        platform_message_id: i64,
+        sender_external_id: &str,
+        content: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<(), RuntimeError> {
+        self.message_repo
+            .record_platform_echo(
+                conversation_id,
+                platform_message_id,
+                sender_external_id,
+                content,
+                metadata,
+            )
+            .await
+            .map_err(RuntimeError::Repository)
+    }
     #[allow(clippy::too_many_arguments)]
     pub async fn accept_inbound(
         &self,

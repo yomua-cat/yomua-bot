@@ -243,6 +243,51 @@ impl MemoryRepository for SqliteMemoryRepository {
         rows.into_iter().map(parse_memory_row).collect()
     }
 
+    async fn search_visible_by_keywords(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        participant_id: i64,
+        keywords: &[String],
+        limit: i64,
+    ) -> Result<Vec<Memory>, RepositoryError> {
+        let keywords: Vec<String> = keywords
+            .iter()
+            .map(|keyword| keyword.trim().to_lowercase())
+            .filter(|keyword| !keyword.is_empty())
+            .collect();
+        if keywords.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut builder = sqlx::QueryBuilder::new(
+            "SELECT id,character_id,user_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding FROM memories WHERE character_id=",
+        );
+        builder.push_bind(character_id);
+        builder.push(
+            " AND COALESCE(json_extract(metadata,'$.status'),'formal') != 'candidate' AND (conversation_id=",
+        );
+        builder.push_bind(conversation_id);
+        builder.push(" OR (user_id=(SELECT user_id FROM participants WHERE id=");
+        builder.push_bind(participant_id);
+        builder.push(
+            " AND role='user') AND COALESCE(json_extract(metadata,'$.shared'),0)=1 AND NOT EXISTS (SELECT 1 FROM memory_sharing_policies policy WHERE policy.character_id=memories.character_id AND policy.user_id=memories.user_id AND policy.status='confirmed')) ) AND (",
+        );
+        for (index, keyword) in keywords.iter().enumerate() {
+            if index > 0 {
+                builder.push(" OR ");
+            }
+            builder.push("lower(content) LIKE ");
+            builder.push_bind(format!("%{keyword}%"));
+        }
+        builder.push(") ORDER BY importance DESC,created_at DESC,id DESC LIMIT ");
+        builder.push_bind(limit.max(0));
+        let rows = builder
+            .build_query_as::<MemoryRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(parse_memory_row).collect()
+    }
+
     async fn request_sharing_policy(
         &self,
         character_id: i64,

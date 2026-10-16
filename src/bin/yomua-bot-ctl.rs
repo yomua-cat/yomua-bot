@@ -842,14 +842,20 @@ async fn execute_command(
         .map_err(|e| format!("无法连接到 control socket {}: {}", socket.display(), e))?;
 
     use yomua_bot::application::control::{
-        read_control_json, write_control_json, CONTROL_REQUEST_LIMIT, CONTROL_RESPONSE_LIMIT,
+        read_control_json_with_timeout, write_control_json, CONTROL_REQUEST_LIMIT,
+        CONTROL_RESPONSE_LIMIT,
+    };
+    let response_timeout = if builtin == BuiltinCommand::Shutdown {
+        Duration::from_secs(10 * 60)
+    } else {
+        Duration::from_secs(45)
     };
     write_control_json(&mut stream, &envelope, CONTROL_REQUEST_LIMIT)
         .await
         .map_err(|e| e.to_string())?;
     let resp: ControlResponse = timeout(
-        Duration::from_secs(45),
-        read_control_json(&mut stream, CONTROL_RESPONSE_LIMIT),
+        response_timeout,
+        read_control_json_with_timeout(&mut stream, CONTROL_RESPONSE_LIMIT, response_timeout),
     )
     .await
     .map_err(|_| "服务器响应超时".to_string())?
@@ -2002,7 +2008,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Err(e) => {
-            eprintln!("错误: {e}");
+            if parsed.opts.raw {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "id": serde_json::Value::Null,
+                        "ok": false,
+                        "error": {"code": "CLIENT_ERROR", "message": e}
+                    })
+                );
+            } else {
+                eprintln!("错误: {e}");
+            }
             std::process::exit(1);
         }
     }

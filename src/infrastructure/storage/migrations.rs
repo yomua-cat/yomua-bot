@@ -540,6 +540,21 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
 
     sqlx::query(r#"
       CREATE INDEX IF NOT EXISTS idx_messages_platform ON messages(conversation_id, platform_message_id);
+      CREATE TABLE IF NOT EXISTS command_receipts (
+        conversation_id INTEGER NOT NULL,
+        platform_message_id INTEGER NOT NULL,
+        received_at TEXT NOT NULL,
+        PRIMARY KEY (conversation_id, platform_message_id)
+      );
+      CREATE TABLE IF NOT EXISTS platform_message_echoes (
+        conversation_id INTEGER NOT NULL,
+        platform_message_id INTEGER NOT NULL,
+        sender_external_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        PRIMARY KEY (conversation_id, platform_message_id)
+      );
       CREATE TABLE IF NOT EXISTS reply_tasks (
         message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
         character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,

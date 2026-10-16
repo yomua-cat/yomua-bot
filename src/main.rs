@@ -33,7 +33,8 @@ use yomua_bot::application::context_assembler::{
     ContextAssembler, ModelCapabilitiesProviderAdapter, TokenEstimatorAdapter,
 };
 use yomua_bot::application::control::{
-    start_control_service, CommandRegistry, RuntimeHandle, ShutdownResult,
+    reconcile_unknown_reply_tasks, start_control_service, CommandRegistry, RuntimeHandle,
+    ShutdownResult,
 };
 use yomua_bot::application::conversation::ConversationManager;
 use yomua_bot::application::decision_orchestrator::{
@@ -497,6 +498,26 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         memory_repo: repos.memory_repo.clone(),
         participant_repo: repos.participant_repo.clone(),
     };
+
+    // 平台回执未知的任务由后台定期核查；只有 get_msg 明确证明已发送或未发送时
+    // 才改变状态，网络异常不会触发自动补发。
+    let unknown_handle = handle.clone();
+    let mut unknown_shutdown = shutdown_rx.clone();
+    background_tasks.handles.push(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                changed = unknown_shutdown.changed() => {
+                    if changed.is_err() || *unknown_shutdown.borrow() { break; }
+                }
+                _ = interval.tick() => {
+                    if let Err(error) = reconcile_unknown_reply_tasks(&unknown_handle, 50).await {
+                        tracing::debug!(%error, "未知发送结果后台核查失败");
+                    }
+                }
+            }
+        }
+    }));
 
     // 启动控制服务（后台任务，监听 data/control.sock）。
     // 控制服务单独持有句柄。关停命令需要等待主流程完成，不能把控制服务本身

@@ -237,16 +237,13 @@ impl OutboxRepository for SqliteOutboxRepository {
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // rows_affected == 0 表示：
-        // 1. 事件不在 processing 状态（已被完成/重试/标记）
-        // 2. lease_token 不匹配（被新 worker claim）
-        // 3. 事件已被另一个 worker 完成
         if result.rows_affected() == 0 {
             tracing::debug!(
                 target: "outbox",
                 event_uuid = %event_uuid,
                 "completion 被跳过：stale worker 或事件状态已改变"
             );
+            return Err(RepositoryError::OwnershipLost);
         }
 
         Ok(())
@@ -262,7 +259,7 @@ impl OutboxRepository for SqliteOutboxRepository {
         let next_str = next_available_at.to_rfc3339();
 
         // P0: 使用 lease_token 进行真正的 ownership fencing
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE outbox_events
             SET status = 'retry_wait',
@@ -283,6 +280,10 @@ impl OutboxRepository for SqliteOutboxRepository {
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::OwnershipLost);
+        }
+
         Ok(())
     }
 
@@ -296,7 +297,7 @@ impl OutboxRepository for SqliteOutboxRepository {
         let now_str = now.to_rfc3339();
 
         // P0: 使用 lease_token 进行真正的 ownership fencing
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE outbox_events
             SET status = 'dead_letter',
@@ -316,6 +317,10 @@ impl OutboxRepository for SqliteOutboxRepository {
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::OwnershipLost);
+        }
 
         Ok(())
     }

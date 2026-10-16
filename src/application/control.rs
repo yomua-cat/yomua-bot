@@ -375,8 +375,14 @@ fn handle_reload_config(
 fn handle_shutdown(handle: &RuntimeHandle, id: u64, _params: serde_json::Value) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
+        if let Some(result) = handle.shutdown_result.read().await.clone() {
+            return Ok(ControlResponse::ok(id, result));
+        }
         let completed = handle.shutdown_complete.notified();
         handle.shutdown();
+        if let Some(result) = handle.shutdown_result.read().await.clone() {
+            return Ok(ControlResponse::ok(id, result));
+        }
         let wait_for =
             Duration::from_secs(handle.effective_config().shutdown_timeout_secs.max(1) + 5);
         if tokio::time::timeout(wait_for, completed).await.is_err() {
@@ -1360,7 +1366,7 @@ fn handle_reply_unknown_check(
 /// OneBot/NapCat 的错误码并没有跨实现稳定的语义，因此不能仅凭非零
 /// `retcode` 重排 unknown 任务。只有错误文本明确包含“消息不存在/未找到”
 /// 等语义时，才允许进入安全重试路径。
-fn response_explicitly_confirms_not_sent(
+pub fn response_explicitly_confirms_not_sent(
     response: &crate::adapters::onebot::ActionResponse,
 ) -> bool {
     if response.is_ok() {
@@ -1385,6 +1391,45 @@ fn response_explicitly_confirms_not_sent(
     ]
     .iter()
     .any(|marker| message.contains(&marker.to_ascii_lowercase()))
+}
+
+/// 后台核查未知发送结果；只有平台明确确认已发送或明确不存在时才改变任务状态。
+/// 网络错误、权限错误和语义不明确的响应都会保留为 unknown，避免重复发言。
+pub async fn reconcile_unknown_reply_tasks(
+    handle: &RuntimeHandle,
+    limit: i64,
+) -> Result<usize, RuntimeError> {
+    let tasks = handle.message_repo.find_unknown_reply_tasks(limit).await?;
+    let mut handled = 0;
+    for task in tasks {
+        let Some(platform_message_id) = task.platform_message_id else {
+            continue;
+        };
+        let response = match handle.adapter.get_message(platform_message_id).await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(message_id = task.message_id, %error, "未知发送结果暂时无法核查");
+                continue;
+            }
+        };
+        if response.is_ok() {
+            if handle
+                .message_repo
+                .confirm_unknown_reply_task(task.message_id, platform_message_id)
+                .await?
+            {
+                handled += 1;
+            }
+        } else if response_explicitly_confirms_not_sent(&response)
+            && handle
+                .message_repo
+                .requeue_unknown_reply_task(task.message_id)
+                .await?
+        {
+            handled += 1;
+        }
+    }
+    Ok(handled)
 }
 
 fn handle_reply_unknown_retry(
@@ -2761,17 +2806,24 @@ async fn handle_connection(
         .commands
         .dispatch_request(&envelope.request, handle, id)
     {
-        Some(future) => match tokio::time::timeout(CONTROL_COMMAND_TIMEOUT, future).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => ControlResponse::err(
-                id,
-                ControlErrorDetail::new("COMMAND_FAILED", error.to_string()),
-            ),
-            Err(_) => ControlResponse::err(
-                id,
-                ControlErrorDetail::new("COMMAND_TIMEOUT", "命令处理超时"),
-            ),
-        },
+        Some(future) => {
+            let command_timeout = if command_name == control_schema::SHUTDOWN {
+                Duration::from_secs(handle.effective_config().shutdown_timeout_secs.max(1) + 5)
+            } else {
+                CONTROL_COMMAND_TIMEOUT
+            };
+            match tokio::time::timeout(command_timeout, future).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("COMMAND_FAILED", error.to_string()),
+                ),
+                Err(_) => ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("COMMAND_TIMEOUT", "命令处理超时"),
+                ),
+            }
+        }
         None => {
             let resp =
                 ControlResponse::err(id, ControlErrorDetail::unsupported_operation(operation));
@@ -2854,7 +2906,18 @@ pub async fn read_control_json<R: AsyncRead + Unpin, T: serde::de::DeserializeOw
     reader: &mut R,
     limit: usize,
 ) -> Result<T, RuntimeError> {
-    tokio::time::timeout(CONTROL_IO_TIMEOUT, async {
+    read_control_json_with_timeout(reader, limit, CONTROL_IO_TIMEOUT).await
+}
+
+pub async fn read_control_json_with_timeout<
+    R: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+>(
+    reader: &mut R,
+    limit: usize,
+    timeout_duration: Duration,
+) -> Result<T, RuntimeError> {
+    tokio::time::timeout(timeout_duration, async {
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 8192];
         loop {

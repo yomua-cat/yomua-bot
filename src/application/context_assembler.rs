@@ -255,15 +255,25 @@ impl ContextAssembler {
             content: current_turn.content.clone(),
         };
 
+        // 历史后指令必须位于历史之后、当前消息之前；不能塞进 system prompt，
+        // 否则模型收到的优先级和角色卡协议不一致。
+        let post_history = components.instructions.clone().map(|content| LlmMessage {
+            role: LlmRole::System,
+            content,
+        });
+        let mut system_components = components.clone();
+        system_components.instructions = None;
+
         // 6. 计算可用 input budget
         let available_budget = context_window - self.config.output_reservation;
 
-        // 7. 组装初始 messages（history + current）
+        // 7. 组装初始 messages（history + post-history instruction + current）
         let mut messages: Vec<LlmMessage> = history
             .into_iter()
+            .chain(post_history)
             .chain(std::iter::once(current))
             .collect();
-        let mut system_tokens = components.total_tokens(&*self.token_estimator);
+        let mut system_tokens = system_components.total_tokens(&*self.token_estimator);
         let current_tokens = self
             .token_estimator
             .estimate_message(messages.last().unwrap());
@@ -276,7 +286,7 @@ impl ContextAssembler {
         // 8. 如果超出预算，执行 Layered Degradation
         if self.config.degradation_enabled && total_tokens > available_budget {
             // 8a. 先尝试 system degradation
-            let (degraded_components, degraded_system_tokens) = components.degrade(
+            let (degraded_components, degraded_system_tokens) = system_components.degrade(
                 &*self.token_estimator,
                 available_budget.saturating_sub(current_tokens),
             );
@@ -314,7 +324,7 @@ impl ContextAssembler {
             })
         } else {
             Ok(AssembledContext {
-                system: components.render(),
+                system: system_components.render(),
                 messages,
                 total_tokens,
                 system_tokens,
@@ -896,6 +906,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn post_history_instruction_is_between_history_and_current_turn() {
+        let assembler = ContextAssembler::new(
+            Arc::new(MockTokenEstimator),
+            Arc::new(MockModelCapabilities {
+                context_window: 10_000,
+            }),
+        );
+        let history = vec![Message {
+            id: 1,
+            conversation_id: 1,
+            sender_id: 1,
+            content: MessageContent::Text("历史消息".into()),
+            timestamp: Utc::now(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            metadata: serde_json::json!({"author_kind":"user","display_name":"小明"}),
+            active_character_id: Some(1),
+            platform_message_id: None,
+            conversation_sequence: Some(1),
+            occurred_at: None,
+            ingested_at: None,
+        }];
+        let result = assembler
+            .assemble(&test_ctx(history), test_current_turn())
+            .expect("上下文应可组装");
+        assert_eq!(result.messages.len(), 3);
+        assert_eq!(result.messages[0].content, "[小明 | 用户 1] 历史消息");
+        assert_eq!(result.messages[1].role, LlmRole::System);
+        assert_eq!(result.messages[1].content, "请以 Alice 的身份回答");
+        assert_eq!(result.messages[2].content, "你好！");
+        assert!(!result.system.contains("请以 Alice 的身份回答"));
+    }
+
     // ========================================================================
     // Test B — History Enters LLM
     // ========================================================================
@@ -952,16 +997,18 @@ mod tests {
             .assemble(&ctx, current)
             .expect("context_window 已配置，assemble 应成功");
 
-        // messages 应包含 history (M1, M2) + current ("你好！")
-        assert_eq!(result.messages.len(), 3);
+        // messages 应包含 history (M1, M2) + 历史后指令 + current ("你好！")
+        assert_eq!(result.messages.len(), 4);
         assert!(result.messages[0].content.contains("M1")); // User
         assert_eq!(result.messages[1].content, "M2"); // Assistant
-        assert_eq!(result.messages[2].content, "你好！"); // Current
+        assert_eq!(result.messages[2].content, "请以 Alice 的身份回答"); // Post-history instruction
+        assert_eq!(result.messages[3].content, "你好！"); // Current
 
         // Role 映射正确
         assert_eq!(result.messages[0].role, LlmRole::User);
         assert_eq!(result.messages[1].role, LlmRole::Assistant);
-        assert_eq!(result.messages[2].role, LlmRole::User);
+        assert_eq!(result.messages[2].role, LlmRole::System);
+        assert_eq!(result.messages[3].role, LlmRole::User);
     }
 
     // ========================================================================
@@ -1291,7 +1338,10 @@ mod tests {
         assert!(result.system.contains("Alice"));
         assert!(result.system.contains("咖啡师"));
         assert!(result.system.contains("清晨的咖啡馆"));
-        assert!(result.system.contains("请以 Alice 的身份回答"));
+        assert!(result
+            .messages
+            .iter()
+            .any(|message| message.content == "请以 Alice 的身份回答"));
     }
 
     // ========================================================================

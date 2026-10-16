@@ -84,6 +84,17 @@ impl OutboxProcessor {
             }
         }
 
+        // 关停时先给已领取的事件有限时间完成并发送 ACK，避免直接 drop
+        // 正在生成或发送的任务，导致平台已有副作用却没有持久化结果。
+        let drain = tokio::time::timeout(
+            std::time::Duration::from_secs(DEFAULT_EVENT_PROCESSING_TIMEOUT_SECS),
+            async { while work.next().await.is_some() {} },
+        )
+        .await;
+        if drain.is_err() {
+            warn!(target: "outbox", "关停等待处理中的事件超时，剩余任务交由租约恢复");
+        }
+
         info!(target: "outbox", "OutboxProcessor 已停止");
     }
 
