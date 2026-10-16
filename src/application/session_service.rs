@@ -75,8 +75,7 @@ impl SessionService {
 
         // 会话删除必须同时终止尚未完成的持久事件，防止删除后仍触发模型、
         // 关系和记忆副作用。payload 中保存了 MessageAccepted 的会话 ID。
-        let placeholders = std::iter::repeat("?")
-            .take(conv_ids.len())
+        let placeholders = std::iter::repeat_n("?", conv_ids.len())
             .collect::<Vec<_>>()
             .join(",");
         let cancel_sql = format!(
