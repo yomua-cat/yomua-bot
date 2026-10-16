@@ -102,6 +102,6 @@ yomua-bot-ctl --data-dir /path/to/data reply unknown retry 123 --confirm
 {"version":1,"id":1,"request":{"operation":"status","params":{}}}
 ```
 
-`operation` 是固定枚举，不接受任意人类命令字符串；`params` 只承载该操作的结构化参数。响应仍返回 `id`、`ok`、`data` 或 `error`。请求上限 1 MiB、响应上限 8 MiB，读写超时 10 秒，命令处理超时 30 秒，客户端总等待 45 秒。协议定义位于 `src/application/control_schema.rs`，ctl 维护人类命令本，bot 只解码、校验和执行请求。
+`operation` 是固定枚举，不接受任意人类命令字符串；`params` 只承载该操作的结构化参数，必须是 JSON 对象。响应仍返回 `id`、`ok`、`data` 或 `error`。请求上限 1 MiB、响应上限 8 MiB，读写超时 50 秒，命令处理超时 40 秒，客户端总等待 45 秒。语法错误返回 `INVALID_JSON`，缺少或错误的协议字段返回 `INVALID_REQUEST`；未知操作返回 `UNSUPPORTED_OPERATION`，缺少完整请求返回 `INCOMPLETE_REQUEST` 或 `MISSING_REQUEST`。协议定义位于 `src/application/control_schema.rs`，ctl 维护人类命令本，bot 只解码、校验和执行请求。
 
 主程序错误和服务端 `ok=false` 响应在一次性模式下均返回非零；REPL 会显示错误并继续等待下一条命令。自动化仍应同时检查响应内容和退出码。实现见[主程序](../src/main.rs)、[ctl](../src/bin/yomua-bot-ctl.rs)和[控制服务](../src/application/control.rs)。

@@ -745,6 +745,19 @@ async fn test_user_merge_and_delete_commands() {
         .await
         .unwrap();
     assert_eq!(target_left, 0);
+
+    // 删除不存在的用户必须返回稳定的业务错误码，而不是泛化为内部错误。
+    let missing = send_json(
+        &env.socket_path,
+        &serde_json::json!({ "version": 1, "id": 503, "request": { "operation": "user_delete", "params": { "user_id": target_user } } }),
+    )
+    .await
+    .expect("missing user delete request should return a response");
+    assert_eq!(missing["ok"], serde_json::json!(false));
+    assert_eq!(
+        missing["error"]["code"],
+        serde_json::json!("USER_NOT_FOUND")
+    );
 }
 
 // ============================================================================
@@ -3837,6 +3850,37 @@ async fn test_memory_list_empty() {
         .as_array()
         .expect("memories 应为数组");
     assert!(memories.is_empty(), "空环境应返回空列表");
+}
+
+#[tokio::test]
+async fn test_memory_list_rejects_non_object_params() {
+    let env = create_env().await;
+    let resp = send_json(
+        &env.socket_path,
+        &serde_json::json!({ "version": 1, "id": 712, "request": { "operation": "memory_list", "params": [] } }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp["ok"], serde_json::json!(false));
+    assert_eq!(resp["error"]["code"], serde_json::json!("INVALID_PARAMS"));
+}
+
+#[tokio::test]
+async fn test_blacklist_ban_extreme_duration_returns_validation_error() {
+    let env = create_env().await;
+    let request = serde_json::json!({
+        "version": 1,
+        "id": 713,
+        "request": {
+            "operation": "blacklist_ban",
+            "params": { "target": "extreme-duration-user", "target_type": "user", "duration_secs": i64::MAX, "confirm": true }
+        }
+    });
+    let raw = serde_json::to_vec(&request).unwrap();
+    let response = send_raw(&env.socket_path, &raw).await.unwrap();
+    let resp: serde_json::Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(resp["ok"], serde_json::json!(false));
+    assert_eq!(resp["error"]["code"], serde_json::json!("INVALID_PARAMS"));
 }
 
 /// 验证：memory_list 全局列表（已插入数据）

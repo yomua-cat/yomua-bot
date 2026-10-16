@@ -1138,9 +1138,7 @@ fn handle_blacklist_ban(
 
         let reason = obj.get("reason").and_then(|v| v.as_str()).map(String::from);
 
-        let expires_at = match chrono::Duration::try_seconds(duration_secs)
-            .and_then(|duration| chrono::Utc::now().checked_add_signed(duration))
-        {
+        let expires_at = match blacklist_expiration(duration_secs) {
             Some(expires_at) => expires_at,
             None => {
                 return Ok(ControlResponse::err(
@@ -2682,15 +2680,34 @@ fn control_read_error_detail(error: &RuntimeError) -> ControlErrorDetail {
         ControlErrorDetail::new("REQUEST_TIMEOUT", message)
     } else if message.contains("完整 JSON 到达前关闭") {
         ControlErrorDetail::new("INCOMPLETE_REQUEST", message)
+    } else if message.contains("控制 JSON 语法错误") {
+        ControlErrorDetail::invalid_json(&message)
     } else if message.contains("missing field `request`") {
         ControlErrorDetail::missing_request()
     } else if message.contains("unknown variant") {
         ControlErrorDetail::new("UNSUPPORTED_OPERATION", message)
-    } else if message.contains("unknown field") {
+    } else if message.contains("控制请求结构错误")
+        || message.contains("missing field")
+        || message.contains("unknown field")
+        || message.contains("invalid type")
+        || message.contains("invalid value")
+    {
         ControlErrorDetail::new("INVALID_REQUEST", message)
     } else {
         ControlErrorDetail::invalid_json(&message)
     }
+}
+
+/// 计算临时黑名单的过期时间。
+///
+/// `chrono::Duration::try_seconds` 和 `checked_add_signed` 都必须成功，
+/// 否则返回用户输入错误；这里不使用任何会在极端输入下 panic 的构造器。
+fn blacklist_expiration(duration_secs: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    if duration_secs <= 0 {
+        return None;
+    }
+    chrono::Duration::try_seconds(duration_secs)
+        .and_then(|duration| chrono::Utc::now().checked_add_signed(duration))
 }
 
 /// 控制接口每条连接一问一答，JSON 可分片传输，大小与总等待时间均受限。
@@ -2729,9 +2746,13 @@ pub async fn read_control_json<R: AsyncRead + Unpin, T: serde::de::DeserializeOw
                 Ok(value) => return Ok(value),
                 Err(error) if error.is_eof() => {}
                 Err(error) => {
-                    return Err(RuntimeError::Internal(format!(
-                        "控制 JSON 格式错误：{error}"
-                    )))
+                    let prefix = match error.classify() {
+                        serde_json::error::Category::Syntax => "控制 JSON 语法错误",
+                        serde_json::error::Category::Data => "控制请求结构错误",
+                        serde_json::error::Category::Eof => "控制 JSON 格式错误",
+                        serde_json::error::Category::Io => "控制 JSON 读取错误",
+                    };
+                    return Err(RuntimeError::Internal(format!("{prefix}：{error}")));
                 }
             }
         }
@@ -2840,6 +2861,25 @@ mod transport_tests {
             control_read_error_detail(&unknown).code,
             "UNSUPPORTED_OPERATION"
         );
+        let syntax = RuntimeError::Internal(
+            "控制 JSON 语法错误：expected value at line 1 column 1".to_string(),
+        );
+        assert_eq!(control_read_error_detail(&syntax).code, "INVALID_JSON");
+        let structure = RuntimeError::Internal(
+            "控制请求结构错误：invalid type: integer, expected a string".to_string(),
+        );
+        assert_eq!(
+            control_read_error_detail(&structure).code,
+            "INVALID_REQUEST"
+        );
+    }
+
+    #[test]
+    fn blacklist_expiration_rejects_extreme_and_non_positive_values_without_panicking() {
+        assert!(blacklist_expiration(0).is_none());
+        assert!(blacklist_expiration(-1).is_none());
+        assert!(blacklist_expiration(i64::MAX).is_none());
+        assert!(blacklist_expiration(60).is_some());
     }
 
     #[tokio::test]
