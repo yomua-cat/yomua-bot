@@ -15,14 +15,14 @@
 - `cargo check --locked --all-targets --offline`：通过。
 - `cargo test --locked --all-targets --no-run --offline`：通过编译检查。
 - `cargo fmt --all -- --check`：通过。
-- `cargo test --locked --all-targets`：库 437 个、主程序 5 个、ctl 36 个、alpha 集成 8 个、控制集成 82 个通过；插件 Unix socket 测试按 `#[ignore]` 标记跳过。
+- `cargo test --locked --all-targets`：库 437 个、主程序 5 个、ctl 36 个、alpha 集成 8 个、控制集成 83 个通过；插件 Unix socket 测试按 `#[ignore]` 标记跳过。
 - `cargo test --locked --lib infrastructure::plugin::transport::tests --offline -- --ignored --test-threads=1`：15 个插件 Unix socket 测试全部通过。
 - 临时 Unix socket 模拟服务配合真实 `yomua-bot-ctl status --raw`：通过，确认发送的是版本化 `ControlEnvelope`，不含旧 `cmd` 字段。
 - CLI 解析测试：覆盖一段、二段、三段命令、短别名归一化和危险命令确认。
 - SQLite 存储测试：覆盖平台消息去重、稳定用户关系、角色归属历史和记忆可见范围。
 - 配置模板验证：首次启动在临时目录生成 `runtime.toml`、`onebot.toml`、`llm.toml`、`decision.toml`；可选 OneBot 字段留空时仍可解析，真实配置密钥未参与验证。
 
-本次核查的基线为：库 437 个通过、主程序 5 个、ctl 36 个、alpha 集成 8 个、控制集成 82 个；另有 15 个插件 Unix socket 测试在普通全目标测试中按 `#[ignore]` 跳过，并通过显式 `--ignored` 运行。
+本次核查的基线为：库 437 个通过、主程序 5 个、ctl 36 个、alpha 集成 8 个、控制集成 83 个；另有 15 个插件 Unix socket 测试在普通全目标测试中按 `#[ignore]` 跳过，并通过显式 `--ignored` 运行。
 
 ## 已实现的重点行为
 

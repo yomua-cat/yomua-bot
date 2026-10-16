@@ -274,6 +274,211 @@ impl ReplyProcessor {
         self
     }
 
+    /// 发送控制指令的结果。
+    ///
+    /// 控制指令本身已经作为系统消息写入 `messages`，因此可以复用同一张
+    /// `reply_tasks` 表和发送状态机。该路径不运行角色决策、记忆或关系逻辑，
+    /// 只负责校验当前绑定、持久化内容、发送和补写 assistant 历史。
+    pub async fn send_control_reply(
+        &self,
+        conversation_id: i64,
+        source_message_id: i64,
+        content: &str,
+    ) -> Result<(), RuntimeError> {
+        let repo = self
+            .message_repo
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Internal("控制回复缺少消息仓储".into()))?;
+        let source = repo
+            .find_by_id(source_message_id)
+            .await?
+            .ok_or(RuntimeError::Domain(
+                crate::error::DomainError::MessageNotFound(source_message_id),
+            ))?;
+        if source.conversation_id != conversation_id {
+            return Err(RuntimeError::Domain(
+                crate::error::DomainError::MessageNotFound(source_message_id),
+            ));
+        }
+        let binding = self
+            .binding_manager
+            .by_conversation(conversation_id)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(RuntimeError::Domain(
+                crate::error::DomainError::ConversationNotFound(conversation_id),
+            ))?;
+        let source_binding_id = source
+            .metadata
+            .get("binding_id")
+            .and_then(|value| value.as_i64());
+        let source_binding_version = source.metadata.get("binding_version");
+        if source_binding_id != Some(binding.id)
+            || source_binding_version != Some(&serde_json::json!(binding.switched_at))
+        {
+            repo.save_reply_task(
+                source_message_id,
+                binding.character_id,
+                ReplyTaskStatus::Cancelled,
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+        let character = self.runtime.refresh_character(binding.character_id).await?;
+        let event = MessageReceivedEvent {
+            conversation_id,
+            sender_id: source.sender_id,
+            message_id: source_message_id,
+            content: String::new(),
+            timestamp: source.timestamp,
+            is_mentioned: false,
+            character_id: binding.character_id,
+            conversation_sequence: source.conversation_sequence.unwrap_or_default(),
+            platform_message_id: source.platform_message_id,
+            ingested_at: source.ingested_at.unwrap_or_else(Utc::now),
+            metadata: serde_json::json!({
+                "author_kind": "system",
+                "binding_id": binding.id,
+                "binding_version": binding.switched_at,
+            }),
+        };
+
+        if !character.enabled {
+            repo.save_reply_task(
+                source_message_id,
+                binding.character_id,
+                ReplyTaskStatus::Cancelled,
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+        if repo
+            .reply_task(source_message_id)
+            .await?
+            .is_some_and(|task| task.status.is_terminal())
+        {
+            return Ok(());
+        }
+
+        let _binding_gate = self
+            .binding_manager
+            .acquire_conversation_lock(conversation_id)
+            .await;
+        let still_current = self
+            .binding_manager
+            .by_conversation(conversation_id)
+            .await?
+            .into_iter()
+            .any(|candidate| {
+                candidate.id == binding.id && candidate.character_id == binding.character_id
+            });
+        if !still_current {
+            repo.save_reply_task(
+                source_message_id,
+                binding.character_id,
+                ReplyTaskStatus::Cancelled,
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        repo.save_reply_task(
+            source_message_id,
+            binding.character_id,
+            ReplyTaskStatus::Generated,
+            Some(content),
+        )
+        .await?;
+        repo.save_reply_task_delivery(
+            source_message_id,
+            binding.character_id,
+            ReplyTaskStatus::Sending,
+            Some(content),
+            None,
+            None,
+        )
+        .await?;
+
+        match self
+            .action_dispatcher
+            .execute_send_message_with_response(conversation_id, content)
+            .await
+        {
+            Ok(response) if response.is_ok() => {
+                let platform_message_id = response
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("message_id"))
+                    .and_then(|value| value.as_i64());
+                repo.save_reply_task_delivery(
+                    source_message_id,
+                    binding.character_id,
+                    ReplyTaskStatus::Sending,
+                    Some(content),
+                    None,
+                    platform_message_id,
+                )
+                .await?;
+                if let Err(error) = self
+                    .persist_assistant_history(&event, &character, content, platform_message_id)
+                    .await
+                {
+                    repo.save_reply_task_delivery(
+                        source_message_id,
+                        binding.character_id,
+                        ReplyTaskStatus::Sending,
+                        Some(content),
+                        Some(&format!("{ASSISTANT_HISTORY_REPAIR_PREFIX}: {error}")),
+                        platform_message_id,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                repo.save_reply_task_delivery(
+                    source_message_id,
+                    binding.character_id,
+                    ReplyTaskStatus::Sent,
+                    None,
+                    None,
+                    platform_message_id,
+                )
+                .await?;
+                Ok(())
+            }
+            Ok(response) => {
+                repo.save_reply_task_delivery(
+                    source_message_id,
+                    binding.character_id,
+                    ReplyTaskStatus::Generated,
+                    Some(content),
+                    Some(&response.error_message()),
+                    None,
+                )
+                .await?;
+                Err(RuntimeError::SendRejected(format!(
+                    "OneBot 明确拒绝发送：status={}, retcode={:?}, error={:?}",
+                    response.status, response.retcode, response.error
+                )))
+            }
+            Err(error) => {
+                repo.save_reply_task_delivery(
+                    source_message_id,
+                    binding.character_id,
+                    ReplyTaskStatus::Unknown,
+                    Some(content),
+                    Some(&error.to_string()),
+                    None,
+                )
+                .await?;
+                Ok(())
+            }
+        }
+    }
+
     async fn save_task(
         &self,
         event: &MessageReceivedEvent,
@@ -305,6 +510,37 @@ impl ReplyProcessor {
                     Some(error),
                 )
                 .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 在会话删除、角色切换或租约恢复后，阻止已失效事件继续产生副作用。
+    ///
+    /// Outbox 删除只能把事件标记为终态，无法撤回已经被 worker 领取的事件；
+    /// 因此每个不可逆副作用前都必须重新检查源消息和租约。检查失败时直接
+    /// 返回所有权失效，调度器会确认事件而不会继续写关系、记忆或发送。
+    async fn ensure_event_still_owned(
+        &self,
+        event: &MessageReceivedEvent,
+        lease: Option<&str>,
+    ) -> Result<(), RuntimeError> {
+        let Some(repo) = &self.message_repo else {
+            return Ok(());
+        };
+        if event.message_id <= 0 {
+            return Ok(());
+        }
+        if repo.find_by_id(event.message_id).await?.is_none() {
+            return Err(RuntimeError::Repository(
+                crate::error::RepositoryError::OwnershipLost,
+            ));
+        }
+        if let Some(token) = lease {
+            if !repo.owns_outbox_lease(event.message_id, token).await? {
+                return Err(RuntimeError::Repository(
+                    crate::error::RepositoryError::OwnershipLost,
+                ));
             }
         }
         Ok(())
@@ -426,6 +662,7 @@ impl ReplyProcessor {
                 return Ok(());
             }
         }
+        self.ensure_event_still_owned(event, lease).await?;
         // 恢复时先处理上一次可能中断的发送状态，再检查绑定和过期时间。
         // 这样切换角色或任务过期不会把 Sending 任务遗留成可重复发送的状态。
         let stored = if let Some(repo) = &self.message_repo {
@@ -574,6 +811,7 @@ impl ReplyProcessor {
             .relationship_service
             .canonical_participant_id(event.character_id, event.sender_id, stable_user_key)
             .await?;
+        self.ensure_event_still_owned(event, lease).await?;
         if event.message_id > 0 && !synthetic_proactive {
             self.memory_service
                 .extract_and_store(
@@ -586,6 +824,7 @@ impl ReplyProcessor {
                 )
                 .await?;
         }
+        self.ensure_event_still_owned(event, lease).await?;
         if event.message_id > 0 && !synthetic_proactive {
             match self
                 .relationship_service
@@ -607,6 +846,7 @@ impl ReplyProcessor {
                 Err(error) => return Err(RuntimeError::Repository(error)),
             }
         }
+        self.ensure_event_still_owned(event, lease).await?;
         let batch_content = self.freeze_batch(event).await?;
         let decision = self
             .decision_orchestrator
@@ -618,6 +858,7 @@ impl ReplyProcessor {
                 Some(relationship_participant_id),
             )
             .await?;
+        self.ensure_event_still_owned(event, lease).await?;
         self.event_bus
             .publish(&CoreEvent::BehaviorDecided(BehaviorDecidedEvent {
                 character_id: event.character_id,
@@ -674,6 +915,7 @@ impl ReplyProcessor {
                     &batch_content,
                 )
                 .await?;
+            self.ensure_event_still_owned(event, lease).await?;
             if Self::event_expired(event) {
                 self.save_task(event, ReplyTaskStatus::Expired, Some(&content))
                     .await?;
@@ -834,7 +1076,7 @@ impl ReplyProcessor {
     ///
     /// 受租约保护的入口和旧的无租约入口必须使用完全相同的分类规则，否则
     /// 同一类故障会在不同启动路径下产生不同的重试行为。
-    fn classify_outbox_error_for_event(
+    pub(crate) fn classify_outbox_error_for_event(
         error: RuntimeError,
         conversation_id: i64,
     ) -> ProcessingOutcome {

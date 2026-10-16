@@ -687,6 +687,11 @@ mod tests {
             command: crate::domain::event::Command::SwitchCharacter {
                 character_name: "木然".to_string(),
             },
+            source_message_id: 2,
+            character_id: 1,
+            conversation_sequence: 1,
+            platform_message_id: Some(3),
+            ingested_at: Some(ts()),
         });
         assert_eq!(EventType::from_core_event(&event), None);
     }

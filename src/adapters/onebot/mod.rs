@@ -25,7 +25,6 @@ use crate::application::conversation::ConversationManager;
 use crate::application::event_bus::EventBus;
 use crate::application::message_acceptance::MessageAcceptanceService;
 use crate::domain::blacklist::BlacklistType;
-use crate::domain::event::{CommandReceivedEvent, CoreEvent};
 use crate::domain::repository::BlacklistRepository;
 use crate::error::RuntimeError;
 
@@ -392,6 +391,7 @@ impl OneBotAdapterImpl {
 struct InboundProcessor {
     event_rx: mpsc::Receiver<String>,
     conversation_manager: ConversationManager,
+    #[allow(dead_code)]
     bus: EventBus,
     acceptance_service: Arc<MessageAcceptanceService>,
     binding_manager: Arc<BindingManager>,
@@ -500,8 +500,8 @@ impl InboundProcessor {
             }
         }
 
-        // 硬性约束 B：指令消息在发布位截流——不发布 MessageReceived（不落库、
-        // 不进角色上下文、不进插件 message 订阅），改为发布 CommandReceived。
+        // 硬性约束 B：指令消息不进入普通角色上下文，但必须先持久化为系统消息
+        // 和 Outbox 事件。这样指令执行与回复才能在断线、重启和未知回执时恢复。
         let classified_command = crate::application::command::classify(
             &inbound.content,
             inbound.is_mentioned,
@@ -531,38 +531,45 @@ impl InboundProcessor {
                 tracing::debug!(target: "adapter", conversation_id, "忽略未知参与者的管理指令");
                 return;
             };
+            let Some(binding) = self
+                .binding_manager
+                .by_conversation(conversation_id)
+                .await
+                .ok()
+                .and_then(|bindings| bindings.into_iter().next())
+            else {
+                tracing::debug!(target: "adapter", conversation_id, "忽略未绑定会话中的管理指令");
+                return;
+            };
+            let timestamp = chrono::DateTime::from_timestamp(inbound.unix_time, 0)
+                .unwrap_or_else(chrono::Utc::now);
             match self
                 .acceptance_service
-                .claim_command_message(conversation_id, inbound.platform_message_id)
+                .accept_command(
+                    conversation_id,
+                    sender_id,
+                    inbound.content,
+                    timestamp,
+                    inbound.platform_message_id,
+                    binding.character_id,
+                    command,
+                    inbound.external_sender_id,
+                    binding.id,
+                    binding.switched_at,
+                )
                 .await
             {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::debug!(
-                        target: "adapter",
-                        conversation_id,
-                        platform_message_id = inbound.platform_message_id,
-                        "重复投递的管理命令已忽略"
-                    );
-                    return;
-                }
+                Ok((message_id, sequence)) => tracing::info!(
+                    target: "adapter",
+                    conversation_id,
+                    message_id,
+                    sequence,
+                    "管理指令已持久化并进入 Outbox"
+                ),
                 Err(error) => {
-                    tracing::error!(target: "adapter", %error, "无法记录管理命令幂等凭证");
-                    return;
+                    tracing::error!(target: "adapter", conversation_id, %error, "管理指令持久化失败")
                 }
             }
-            let cmd_event = CoreEvent::CommandReceived(CommandReceivedEvent {
-                conversation_id,
-                sender_id,
-                external_sender_id: inbound.external_sender_id.clone(),
-                message_id: inbound.platform_message_id,
-                content: inbound.content,
-                timestamp: chrono::DateTime::from_timestamp(inbound.unix_time, 0)
-                    .unwrap_or_else(chrono::Utc::now),
-                command,
-            });
-            let receivers = self.bus.publish(&cmd_event);
-            tracing::info!(target: "adapter", conversation_id, receivers, "收到系统指令，已截流发布 CommandReceived（不落库、不进角色上下文）");
             return;
         }
 
@@ -690,7 +697,7 @@ mod tests {
     use crate::application::event_bus::EventSubscription;
     use crate::application::message_acceptance::MessageAcceptanceService;
     use crate::domain::conversation::{Conversation, Participant};
-    use crate::domain::event::Command;
+    use crate::domain::event::{Command, CoreEvent};
     use crate::domain::repository::{
         CharacterBindingRepository, CharacterRepository, ConversationRepository, MessageRepository,
         ParticipantRepository,
@@ -1237,7 +1244,7 @@ mod tests {
     // 发布前截流（硬性约束 B）测试
     // ------------------------------------------------------------------
 
-    /// 群聊 @ + "换角色 木然" → 只发布 CommandReceived，绝不发布 MessageReceived。
+    /// 群聊 @ + "换角色 木然" → 只发布带系统指令元数据的 MessageAccepted。
     #[tokio::test]
     async fn command_message_is_intercepted_not_forwarded_as_message() {
         let p = processor();
@@ -1248,20 +1255,21 @@ mod tests {
         let events = drain(&mut sub);
         assert_eq!(events.len(), 1, "应只发布一条事件（指令被截流）");
         match &events[0] {
-            CoreEvent::CommandReceived(e) => {
+            CoreEvent::MessageAccepted(e) => {
                 assert_eq!(e.conversation_id, 1);
                 assert_eq!(e.sender_id, 1);
-                assert_eq!(e.external_sender_id, "900001");
-                assert_eq!(e.message_id, 1001);
+                assert_eq!(e.platform_message_id, Some(1001));
                 assert_eq!(e.content, "换角色 木然");
+                assert_eq!(e.metadata["author_kind"], "system_command");
                 assert_eq!(
-                    e.command,
-                    Command::SwitchCharacter {
+                    e.metadata["command"],
+                    serde_json::to_value(Command::SwitchCharacter {
                         character_name: "木然".to_string(),
-                    }
+                    })
+                    .unwrap()
                 );
             }
-            other => panic!("期望 CommandReceived，实际 {other:?}"),
+            other => panic!("期望 MessageAccepted，实际 {other:?}"),
         }
     }
 
@@ -1282,7 +1290,7 @@ mod tests {
         );
     }
 
-    /// 私聊无 at 的"换角色 木然" → 同样识别为指令（私聊无需 @）。
+    /// 私聊无 at 的"换角色 木然" → 同样持久化为系统指令消息（私聊无需 @）。
     #[tokio::test]
     async fn private_command_without_at_is_intercepted() {
         let p = processor();
@@ -1293,17 +1301,19 @@ mod tests {
         let events = drain(&mut sub);
         assert_eq!(events.len(), 1, "私聊指令应只发布一条事件");
         match &events[0] {
-            CoreEvent::CommandReceived(e) => {
-                assert_eq!(e.external_sender_id, "555");
-                assert_eq!(e.message_id, 1002);
+            CoreEvent::MessageAccepted(e) => {
+                assert_eq!(e.platform_message_id, Some(1002));
+                assert_eq!(e.metadata["external_sender_id"], "555");
+                assert_eq!(e.metadata["author_kind"], "system_command");
                 assert_eq!(
-                    e.command,
-                    Command::SwitchCharacter {
+                    e.metadata["command"],
+                    serde_json::to_value(Command::SwitchCharacter {
                         character_name: "木然".to_string(),
-                    }
+                    })
+                    .unwrap()
                 );
             }
-            other => panic!("期望 CommandReceived，实际 {other:?}"),
+            other => panic!("期望 MessageAccepted，实际 {other:?}"),
         }
     }
 

@@ -23,27 +23,29 @@
 flowchart TD
     A[OneBot WebSocket 入站] --> B[转换事件、解析会话和参与者]
     B --> C{系统指令}
-    C -->|是| D[已有会话/身份检查后发布 CommandReceived]
-    D --> E[管理员校验及指令处理]
+    C -->|是| D[已有会话/身份检查后持久化系统消息]
+    D --> E[MessageAccepted Outbox]
     C -->|否| F[查询会话角色绑定]
     F --> G[MessageAcceptanceService]
     G --> H[SQLite 事务：序号、消息、Outbox]
     H --> I[OutboxDispatcher：领取租约]
     I --> J[MPSC 与完成应答]
     J --> K[OutboxProcessor]
-    K --> L[ReplyProcessor]
-    L --> M[状态与关系、规则决策、上下文、回复生成]
-    M --> N[ActionDispatcher → OneBot]
-    H --> O[EventBus MessageAccepted → 观察者与插件]
+    K --> L{系统指令?}
+    L -->|是| M[CommandHandler：权限与绑定变更]
+    L -->|否| N[ReplyProcessor：状态、关系、规则、上下文与生成]
+    M --> O[控制回复任务 → OneBot]
+    N --> P[回复任务 → OneBot]
+    H --> Q[EventBus MessageAccepted → 观察者与插件]
 ```
 
-入站实现见[OneBot 适配器](../src/adapters/onebot/mod.rs)。系统指令先截流，只对已有会话和参与者发布 `CommandReceived`，避免无效指令制造孤儿身份；普通消息无角色绑定时不进入消息落库及回复流程，但允许按需创建会话与发送者。
+入站实现见[OneBot 适配器](../src/adapters/onebot/mod.rs)。系统指令先截流，只接受已有会话、参与者和角色绑定，然后作为 `author_kind=system_command` 的消息写入消息表和 Outbox；它不会进入普通角色上下文或插件消息订阅。普通消息无角色绑定时不进入消息落库及回复流程，但允许按需创建会话与发送者。
 
 [消息接受服务](../src/application/message_acceptance.rs)调用[消息仓储](../src/infrastructure/storage/repository/message_repository.rs)，在同一事务内递增会话序号并写入消息和 Outbox 行。广播事件保留给插件和观察者；普通消息回复只由 Outbox Dispatcher/Processor 链路处理。
 
 [OutboxDispatcher](../src/application/outbox_dispatcher.rs)轮询、领取租约并等待消费者应答；[OutboxProcessor](../src/application/outbox_processor.rs)把 payload 转交[回复处理器](../src/application/reply_processor.rs)。租约、轮询和最大重试次数是代码默认值，当前没有对应 TOML 字段。消费者成功后标记完成，失败可转入等待重试或死信；永久失败事件记录后不会阻塞同一会话后续事件。
 
-这条链路不构成端到端可靠投递保证：QQ 管理指令回复尚未接入持久回复任务，普通消息的未知外部回执也可能缺少平台消息 ID。完成状态只能按实际实现解释，不能据此推断 QQ 用户已收到消息。
+这条链路不构成端到端可靠投递保证：控制回复和普通回复都已进入持久回复任务，但 OneBot 超时通常没有平台消息 ID，未知外部回执仍需要人工核查。完成状态只能按实际实现解释，不能据此推断 QQ 用户已收到消息。
 
 ## 角色与状态边界
 
@@ -78,7 +80,7 @@ flowchart TD
 
 ## 后台任务与持久化
 
-- 常驻任务：事件观察、系统指令处理、主动行为评估、Outbox 调度和消费、控制服务、适配器连接与入站处理。
+- 常驻任务：事件观察、主动行为评估、Outbox 调度和消费、控制服务、适配器连接与入站处理；系统指令在 Outbox 消费任务内处理。
 - LLM 启用后启动后台认知任务，使用 `cognition` role；插件启用后增加事件桥接、传输和进程监督任务。
 - 主动行为驱动会在已有话题依据、冷却、静默和每日上限通过后，以 SQLite 原子事务预留额度并创建持久回复任务，复用普通回复发送链路；没有已有话题依据时不会发言。主动合成消息不会更新用户关系或记忆。
 - SQLite 使用 WAL、外键约束和连接池。[迁移](../src/infrastructure/storage/migrations.rs)在代码中执行并探测已有表列，没有独立迁移文件或自动回滚机制。

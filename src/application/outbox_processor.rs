@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
+use crate::application::command::CommandHandler;
 use crate::application::reply_processor::ReplyProcessor;
 use crate::domain::outbox::{OutboxEvent, ProcessingOutcome};
 
@@ -41,12 +42,16 @@ where
 /// 接收来自 OutboxDispatcher 的事件，执行处理，并返回结果。
 pub struct OutboxProcessor {
     reply_processor: Arc<ReplyProcessor>,
+    command_handler: Arc<CommandHandler>,
 }
 
 impl OutboxProcessor {
     /// 创建 Outbox 处理器。
-    pub fn new(reply_processor: Arc<ReplyProcessor>) -> Self {
-        Self { reply_processor }
+    pub fn new(reply_processor: Arc<ReplyProcessor>, command_handler: Arc<CommandHandler>) -> Self {
+        Self {
+            reply_processor,
+            command_handler,
+        }
     }
 
     /// 启动处理循环。
@@ -158,6 +163,7 @@ impl OutboxProcessor {
         );
 
         // 转换为 MessageReceivedEvent（复用 ReplyProcessor 的处理逻辑）
+        let metadata = payload.metadata.clone();
         let msg_received = crate::domain::event::MessageReceivedEvent {
             conversation_id: payload.conversation_id,
             sender_id: payload.sender_id,
@@ -169,8 +175,55 @@ impl OutboxProcessor {
             conversation_sequence: payload.conversation_sequence,
             platform_message_id: payload.platform_message_id,
             ingested_at: payload.ingested_at,
-            metadata: payload.metadata,
+            metadata,
         };
+
+        if payload
+            .metadata
+            .get("author_kind")
+            .and_then(|value| value.as_str())
+            == Some("system_command")
+        {
+            let Some(command_value) = payload.metadata.get("command") else {
+                return ProcessingOutcome::PermanentFailure {
+                    error: "系统指令事件缺少 command 字段".into(),
+                };
+            };
+            let command = match serde_json::from_value(command_value.clone()) {
+                Ok(command) => command,
+                Err(error) => {
+                    return ProcessingOutcome::PermanentFailure {
+                        error: format!("系统指令反序列化失败: {error}"),
+                    };
+                }
+            };
+            let platform_message_id = payload.platform_message_id.unwrap_or_default();
+            let event = crate::domain::event::CommandReceivedEvent {
+                conversation_id: payload.conversation_id,
+                sender_id: payload.sender_id,
+                external_sender_id: payload
+                    .metadata
+                    .get("external_sender_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                message_id: platform_message_id,
+                content: payload.content,
+                timestamp: payload.timestamp,
+                command,
+                source_message_id: payload.message_id,
+                character_id: payload.character_id,
+                conversation_sequence: payload.conversation_sequence,
+                platform_message_id: payload.platform_message_id,
+                ingested_at: Some(payload.ingested_at),
+            };
+            return match self.command_handler.handle(&event).await {
+                Ok(()) => ProcessingOutcome::Success,
+                Err(error) => {
+                    ReplyProcessor::classify_outbox_error_for_event(error, event.conversation_id)
+                }
+            };
+        }
 
         let Some(token) = event.lease_token.as_deref() else {
             return ProcessingOutcome::PermanentFailure {

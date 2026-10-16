@@ -1,18 +1,17 @@
 //! 系统指令模块 —— 识别、权限校验与执行。
 //!
 //! 纯函数 `classify` / `is_admin` 供适配层与应用层复用；
-//! `CommandHandler` 订阅 `CommandReceived` 事件并执行指令（换角色）。
+//! `CommandHandler` 处理 Outbox 中的系统指令消息并执行指令（换角色）。
 //!
-//! 硬性约束 B：指令消息在消息发布位被截流，不发布 `MessageReceived`，
-//! 因此不落库、不进角色上下文、不进插件 message 订阅。
+//! 硬性约束 B：指令消息不进入普通角色上下文或插件消息订阅，
+//! 但会先作为系统消息持久化，保证重启和发送异常可恢复。
 
 use std::sync::Arc;
 
-use crate::application::action::ActionDispatcher;
 use crate::application::binding::BindingManager;
-use crate::application::event_bus::EventBus;
+use crate::application::reply_processor::ReplyProcessor;
 use crate::domain::conversation::ConversationType;
-use crate::domain::event::{Command, CommandReceivedEvent, CoreEvent};
+use crate::domain::event::{Command, CommandReceivedEvent};
 use crate::domain::repository::CharacterRepository;
 use crate::error::RuntimeError;
 
@@ -57,11 +56,34 @@ pub fn is_admin(sender_external_id: &str, admin_users: Option<&[String]>) -> boo
         .unwrap_or(false)
 }
 
-/// 系统指令执行器：订阅 `CommandReceived`，校验权限后执行换角色并中文回复结果。
+/// 可持久化发送控制回复的抽象，便于命令处理与回复状态机解耦。
+#[async_trait::async_trait]
+pub trait ControlReplySender: Send + Sync {
+    async fn send_control_reply(
+        &self,
+        conversation_id: i64,
+        source_message_id: i64,
+        content: &str,
+    ) -> Result<(), RuntimeError>;
+}
+
+#[async_trait::async_trait]
+impl ControlReplySender for ReplyProcessor {
+    async fn send_control_reply(
+        &self,
+        conversation_id: i64,
+        source_message_id: i64,
+        content: &str,
+    ) -> Result<(), RuntimeError> {
+        ReplyProcessor::send_control_reply(self, conversation_id, source_message_id, content).await
+    }
+}
+
+/// 系统指令执行器：校验权限后执行换角色并通过可靠回复链路返回结果。
 pub struct CommandHandler {
     binding_manager: Arc<BindingManager>,
     character_repo: Arc<dyn CharacterRepository>,
-    action_dispatcher: Arc<ActionDispatcher>,
+    reply_sender: Arc<dyn ControlReplySender>,
     admin_users: Option<Vec<String>>,
     live_settings: Option<tokio::sync::watch::Receiver<crate::application::config::RuntimeConfig>>,
 }
@@ -70,13 +92,13 @@ impl CommandHandler {
     pub fn new(
         binding_manager: Arc<BindingManager>,
         character_repo: Arc<dyn CharacterRepository>,
-        action_dispatcher: Arc<ActionDispatcher>,
+        reply_sender: Arc<dyn ControlReplySender>,
         admin_users: Option<Vec<String>>,
     ) -> Self {
         Self {
             binding_manager,
             character_repo,
-            action_dispatcher,
+            reply_sender,
             admin_users,
             live_settings: None,
         }
@@ -90,19 +112,6 @@ impl CommandHandler {
         self
     }
 
-    /// 从事件总线持续消费并处理 `CommandReceived`。
-    pub async fn run(self, bus: &EventBus) {
-        let mut subscription = bus.subscribe();
-        while let Some(event) = subscription.recv().await {
-            let CoreEvent::CommandReceived(e) = &event else {
-                continue;
-            };
-            if let Err(err) = self.handle(e).await {
-                tracing::warn!(target: "command", error = %err, "指令处理失败");
-            }
-        }
-    }
-
     /// 处理一条指令：权限校验 → 执行 → 中文结果回复。
     pub async fn handle(&self, event: &CommandReceivedEvent) -> Result<(), RuntimeError> {
         // 1. 权限校验：非管理员直接中文拒绝（不执行）。
@@ -112,8 +121,12 @@ impl CommandHandler {
             .map(|settings| settings.borrow().admin_users.clone())
             .unwrap_or_else(|| self.admin_users.clone());
         if !is_admin(&event.external_sender_id, administrators.as_deref()) {
-            self.reply(event.conversation_id, "你没有权限执行该指令。")
-                .await?;
+            self.reply(
+                event.source_message_id,
+                event.conversation_id,
+                "你没有权限执行该指令。",
+            )
+            .await?;
             return Ok(());
         }
 
@@ -127,6 +140,7 @@ impl CommandHandler {
                     .find(|c| c.definition.name == *character_name)
                 else {
                     self.reply(
+                        event.source_message_id,
                         event.conversation_id,
                         &format!("未找到角色「{character_name}」，请先导入该角色。"),
                     )
@@ -142,14 +156,19 @@ impl CommandHandler {
                 {
                     Ok(_) => {
                         self.reply(
+                            event.source_message_id,
                             event.conversation_id,
                             &format!("已把本会话角色切换为「{character_name}」。"),
                         )
                         .await?;
                     }
                     Err(err) => {
-                        self.reply(event.conversation_id, &format!("换角色失败：{err}"))
-                            .await?;
+                        self.reply(
+                            event.source_message_id,
+                            event.conversation_id,
+                            &format!("换角色失败：{err}"),
+                        )
+                        .await?;
                     }
                 }
             }
@@ -157,13 +176,15 @@ impl CommandHandler {
         Ok(())
     }
 
-    /// 通过动作分发器向会话发送一条文本消息（复用既有发送链路）。
-    async fn reply(&self, conversation_id: i64, content: &str) -> Result<(), RuntimeError> {
-        self.action_dispatcher
-            .execute(&crate::domain::behavior::Action::SendMessage {
-                conversation_id,
-                content: content.to_string(),
-            })
+    /// 通过可靠回复状态机向会话发送一条文本消息。
+    async fn reply(
+        &self,
+        source_message_id: i64,
+        conversation_id: i64,
+        content: &str,
+    ) -> Result<(), RuntimeError> {
+        self.reply_sender
+            .send_control_reply(conversation_id, source_message_id, content)
             .await
     }
 }
@@ -171,7 +192,6 @@ impl CommandHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::onebot::{ActionResponse, OneBotAdapter, OneBotConnectionState};
     use crate::domain::character::{
         Character, CharacterBinding, CharacterDefinition, CharacterState, ReplyMode,
     };
@@ -355,58 +375,25 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 假适配器：记录发送内容（复用既有 ActionDispatcher + FakeAdapter 测试先例）
+    // 假回复发送器：只记录控制回复，不绕过生产回复状态机。
     // ------------------------------------------------------------------
 
-    struct FakeAdapter {
+    struct FakeReplySender {
         sent: Mutex<Vec<(String, String)>>,
     }
     #[async_trait]
-    impl OneBotAdapter for FakeAdapter {
-        async fn start(&self) -> Result<(), RuntimeError> {
-            Ok(())
-        }
-        async fn stop(&self) -> Result<(), RuntimeError> {
-            Ok(())
-        }
-        async fn state(&self) -> OneBotConnectionState {
-            OneBotConnectionState::Connected
-        }
-        async fn send_group_message(
+    impl ControlReplySender for FakeReplySender {
+        async fn send_control_reply(
             &self,
-            group_id: &str,
+            _conversation_id: i64,
+            _source_message_id: i64,
             content: &str,
-        ) -> Result<ActionResponse, RuntimeError> {
+        ) -> Result<(), RuntimeError> {
             self.sent
                 .lock()
                 .unwrap()
-                .push((group_id.to_string(), content.to_string()));
-            Ok(ActionResponse {
-                id: 0,
-                action: "send_group_msg".to_string(),
-                status: "ok".to_string(),
-                retcode: Some(0),
-                data: None,
-                error: None,
-            })
-        }
-        async fn send_private_message(
-            &self,
-            user_id: &str,
-            content: &str,
-        ) -> Result<ActionResponse, RuntimeError> {
-            self.sent
-                .lock()
-                .unwrap()
-                .push((user_id.to_string(), content.to_string()));
-            Ok(ActionResponse {
-                id: 0,
-                action: "send_private_msg".to_string(),
-                status: "ok".to_string(),
-                retcode: Some(0),
-                data: None,
-                error: None,
-            })
+                .push(("u100".to_string(), content.to_string()));
+            Ok(())
         }
     }
 
@@ -441,7 +428,7 @@ mod tests {
 
     /// 标准装配：会话 100（私聊，外部 u100）绑定角色 1（木然），另有角色 2（苏苏）。
     #[allow(clippy::type_complexity)]
-    fn setup() -> (CommandHandler, Arc<MemBindingRepo>, Arc<FakeAdapter>) {
+    fn setup() -> (CommandHandler, Arc<MemBindingRepo>, Arc<FakeReplySender>) {
         let character_repo = Arc::new(MemCharacterRepo {
             chars: Mutex::new(vec![
                 sample_character(1, "木然"),
@@ -479,7 +466,7 @@ mod tests {
             participants: Mutex::new(vec![]),
         });
 
-        let adapter = Arc::new(FakeAdapter {
+        let reply_sender = Arc::new(FakeReplySender {
             sent: Mutex::new(vec![]),
         });
         let binding_manager = Arc::new(BindingManager::new(
@@ -487,15 +474,13 @@ mod tests {
             character_repo,
             conv_repo.clone(),
         ));
-        let action_dispatcher = Arc::new(ActionDispatcher::new(conv_repo, adapter.clone()));
-
         let handler = CommandHandler::new(
             binding_manager,
             character_repo_trait,
-            action_dispatcher,
+            reply_sender.clone(),
             Some(vec!["900001".to_string()]),
         );
-        (handler, binding_repo, adapter)
+        (handler, binding_repo, reply_sender)
     }
 
     fn sample_event(character_name: &str) -> CommandReceivedEvent {
@@ -509,6 +494,11 @@ mod tests {
             command: Command::SwitchCharacter {
                 character_name: character_name.to_string(),
             },
+            source_message_id: 1001,
+            character_id: 1,
+            conversation_sequence: 1,
+            platform_message_id: Some(1001),
+            ingested_at: Some(Utc::now()),
         }
     }
 

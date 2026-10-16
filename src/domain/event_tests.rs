@@ -71,6 +71,11 @@ fn command_received_roundtrip() {
         command: Command::SwitchCharacter {
             character_name: "木然".to_string(),
         },
+        source_message_id: 99,
+        character_id: 7,
+        conversation_sequence: 3,
+        platform_message_id: Some(1001),
+        ingested_at: Some(chrono::Utc::now()),
     });
 
     let json = serde_json::to_string(&event).unwrap();

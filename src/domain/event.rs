@@ -211,8 +211,8 @@ pub struct ScheduledTaskTriggeredEvent {
 
 /// 系统指令（平台无关语义）。
 ///
-/// 由适配层在消息发布位识别产生；指令消息不发布 `MessageReceived`，
-/// 因此不落库、不进角色上下文、不进插件 message 订阅（硬性约束 B）。
+/// 由适配层在入站消息接受前识别产生；指令消息会作为系统消息持久化，
+/// 但不进入普通角色上下文或插件 message 订阅（硬性约束 B）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     /// 把当前会话切换到指定角色。
@@ -230,4 +230,16 @@ pub struct CommandReceivedEvent {
     pub content: String,
     pub timestamp: DateTime<Utc>,
     pub command: Command,
+    /// 入站命令对应的本地消息 ID。`message_id` 保留平台消息 ID，便于审计。
+    #[serde(default)]
+    pub source_message_id: i64,
+    /// 命令接收时正在使用的角色。回复会在执行后重新校验当前绑定。
+    #[serde(default)]
+    pub character_id: i64,
+    #[serde(default)]
+    pub conversation_sequence: i64,
+    #[serde(default)]
+    pub platform_message_id: Option<i64>,
+    #[serde(default)]
+    pub ingested_at: Option<DateTime<Utc>>,
 }

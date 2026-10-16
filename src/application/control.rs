@@ -1277,15 +1277,22 @@ fn handle_reply_unknown_check(
 ) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
-        let message_id = params
-            .get("message_id")
-            .and_then(|value| value.as_i64())
-            .ok_or_else(|| RuntimeError::Internal("缺少 message_id".into()))?;
+        let message_id = match params.get("message_id").and_then(|value| value.as_i64()) {
+            Some(value) if value > 0 => value,
+            _ => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "缺少或非法参数 message_id"),
+                ));
+            }
+        };
         let task = handle
             .message_repo
             .find_unknown_reply_task(message_id)
             .await?
-            .ok_or_else(|| RuntimeError::Internal("未找到未知发送结果任务".into()))?;
+            .ok_or_else(|| {
+                RuntimeError::UserInput("NOT_FOUND".into(), "未找到未知发送结果任务".into())
+            })?;
         let Some(platform_message_id) = task.platform_message_id else {
             return Ok(ControlResponse::ok(
                 id,
@@ -1384,7 +1391,6 @@ pub fn response_explicitly_confirms_not_sent(
         "消息不存在",
         "消息未找到",
         "未找到消息",
-        "消息不存在或已被撤回",
         "消息未发送",
         "不存在该消息",
         "message not found",
@@ -1446,15 +1452,22 @@ fn handle_reply_unknown_retry(
 ) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
-        let message_id = params
-            .get("message_id")
-            .and_then(|value| value.as_i64())
-            .ok_or_else(|| RuntimeError::Internal("参数错误：缺少 message_id".into()))?;
+        let message_id = match params.get("message_id").and_then(|value| value.as_i64()) {
+            Some(value) if value > 0 => value,
+            _ => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "缺少或非法参数 message_id"),
+                ));
+            }
+        };
         let task = handle
             .message_repo
             .find_unknown_reply_task(message_id)
             .await?
-            .ok_or_else(|| RuntimeError::Internal("未找到 unknown 回复任务".into()))?;
+            .ok_or_else(|| {
+                RuntimeError::UserInput("NOT_FOUND".into(), "未找到 unknown 回复任务".into())
+            })?;
         let platform_message_id = task.platform_message_id.ok_or_else(|| {
             RuntimeError::Internal("该任务没有平台消息 ID，只能人工核查，禁止自动重试".into())
         })?;
@@ -2852,10 +2865,7 @@ async fn handle_connection(
             };
             match tokio::time::timeout(command_timeout, future).await {
                 Ok(Ok(response)) => response,
-                Ok(Err(error)) => ControlResponse::err(
-                    id,
-                    ControlErrorDetail::new("COMMAND_FAILED", error.to_string()),
-                ),
+                Ok(Err(error)) => ControlResponse::err(id, control_command_error_detail(&error)),
                 Err(_) => ControlResponse::err(
                     id,
                     ControlErrorDetail::new("COMMAND_TIMEOUT", "命令处理超时"),
@@ -2917,6 +2927,39 @@ fn control_read_error_detail(error: &RuntimeError) -> ControlErrorDetail {
         ControlErrorDetail::new("INVALID_REQUEST", message)
     } else {
         ControlErrorDetail::invalid_json(&message)
+    }
+}
+
+/// 将应用处理器返回的错误映射为稳定的控制协议错误码。
+///
+/// ctl 和脚本不能通过中文错误文本猜测下一步动作；用户输入、资源不存在、
+/// 冲突和内部故障必须保持可区分。未显式分类的运行时错误才退回
+/// `COMMAND_FAILED`，避免把传输或模型故障伪装成参数错误。
+fn control_command_error_detail(error: &RuntimeError) -> ControlErrorDetail {
+    match error {
+        RuntimeError::UserInput(code, message) => ControlErrorDetail::with_code(code, message),
+        RuntimeError::Domain(crate::error::DomainError::CharacterNotFound(id)) => {
+            ControlErrorDetail::new("CHARACTER_NOT_FOUND", format!("角色未找到：{id}"))
+        }
+        RuntimeError::Domain(crate::error::DomainError::ConversationNotFound(id)) => {
+            ControlErrorDetail::new("CONVERSATION_NOT_FOUND", format!("会话未找到：{id}"))
+        }
+        RuntimeError::Domain(crate::error::DomainError::MessageNotFound(id)) => {
+            ControlErrorDetail::new("MESSAGE_NOT_FOUND", format!("消息未找到：{id}"))
+        }
+        RuntimeError::Domain(crate::error::DomainError::MemoryNotFound(id)) => {
+            ControlErrorDetail::new("MEMORY_NOT_FOUND", format!("记忆未找到：{id}"))
+        }
+        RuntimeError::Repository(crate::error::RepositoryError::NotFound(message)) => {
+            ControlErrorDetail::new("NOT_FOUND", message)
+        }
+        RuntimeError::Repository(crate::error::RepositoryError::AlreadyExists(message)) => {
+            ControlErrorDetail::new("ALREADY_EXISTS", message)
+        }
+        RuntimeError::Repository(crate::error::RepositoryError::OwnershipLost) => {
+            ControlErrorDetail::new("CONFLICT", "任务所有权已失效，请重新查询状态")
+        }
+        _ => ControlErrorDetail::new("COMMAND_FAILED", error.to_string()),
     }
 }
 
@@ -3135,8 +3178,12 @@ mod transport_tests {
 
     #[test]
     fn unknown_reply_check_only_requeues_for_explicit_missing_message() {
+        assert!(!response_explicitly_confirms_not_sent(&action_response(
+            Some("消息已发送但后来被撤回"),
+            Some(100),
+        )));
         assert!(response_explicitly_confirms_not_sent(&action_response(
-            Some("消息不存在或已被撤回"),
+            Some("消息不存在"),
             Some(100),
         )));
         assert!(response_explicitly_confirms_not_sent(&action_response(

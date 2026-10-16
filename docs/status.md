@@ -7,7 +7,7 @@
 | 检查 | 结果 | 边界 |
 | --- | --- | --- |
 | `cargo check --locked --all-targets --offline` | 通过 | 当前本机工具链和锁文件 |
-| `cargo test --locked --lib --no-default-features` | 通过 | 本轮 437 个通过、15 个按测试标记忽略；其余目标未在本轮重新执行 |
+| `cargo test --locked --all-targets` | 通过 | 库 437 个、主程序 5 个、ctl 36 个、alpha 集成 8 个、控制集成 83 个通过；15 个插件 Unix socket 测试按标记忽略 |
 | 插件 Unix socket 测试显式运行 | 通过 | `--ignored` 下 15 个测试全部通过；普通 CI 仍按 `#[ignore]` 标记单独记录 |
 | `cargo fmt --all -- --check` | 通过 | 当前工作树 |
 | `cargo clippy --locked --offline --all-targets --all-features -- -D warnings` | 通过 | 当前工作树，包含测试目标 |
@@ -24,6 +24,7 @@
 - 回复任务会冻结连续输入；原消息逐条保存，生成期间的新消息进入下一轮。
 - 上下文中只有角色真实发送且归属当前观察角色的消息才使用 `assistant`；当前批次只作为当前输入出现一次。
 - ctl 客户端、服务端和帮助文本使用统一 canonical 命令定义，支持一段、二段和三段命令；Unix socket 使用版本化结构化 `ControlEnvelope`，bot 不再解析人类 `cmd` 字符串。
+- QQ 管理指令会先保存为 `author_kind=system_command` 的消息并创建 `MessageAccepted` Outbox 事件；Outbox 消费时由 `CommandHandler` 做权限和绑定校验，控制回复复用 `reply_tasks` 的生成、发送、未知和历史落库状态机，不再由适配器直接发送。
 - 记忆候选与正式可见记忆分离；上下文只在来源会话读取会话记忆，跨会话仅读取当前全域用户且明确标记共享的记忆。跨会话记忆只作为角色的内部上下文使用，不向用户透露来源会话；没有用户身份上下文的接口只返回本会话内容。
 - `memory update` 先把 pending 请求写入记忆元数据，再通过 decision LLM 生成受限修改建议；程序校验并做乐观并发检查后才写入，记忆原文不在普通控制响应中返回，模型不可执行删除动作。
 - 跨会话记忆默认允许角色内部使用，但不把来源会话、原始群聊或记忆标识暴露给用户。用户可通过 `memory sharing request <character-id> <user-id>` 登记高优先级禁用请求；管理员使用 `memory sharing confirm ... --confirm` 后，未来跨会话检索会被数据库层阻止，来源会话仍可读取；`memory sharing cancel ... --confirm` 可恢复共享。
@@ -55,7 +56,7 @@
 - 插件 Unix socket 测试在普通测试命令中按 `#[ignore]` 标记；本机显式运行 15 个测试全部通过，CI 仍需单独执行 ignored 测试才能纳入必过门槛。
 - `unknown` 发送结果仍是待核查终态；现在会保存生成内容和错误原因。`reply unknown check` 仅在任务有平台消息 ID 时调用 `get_msg`，平台明确返回“未找到”才自动重新排队；没有平台消息 ID 或查询网络失败时明确要求人工核查，不能把不确定结果当作未发送。
 - 普通入站消息现在会按来源消息幂等地产生候选记忆，候选不会进入正常上下文或默认 ctl 列表；自然语言编辑请求的后台消费和矛盾修订尚未完成。自然语言编辑的 pending/failed/rejected/applied 状态会留在记忆元数据中，进程崩溃后可被发现，但尚无独立后台恢复队列。跨会话隐私禁用请求、确认和取消已通过 `memory sharing` 控制命令落库并在检索层生效。
-- QQ 管理指令目前仍通过独立的 `CommandHandler` 直接发送结果，尚未完全复用回复任务/Outbox 的持久发送链；断线或未知回执时仍需人工观察日志。
+- 控制回复已经复用回复任务和 Outbox；OneBot 超时缺少平台消息 ID 时仍无法自动查询，只能保留 unknown 状态等待人工核查。角色切换、停用或绑定版本变化会在发送前取消旧控制回复。
 - 角色状态缓存与控制命令写入后的长期一致性、真实配置热重载和进程级关停仍需演练。当前 `reload-config` 对 LLM/decision 装配仍提示重启，不能声称模型路由已经热替换。
 - 主动发言的静默时段仍按 UTC 解释，显式时区配置尚未接入；跨时区部署前不能把当前静默行为视为最终生产语义。
 - 单 Provider 模式仍是首次发布的最小可用模式：一个兼容接口、一个凭据和一个默认模型覆盖对话与认知任务。多 Provider 路由已支持同一 Provider 复用多个模型、按任务配置备用链，并只在网络错误、超时、429 或 5xx 时切换；`decision.toml` 单独配置决策模型。Grok 按 OpenAI-compatible Provider 接入，真实 endpoint、模型名、额度和延迟仍待填写后验证。

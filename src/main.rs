@@ -397,14 +397,16 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         .with_message_repository(repos.message_repo.clone()),
     );
 
-    // 系统指令处理器（硬性约束 B）：订阅 CommandReceived，执行换角色并中文回复。
-    let command_handler = CommandHandler::new(
-        app.binding_manager.clone(),
-        repos.character_repo.clone() as Arc<dyn CharacterRepository>,
-        action_dispatcher.clone(),
-        runtime_cfg.admin_users.clone(),
-    )
-    .with_live_settings(settings_rx);
+    // 系统指令处理器：由 Outbox 消费系统指令消息，执行换角色并通过可靠回复链路返回结果。
+    let command_handler = Arc::new(
+        CommandHandler::new(
+            app.binding_manager.clone(),
+            repos.character_repo.clone() as Arc<dyn CharacterRepository>,
+            reply_processor.clone(),
+            runtime_cfg.admin_users.clone(),
+        )
+        .with_live_settings(settings_rx),
+    );
 
     // 8. 启动订阅者和后台任务（在 shutdown_rx 创建后）。
     // OutboxDispatcher 和 OutboxProcessor 也在这里启动（C2-4 durable event delivery）。
@@ -1199,7 +1201,7 @@ fn spawn_background_tasks(
     repos: &Repos,
     bus: &EventBus,
     reply_processor: Arc<ReplyProcessor>,
-    command_handler: CommandHandler,
+    command_handler: Arc<CommandHandler>,
     app: &AppLayer,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> BackgroundTasks {
@@ -1212,13 +1214,6 @@ fn spawn_background_tasks(
         .handles
         .push(spawn_until_stopped(memory_shutdown.clone(), async move {
             memory_maintenance.run_until_stopped(memory_shutdown).await;
-        }));
-
-    let command_bus = bus.clone();
-    tasks
-        .handles
-        .push(spawn_until_stopped(shutdown_rx.clone(), async move {
-            command_handler.run(&command_bus).await;
         }));
 
     // 主动消息复用普通回复任务：从同一会话最近的已持久化消息取得依据。
@@ -1306,7 +1301,7 @@ fn spawn_background_tasks(
     let outbox_dispatcher =
         OutboxDispatcher::new(repos.outbox_repo.clone(), OutboxDispatcherConfig::default());
     let (event_tx, event_rx) = mpsc::channel(32); // bounded MPSC channel
-    let outbox_processor = OutboxProcessor::new(reply_processor_for_outbox);
+    let outbox_processor = OutboxProcessor::new(reply_processor_for_outbox, command_handler);
     let dispatcher_shutdown_rx = shutdown_rx.clone();
     let processor_shutdown_rx = shutdown_rx.clone();
 
