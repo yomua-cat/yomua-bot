@@ -353,7 +353,16 @@ impl OutboxRepository for SqliteOutboxRepository {
     }
 
     async fn recover_expired_processing(&self) -> Result<i64, RepositoryError> {
+        self.recover_expired_processing_with_limit(DEFAULT_MAX_RETRY_ATTEMPTS as i64)
+            .await
+    }
+
+    async fn recover_expired_processing_with_limit(
+        &self,
+        configured_max_attempts: i64,
+    ) -> Result<i64, RepositoryError> {
         let now = Utc::now().to_rfc3339();
+        let max_attempts = configured_max_attempts.max(1);
         let mut tx = self
             .pool
             .begin()
@@ -378,7 +387,7 @@ impl OutboxRepository for SqliteOutboxRepository {
         )
         .bind(&now)
         .bind(&now)
-        .bind(DEFAULT_MAX_RETRY_ATTEMPTS)
+        .bind(max_attempts)
         .execute(&mut *tx)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -395,7 +404,7 @@ impl OutboxRepository for SqliteOutboxRepository {
             "#,
         )
         .bind(&now)
-        .bind(DEFAULT_MAX_RETRY_ATTEMPTS)
+        .bind(max_attempts)
         .execute(&mut *tx)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;

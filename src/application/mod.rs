@@ -23,6 +23,7 @@ pub mod decision_orchestrator;
 pub mod decision_pipeline;
 pub mod event_bus;
 pub mod llm_scheduler;
+pub mod memory_maintenance;
 pub mod memory_service;
 pub mod message_acceptance;
 pub mod mood_service;

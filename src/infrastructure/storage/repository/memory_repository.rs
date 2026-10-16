@@ -19,6 +19,53 @@ impl SqliteMemoryRepository {
 
 #[async_trait]
 impl MemoryRepository for SqliteMemoryRepository {
+    async fn promote_safe_candidates(&self, limit: i64) -> Result<u64, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let ids: Vec<i64> = sqlx::query_scalar(
+            r#"SELECT id
+                 FROM memories
+                WHERE COALESCE(json_extract(metadata, '$.status'), 'formal') = 'candidate'
+                  AND json_extract(metadata, '$.kind') = 'statement'
+                  AND json_extract(metadata, '$.source_message_id') IS NOT NULL
+                  AND importance >= 0.5
+                ORDER BY importance DESC, created_at ASC, id ASC
+                LIMIT ?"#,
+        )
+        .bind(limit.max(0))
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if ids.is_empty() {
+            tx.rollback().await?;
+            return Ok(0);
+        }
+
+        let confirmed_at = chrono::Utc::now().to_rfc3339();
+        let mut promoted = 0_u64;
+        for id in ids {
+            let result = sqlx::query(
+                r#"UPDATE memories
+                      SET metadata = json_set(
+                          CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                          '$.status', 'formal',
+                          '$.verification', 'program_confirmed',
+                          '$.confirmed_at', ?,
+                          '$.confirmation_reason', '有来源的确定性陈述候选，满足最低重要度'
+                      )
+                    WHERE id = ?
+                      AND COALESCE(json_extract(metadata, '$.status'), 'formal') = 'candidate'"#,
+            )
+            .bind(&confirmed_at)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            promoted += u64::from(result.rows_affected() == 1);
+        }
+
+        tx.commit().await?;
+        Ok(promoted)
+    }
+
     async fn candidate_exists_for_source(
         &self,
         character_id: i64,

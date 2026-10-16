@@ -43,6 +43,7 @@ use yomua_bot::application::event_bus::EventBus;
 use yomua_bot::application::llm_scheduler::{
     DefaultLlmScheduler, EmbeddingScheduler, LlmRouteConfig, LlmScheduler,
 };
+use yomua_bot::application::memory_maintenance::MemoryMaintenanceDriver;
 use yomua_bot::application::memory_service::MemoryService;
 use yomua_bot::application::message_acceptance::MessageAcceptanceService;
 use yomua_bot::application::mood_service::MoodService;
@@ -1150,6 +1151,14 @@ fn spawn_background_tasks(
 ) -> BackgroundTasks {
     let mut tasks = BackgroundTasks::default();
     let reply_processor_for_outbox = reply_processor.clone();
+
+    let memory_maintenance = Arc::new(MemoryMaintenanceDriver::new(repos.memory_repo.clone()));
+    let memory_shutdown = shutdown_rx.clone();
+    tasks
+        .handles
+        .push(spawn_until_stopped(memory_shutdown.clone(), async move {
+            memory_maintenance.run_until_stopped(memory_shutdown).await;
+        }));
 
     let command_bus = bus.clone();
     tasks

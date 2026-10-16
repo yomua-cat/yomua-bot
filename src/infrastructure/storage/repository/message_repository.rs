@@ -137,6 +137,27 @@ impl MessageRepository for SqliteMessageRepository {
         })
         .transpose()
     }
+
+    async fn assistant_history_exists(
+        &self,
+        conversation_id: i64,
+        reply_task_message_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        let exists: i64 = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                SELECT 1
+                  FROM messages
+                 WHERE conversation_id = ?
+                   AND json_extract(metadata, '$.reply_task') = ?
+                   AND json_extract(metadata, '$.author_kind') = 'assistant'
+            )"#,
+        )
+        .bind(conversation_id)
+        .bind(reply_task_message_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists != 0)
+    }
     async fn find_unknown_reply_tasks(
         &self,
         limit: i64,
@@ -290,18 +311,99 @@ impl MessageRepository for SqliteMessageRepository {
         message_id: i64,
         platform_message_id: i64,
     ) -> Result<bool, RepositoryError> {
-        let result = sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        let task: Option<(i64, Option<String>, i64, Option<i64>)> = sqlx::query_as(
+            r#"SELECT task.character_id, task.content, message.conversation_id,
+                       message.conversation_sequence
+                  FROM reply_tasks task
+                  JOIN messages message ON message.id = task.message_id
+                 WHERE task.message_id = ? AND task.status = 'unknown'"#,
+        )
+        .bind(message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((character_id, content, conversation_id, conversation_sequence)) = task else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+
+        let updated = sqlx::query(
             r#"UPDATE reply_tasks
-               SET status = 'sent', platform_message_id = ?, error = NULL,
-                   updated_at = ?
-               WHERE message_id = ? AND status = 'unknown'"#,
+                  SET status = 'sent', platform_message_id = ?, error = NULL,
+                      updated_at = ?
+                WHERE message_id = ? AND status = 'unknown'"#,
         )
         .bind(platform_message_id)
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(message_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        if let Some(content) = content {
+            let external_id = format!("character:{character_id}");
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO participants
+                     (conversation_id, external_id, display_name, role, metadata)
+                   SELECT ?, ?, name, 'character', json_object(
+                       'author_kind', 'assistant', 'character_id', ?
+                   )
+                     FROM characters WHERE id = ?"#,
+            )
+            .bind(conversation_id)
+            .bind(&external_id)
+            .bind(character_id)
+            .bind(character_id)
+            .execute(&mut *tx)
+            .await?;
+            let assistant_id: i64 = sqlx::query_scalar(
+                "SELECT id FROM participants WHERE conversation_id = ? AND external_id = ?",
+            )
+            .bind(conversation_id)
+            .bind(&external_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"INSERT INTO messages
+                     (conversation_id, sender_id, content, timestamp, reply_to,
+                      mentions, attachments, metadata, active_character_id,
+                      platform_message_id, conversation_sequence, occurred_at, ingested_at)
+                   SELECT ?, ?, ?, ?, ?, '[]', '[]', ?, ?, ?, ?, ?, ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM messages
+                         WHERE conversation_id = ?
+                           AND json_extract(metadata, '$.reply_task') = ?
+                           AND json_extract(metadata, '$.author_kind') = 'assistant'
+                    )"#,
+            )
+            .bind(conversation_id)
+            .bind(assistant_id)
+            .bind(serde_json::json!({"Text": content}).to_string())
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(message_id)
+            .bind(
+                serde_json::json!({
+                    "author_kind": "assistant",
+                    "reply_task": message_id,
+                })
+                .to_string(),
+            )
+            .bind(character_id)
+            .bind(platform_message_id)
+            .bind(conversation_sequence)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(conversation_id)
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn find_by_id(&self, id: i64) -> Result<Option<Message>, RepositoryError> {

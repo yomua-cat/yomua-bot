@@ -267,6 +267,17 @@ pub trait MessageRepository: Send + Sync {
     ) -> Result<Option<crate::domain::message::ReplyTask>, RepositoryError> {
         Err(RepositoryError::NotImplemented("回复任务存储".into()))
     }
+    /// 判断某条入站消息是否已经有对应的 assistant 历史。
+    ///
+    /// 发送成功后本地历史可能因进程退出而延迟补写，恢复路径必须按任务
+    /// 标识精确去重，不能依赖有限长度的最近历史窗口。
+    async fn assistant_history_exists(
+        &self,
+        _conversation_id: i64,
+        _reply_task_message_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        Ok(false)
+    }
     async fn find_unknown_reply_tasks(
         &self,
         _limit: i64,
@@ -491,6 +502,14 @@ pub trait MessageRepository: Send + Sync {
 #[async_trait]
 pub trait MemoryRepository: Send + Sync {
     async fn find_by_id(&self, id: i64) -> Result<Option<Memory>, RepositoryError>;
+
+    /// 自动确认可以由程序安全判断的候选记忆。
+    ///
+    /// 只有带可靠来源且由确定性规则提取的 statement 候选适合走默认路径；
+    /// 模型推断的 inference 候选必须继续等待更严格的复核。
+    async fn promote_safe_candidates(&self, _limit: i64) -> Result<u64, RepositoryError> {
+        Ok(0)
+    }
 
     /// 判断某条来源消息是否已经生成候选记忆，抵御 Outbox 重试的重复副作用。
     async fn candidate_exists_for_source(
@@ -878,6 +897,14 @@ pub trait OutboxRepository: Send + Sync {
     /// 将 locked_until <= now 的 processing 事件重置为 pending，
     /// 以便下次 poll 可以重新 claim。
     async fn recover_expired_processing(&self) -> Result<i64, RepositoryError>;
+    /// 使用调度器实际配置的最大尝试次数恢复过期事件。
+    /// 默认实现兼容只提供固定默认值的测试仓储。
+    async fn recover_expired_processing_with_limit(
+        &self,
+        _max_attempts: i64,
+    ) -> Result<i64, RepositoryError> {
+        self.recover_expired_processing().await
+    }
     async fn renew_lease(
         &self,
         _event_uuid: &str,

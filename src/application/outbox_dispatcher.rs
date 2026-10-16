@@ -425,7 +425,11 @@ impl OutboxDispatcher {
     /// 尝试 claim 下一个可处理的事件。
     async fn claim_next(&self) -> Result<Option<OutboxEvent>, crate::error::RuntimeError> {
         // 首先恢复所有已过期的 processing 事件
-        if let Err(e) = self.repo.recover_expired_processing().await {
+        if let Err(e) = self
+            .repo
+            .recover_expired_processing_with_limit(self.config.max_retry_attempts)
+            .await
+        {
             warn!(target: "outbox", error = %e, "恢复过期事件失败");
         }
 
@@ -452,7 +456,11 @@ impl OutboxDispatcher {
 
     /// 恢复所有已过期的 processing 事件。
     async fn recover_expired_events(&self) {
-        match self.repo.recover_expired_processing().await {
+        match self
+            .repo
+            .recover_expired_processing_with_limit(self.config.max_retry_attempts)
+            .await
+        {
             Ok(n) if n > 0 => {
                 info!(
                     target: "outbox",

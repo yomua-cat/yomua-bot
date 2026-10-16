@@ -553,6 +553,18 @@ mod storage_tests {
         assert_eq!(task.status, ReplyTaskStatus::Unknown);
         assert_eq!(task.content.as_deref(), Some("reply"));
         assert_eq!(task.error.as_deref(), Some("发送结果未知"));
+
+        assert!(msg_repo
+            .confirm_unknown_reply_task(message_id, 7001)
+            .await
+            .unwrap());
+        let confirmed = msg_repo.reply_task(message_id).await.unwrap().unwrap();
+        assert_eq!(confirmed.status, ReplyTaskStatus::Sent);
+        assert_eq!(confirmed.platform_message_id, Some(7001));
+        assert!(msg_repo
+            .assistant_history_exists(conversation_id, message_id)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -652,6 +664,45 @@ mod storage_tests {
             task.error.as_deref(),
             Some("进程在发送平台回执前退出，发送结果未知，需要核查")
         );
+    }
+
+    #[tokio::test]
+    async fn assistant_history_lookup_is_exact_not_window_limited() {
+        let storage = setup_storage().await;
+        let msg_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type,external_id) VALUES('private','history-lookup') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let sender_id: i64 = sqlx::query_scalar(
+            "INSERT INTO participants(conversation_id,external_id,display_name,role,metadata) VALUES(?,?,?,?,?) RETURNING id",
+        )
+        .bind(conversation_id)
+        .bind("assistant").bind("角色").bind("character").bind("{}").fetch_one(storage.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO messages(conversation_id,sender_id,content,timestamp,metadata) VALUES(?,?,?,?,?)",
+        )
+        .bind(conversation_id)
+        .bind(sender_id)
+        .bind(serde_json::json!({"Text":"回复"}).to_string())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(serde_json::json!({"author_kind":"assistant","reply_task":9001}).to_string())
+        .execute(storage.pool())
+        .await
+        .unwrap();
+
+        assert!(msg_repo
+            .assistant_history_exists(conversation_id, 9001)
+            .await
+            .unwrap());
+        assert!(!msg_repo
+            .assistant_history_exists(conversation_id, 9002)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1096,6 +1147,59 @@ mod storage_tests {
                 .is_empty(),
             "候选记忆不得进入普通读取路径"
         );
+    }
+
+    #[tokio::test]
+    async fn safe_statement_candidates_are_promoted_with_audit_metadata() {
+        let storage = setup_storage().await;
+        let memory_repo = crate::infrastructure::storage::repository::SqliteMemoryRepository::new(
+            storage.pool().clone(),
+        );
+        let character_id: i64 =
+            sqlx::query_scalar("INSERT INTO characters(name) VALUES('候选确认') RETURNING id")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let mut candidate = Memory::new(
+            character_id,
+            None,
+            MemoryType::Semantic,
+            "我喜欢喝咖啡".to_string(),
+            0.7,
+        );
+        candidate.metadata = serde_json::json!({
+            "kind": "statement",
+            "status": "candidate",
+            "source_message_id": 42,
+            "shared": true,
+        });
+        memory_repo.insert(&candidate).await.unwrap();
+
+        assert_eq!(memory_repo.promote_safe_candidates(10).await.unwrap(), 1);
+        let stored = memory_repo
+            .find_by_character_id(character_id, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].metadata["status"], "formal");
+        assert_eq!(stored[0].metadata["verification"], "program_confirmed");
+        assert!(stored[0].metadata["confirmed_at"].is_string());
+
+        // 推断候选不走默认确认路径。
+        let mut inference = Memory::new(
+            character_id,
+            None,
+            MemoryType::Semantic,
+            "这可能说明角色更信任用户".to_string(),
+            0.9,
+        );
+        inference.metadata = serde_json::json!({
+            "kind": "inference",
+            "status": "candidate",
+            "source_message_id": 43,
+        });
+        memory_repo.insert(&inference).await.unwrap();
+        assert_eq!(memory_repo.promote_safe_candidates(10).await.unwrap(), 0);
     }
 
     #[tokio::test]

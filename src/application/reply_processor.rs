@@ -337,26 +337,16 @@ impl ReplyProcessor {
         let Some(repo) = &self.message_repo else {
             return Ok(());
         };
-        let recent = repo.find_recent(event.conversation_id, 200).await?;
-        if recent.iter().any(|message| {
-            message
-                .metadata
-                .get("reply_task")
-                .and_then(|value| value.as_i64())
-                == Some(event.message_id)
-                && message
-                    .metadata
-                    .get("author_kind")
-                    .and_then(|value| value.as_str())
-                    == Some("assistant")
-        }) {
+        if repo
+            .assistant_history_exists(event.conversation_id, event.message_id)
+            .await?
+        {
             return Ok(());
         }
 
-        let assistant_external_id = self
-            .bot_self_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| format!("character:{}", event.character_id));
+        // assistant 历史按角色身份归属，而不是按平台账号归属。一个 QQ 账号
+        // 可以在不同会话扮演不同角色；未知发送结果的确认路径也使用同一键。
+        let assistant_external_id = format!("character:{}", event.character_id);
         let assistant_sender_id = if let Some(participant) = self
             .participant_repo
             .find_by_external_id(event.conversation_id, &assistant_external_id)
@@ -1594,7 +1584,7 @@ mod tests {
             states: Mutex::new(HashMap::new()),
         });
         // 预设参与者：
-        // - Bot 自身（id=55，role='character'，external_id = "111111" 与 bot_self_id 一致）
+        // - 当前角色（id=55，role='character'，external_id = "character:1"）
         // - 普通用户（id=66，role='user'，external_id="u100"）
         // sender_id=66 在 received_event 中对应用户发送者。
         let participant_repo = Arc::new(MemParticipantRepo {
@@ -1602,7 +1592,7 @@ mod tests {
                 crate::domain::conversation::Participant {
                     id: 55,
                     conversation_id: 100,
-                    external_id: "111111".to_string(),
+                    external_id: "character:1".to_string(),
                     display_name: "TestBot".to_string(),
                     role: crate::domain::conversation::ParticipantRole::Character,
                     metadata: serde_json::json!({}),
