@@ -373,7 +373,11 @@ async fn create_env() -> TestEnv {
 
     let socket_path = socket_dir.join("control.sock");
     // 启动控制服务（真实 UDS 监听）。
-    let server = start_control_service(handle.clone(), shutdown_rx);
+    let (server, started) = start_control_service(handle.clone(), shutdown_rx);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), started).await,
+        Ok(Ok(Ok(())))
+    ));
 
     // 等待 socket 就绪（最多 2 秒）。
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -595,7 +599,7 @@ async fn test_unknown_command_returns_error() {
     .await
     .unwrap();
     assert_eq!(resp["ok"], false);
-    assert_eq!(resp["error"]["code"], "INVALID_JSON");
+    assert_eq!(resp["error"]["code"], "UNSUPPORTED_OPERATION");
 }
 
 #[tokio::test]

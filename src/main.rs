@@ -501,11 +501,34 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     // 启动控制服务（后台任务，监听 data/control.sock）。
     // 控制服务单独持有句柄。关停命令需要等待主流程完成，不能把控制服务本身
     // 放进 auxiliary_tasks，否则会形成“控制请求等待主流程、主流程等待控制请求”的环。
-    let control_task = start_control_service(handle.clone(), shutdown_rx.clone());
-    tracing::info!(target: "runtime", socket_path = %handle.data_dir.join("control.sock").display(), "控制服务已启动（可用 yomua-bot-ctl status/reload-config/shutdown）");
+    let (control_task, control_started) =
+        start_control_service(handle.clone(), shutdown_rx.clone());
+    let control_start_result = tokio::time::timeout(Duration::from_secs(5), control_started).await;
+    let control_ready = match control_start_result {
+        Ok(Ok(Ok(()))) => {
+            tracing::info!(target: "runtime", socket_path = %handle.data_dir.join("control.sock").display(), "控制服务已启动（可用 yomua-bot-ctl status/reload-config/shutdown）");
+            true
+        }
+        Ok(Ok(Err(error))) => {
+            tracing::error!(target: "control", error = %error, "控制服务启动失败");
+            false
+        }
+        Ok(Err(_)) => {
+            tracing::error!(target: "control", "控制服务在报告启动结果前退出");
+            false
+        }
+        Err(_) => {
+            tracing::error!(target: "control", "控制服务启动超时");
+            false
+        }
+    };
 
     // 启动失败也进入同一清理流程，避免插件或 socket 遗留。
-    let start_result = adapter.start().await;
+    let start_result = if control_ready {
+        adapter.start().await
+    } else {
+        Err(RuntimeError::Internal("控制服务启动失败".to_string()))
+    };
     if start_result.is_ok() {
         tracing::info!(target: "runtime", "运行时已就绪，等待消息。Ctrl+C、SIGTERM 或控制命令可关停。");
         tokio::select! {

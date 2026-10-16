@@ -4,7 +4,7 @@
 
 ## 构建与准备
 
-需要 Rust stable、链接器和正常的编译环境。当前依赖锁定下的最低 Rust 版本尚未验证。SQLite 通过 Rust 依赖构建；`sqlite3` 命令仅在下面的备份示例中使用。NapCat 或其他 OneBot 11 服务应独立部署。
+需要 Rust stable、链接器和正常的编译环境。本轮在 `rustc 1.98.0`、`cargo 1.98.0` 上完成构建和测试；项目不承诺更低的 Rust 最低版本。SQLite 通过 Rust 依赖构建；`sqlite3` 命令仅在下面的备份示例中使用。NapCat 或其他 OneBot 11 服务应独立部署。
 
 ```bash
 cargo build --release --locked --bin yomua-bot --bin yomua-bot-ctl

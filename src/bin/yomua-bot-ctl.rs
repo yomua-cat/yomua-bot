@@ -94,6 +94,19 @@ impl ParsedCommand {
             return Err("缺少命令".to_string());
         }
 
+        // 交互模式与一次性模式统一接受命令前的无值选项。
+        // 只移动协议级通用选项，带值选项仍要求跟在命令路径之后，
+        // 这样不会把 `--character` 的值误判成命令路径。
+        let leading = tokens
+            .iter()
+            .take_while(|token| matches!(*token, &"--raw" | &"--confirm"))
+            .count();
+        if leading > 0 {
+            let mut reordered = tokens[leading..].to_vec();
+            reordered.extend_from_slice(&tokens[..leading]);
+            return Self::parse(&reordered);
+        }
+
         // 命令路径按已注册命令做最长匹配。旧实现把路径硬编码为最多两段，
         // 否则 `character card list` / `character state get` 这类三段命令会无法识别。
         let option_start = tokens
@@ -1976,6 +1989,19 @@ mod tests {
         let p = ParsedCommand::parse(&tokens).unwrap();
         assert_eq!(p.path, &["status".to_string()][..]);
         assert!(p.opts.raw);
+    }
+
+    #[test]
+    fn test_parse_common_options_before_command() {
+        let prefix = ParsedCommand::parse(&["--raw", "status"]).unwrap();
+        let suffix = ParsedCommand::parse(&["status", "--raw"]).unwrap();
+        assert_eq!(prefix.path, suffix.path);
+        assert_eq!(prefix.opts.raw, suffix.opts.raw);
+
+        let prefix = ParsedCommand::parse(&["--confirm", "shutdown"]).unwrap();
+        let suffix = ParsedCommand::parse(&["shutdown", "--confirm"]).unwrap();
+        assert_eq!(prefix.path, suffix.path);
+        assert_eq!(prefix.opts.confirm, suffix.opts.confirm);
     }
 
     #[test]

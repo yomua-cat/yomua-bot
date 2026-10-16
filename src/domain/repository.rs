@@ -610,6 +610,33 @@ pub trait MemoryRepository: Send + Sync {
 
     async fn insert(&self, memory: &Memory) -> Result<i64, RepositoryError>;
     async fn update(&self, memory: &Memory) -> Result<(), RepositoryError>;
+
+    /// 仅在持久化内容仍与 `expected` 一致时更新记忆。
+    ///
+    /// 控制端的自然语言修改会经过一次模型调用；调用期间可能有后台整理或
+    /// 另一个管理员修改同一条记忆。生产仓储应使用数据库条件更新保证不会
+    /// 用旧快照覆盖新内容，测试仓储可以使用默认的比较实现。
+    async fn update_if_unchanged(
+        &self,
+        memory: &Memory,
+        expected: &Memory,
+    ) -> Result<bool, RepositoryError> {
+        let Some(current) = self.find_by_id(memory.id).await? else {
+            return Err(RepositoryError::NotFound(format!(
+                "memory {} not found",
+                memory.id
+            )));
+        };
+        if current.content != expected.content
+            || current.importance != expected.importance
+            || current.last_accessed != expected.last_accessed
+            || current.metadata != expected.metadata
+        {
+            return Ok(false);
+        }
+        self.update(memory).await?;
+        Ok(true)
+    }
     async fn delete(&self, id: i64) -> Result<(), RepositoryError>;
 
     /// 查询所有记忆（全局列表）。

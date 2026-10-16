@@ -412,6 +412,51 @@ impl MemoryRepository for SqliteMemoryRepository {
         Ok(())
     }
 
+    async fn update_if_unchanged(
+        &self,
+        memory: &Memory,
+        expected: &Memory,
+    ) -> Result<bool, RepositoryError> {
+        let metadata = serde_json::to_string(&memory.metadata)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let expected_metadata = serde_json::to_string(&expected.metadata)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let result = sqlx::query(
+            r#"UPDATE memories SET
+                content = ?, importance = ?, last_accessed = ?, metadata = ?
+             WHERE id = ? AND content = ? AND importance = ? AND metadata = ?"#,
+        )
+        .bind(&memory.content)
+        .bind(memory.importance)
+        .bind(memory.last_accessed.to_rfc3339())
+        .bind(&metadata)
+        .bind(memory.id)
+        .bind(&expected.content)
+        .bind(expected.importance)
+        .bind(&expected_metadata)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if result.rows_affected() == 1 {
+            Ok(true)
+        } else {
+            let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM memories WHERE id = ?")
+                .bind(memory.id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            if exists.is_none() {
+                Err(RepositoryError::NotFound(format!(
+                    "memory {} not found",
+                    memory.id
+                )))
+            } else {
+                Ok(false)
+            }
+        }
+    }
+
     async fn delete(&self, id: i64) -> Result<(), RepositoryError> {
         let result = sqlx::query("DELETE FROM memories WHERE id = ?")
             .bind(id)

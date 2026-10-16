@@ -329,6 +329,12 @@ pub async fn run_connection_loop(
             tracing::warn!(target: "adapter", count = cleared, "连接断开，清理 pending 请求");
         }
 
+        // 连接 IO 因关停信号返回时，不要进入重连分支。否则 stop() 已经
+        // 设置为 Disconnected，下面的状态更新会把它错误地改回 Reconnecting。
+        if *shutdown.borrow() {
+            break;
+        }
+
         shared.set_state(OneBotConnectionState::Reconnecting).await;
         tracing::warn!(
             target: "adapter",
@@ -338,6 +344,9 @@ pub async fn run_connection_loop(
         publish_disconnected(&shared, None);
         sleep_until_shutdown(backoff.peek_latest(), &mut shutdown).await;
     }
+
+    // 所有退出路径都以 Disconnected 作为最终状态，供 ctl/status 和监控读取。
+    shared.set_state(OneBotConnectionState::Disconnected).await;
 }
 
 /// 根据 JSON 文本的 `echo` 字段对入站消息进行分类。

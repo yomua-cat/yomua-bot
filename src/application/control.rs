@@ -35,7 +35,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{watch, Notify, RwLock};
+use tokio::sync::{oneshot, watch, Notify, RwLock};
 
 use crate::adapters::onebot::{OneBotAdapter, OneBotAdapterImpl};
 use crate::application::config::{ConfigurationBundle, RuntimeConfig};
@@ -1138,7 +1138,17 @@ fn handle_blacklist_ban(
 
         let reason = obj.get("reason").and_then(|v| v.as_str()).map(String::from);
 
-        let expires_at = chrono::Utc::now() + chrono::Duration::seconds(duration_secs);
+        let expires_at = match chrono::Duration::try_seconds(duration_secs)
+            .and_then(|duration| chrono::Utc::now().checked_add_signed(duration))
+        {
+            Some(expires_at) => expires_at,
+            None => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "duration_secs 超出可表示的时间范围"),
+                ));
+            }
+        };
 
         // 检查是否已存在
         if let Some(existing) = handle
@@ -1398,6 +1408,15 @@ fn handle_reply_unknown_retry(
 fn handle_memory_list(handle: &RuntimeHandle, id: u64, params: serde_json::Value) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
+        let params = match params.as_object() {
+            Some(params) => params,
+            None => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "params 必须是 JSON 对象"),
+                ));
+            }
+        };
         let limit = params
             .get("limit")
             .and_then(|v| v.as_i64())
@@ -1518,6 +1537,15 @@ fn handle_memory_update(
 ) -> CommandFuture {
     let handle = handle.clone();
     Box::pin(async move {
+        let params = match params.as_object() {
+            Some(params) => params,
+            None => {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new("INVALID_PARAMS", "params 必须是 JSON 对象"),
+                ));
+            }
+        };
         let memory_id = match params.get("memory_id").and_then(|v| v.as_i64()) {
             Some(v) if v > 0 => v,
             _ => {
@@ -1564,6 +1592,10 @@ fn handle_memory_update(
             "status": "pending",
             "requested_at": requested_at,
         });
+        // 先把请求状态写入数据库，再调用模型。进程在模型调用期间崩溃时，
+        // 下次仍能看到这次修改处于 pending，而不是把审计记录留在内存里。
+        let pending_snapshot = memory.clone();
+        handle.memory_repo.update(&pending_snapshot).await?;
 
         // 记忆原文只发送给已配置的 LLM 调度器；响应必须是受限 JSON，
         // 后续只允许程序审核过的操作落库。
@@ -1598,32 +1630,62 @@ fn handle_memory_update(
         let response = match scheduler.submit(request).await {
             Ok(response) => response,
             Err(error) => {
-                memory.metadata["edit_request"] = serde_json::json!({
+                let mut failed = pending_snapshot.clone();
+                failed.metadata["edit_request"] = serde_json::json!({
                     "instruction": instruction,
                     "status": "failed",
                     "requested_at": requested_at,
                     "error": error.to_string(),
                 });
-                handle.memory_repo.update(&memory).await?;
+                let _ = handle
+                    .memory_repo
+                    .update_if_unchanged(&failed, &pending_snapshot)
+                    .await?;
                 return Err(error);
             }
         };
         let suggestion = match parse_memory_edit_suggestion(&response.content) {
             Ok(suggestion) => suggestion,
             Err(error) => {
-                memory.metadata["edit_request"] = serde_json::json!({
+                let mut rejected = pending_snapshot.clone();
+                rejected.metadata["edit_request"] = serde_json::json!({
                     "instruction": instruction,
                     "status": "rejected",
                     "requested_at": requested_at,
                     "error": error,
                 });
-                handle.memory_repo.update(&memory).await?;
+                let _ = handle
+                    .memory_repo
+                    .update_if_unchanged(&rejected, &pending_snapshot)
+                    .await?;
                 return Ok(ControlResponse::err(
                     id,
                     ControlErrorDetail::new("MEMORY_EDIT_REJECTED", error),
                 ));
             }
         };
+
+        // 模型调用期间如果记忆已被其他请求改动，放弃本次建议，避免旧快照覆盖新内容。
+        let Some(current) = handle.memory_repo.find_by_id(memory_id).await? else {
+            return Ok(ControlResponse::err(
+                id,
+                ControlErrorDetail::new("MEMORY_NOT_FOUND", format!("记忆不存在：{memory_id}")),
+            ));
+        };
+        if current.content != pending_snapshot.content
+            || current.importance != pending_snapshot.importance
+            || current.last_accessed != pending_snapshot.last_accessed
+            || current.metadata != pending_snapshot.metadata
+        {
+            return Ok(ControlResponse::err(
+                id,
+                ControlErrorDetail::new(
+                    "MEMORY_EDIT_CONFLICT",
+                    "模型处理期间记忆已被其他请求修改，本次建议未应用",
+                ),
+            ));
+        }
+        memory = current;
 
         let old_content = memory.content.clone();
         match suggestion.action.as_str() {
@@ -1642,7 +1704,10 @@ fn handle_memory_update(
                 "requested_at": requested_at,
                 "error": "修改后的记忆超过 20000 个字符",
             });
-            handle.memory_repo.update(&memory).await?;
+            let _ = handle
+                .memory_repo
+                .update_if_unchanged(&memory, &pending_snapshot)
+                .await?;
             return Ok(ControlResponse::err(
                 id,
                 ControlErrorDetail::new("MEMORY_EDIT_REJECTED", "修改后的记忆过长"),
@@ -1659,7 +1724,19 @@ fn handle_memory_update(
             "model": response.model,
         });
         memory.metadata["updated_by"] = serde_json::Value::String("llm_memory_edit".to_string());
-        handle.memory_repo.update(&memory).await?;
+        if !handle
+            .memory_repo
+            .update_if_unchanged(&memory, &pending_snapshot)
+            .await?
+        {
+            return Ok(ControlResponse::err(
+                id,
+                ControlErrorDetail::new(
+                    "MEMORY_EDIT_CONFLICT",
+                    "模型处理期间记忆已被其他请求修改，本次建议未应用",
+                ),
+            ));
+        }
         Ok(ControlResponse::ok(
             id,
             serde_json::json!({
@@ -1890,10 +1967,13 @@ fn handle_user_delete(handle: &RuntimeHandle, id: u64, params: serde_json::Value
             }
         };
         if let Err(e) = handle.participant_repo.delete_user(user_id).await {
-            return Ok(ControlResponse::err(
-                id,
-                ControlErrorDetail::internal(&e.to_string()),
-            ));
+            let detail = match e {
+                crate::error::RepositoryError::NotFound(message) => {
+                    ControlErrorDetail::new("USER_NOT_FOUND", message)
+                }
+                other => ControlErrorDetail::internal(&other.to_string()),
+            };
+            return Ok(ControlResponse::err(id, detail));
         }
         Ok(ControlResponse::ok(
             id,
@@ -2163,7 +2243,7 @@ fn handle_character_state_refresh(
 // ---------------------------------------------------------------------------
 
 /// 控制协议错误码。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ControlErrorDetail {
     pub code: String,
     pub message: String,
@@ -2209,7 +2289,7 @@ impl ControlErrorDetail {
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ControlResponse {
     /// 请求 ID，用于关联请求与响应。
     pub id: u64,
@@ -2417,19 +2497,30 @@ pub struct RuntimeStatus {
 pub fn start_control_service(
     handle: RuntimeHandle,
     shutdown_rx: watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
+) -> (
+    tokio::task::JoinHandle<()>,
+    oneshot::Receiver<Result<(), String>>,
+) {
     let socket_path = handle.data_dir.join("control.sock");
-    tokio::spawn(async move {
-        if let Err(e) = run_control_server(handle, socket_path, shutdown_rx).await {
+    let (startup_tx, startup_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut startup_tx = Some(startup_tx);
+        if let Err(e) = run_control_server(handle, socket_path, shutdown_rx, &mut startup_tx).await
+        {
+            if let Some(startup_tx) = startup_tx.take() {
+                let _ = startup_tx.send(Err(e.to_string()));
+            }
             tracing::error!(target: "control", error = %e, "控制服务异常退出");
         }
-    })
+    });
+    (task, startup_rx)
 }
 
 async fn run_control_server(
     handle: RuntimeHandle,
     socket_path: PathBuf,
     mut shutdown_rx: watch::Receiver<bool>,
+    startup_tx: &mut Option<oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), RuntimeError> {
     // 确保 socket 目录存在。
     if let Some(parent) = socket_path.parent() {
@@ -2447,9 +2538,12 @@ async fn run_control_server(
         ))
     })?;
 
+    let _socket_guard = SocketCleanup(socket_path.clone());
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| RuntimeError::Internal(format!("设置控制 socket 权限失败：{e}")))?;
-    let _socket_guard = SocketCleanup(socket_path.clone());
+    if let Some(startup_tx) = startup_tx.take() {
+        let _ = startup_tx.send(Ok(()));
+    }
     let mut connections = tokio::task::JoinSet::new();
     tracing::info!(target: "control", path = %socket_path.display(), "控制服务已启动");
 
@@ -2493,8 +2587,7 @@ async fn handle_connection(
     let envelope: ControlEnvelope = match read_control_json(stream, CONTROL_REQUEST_LIMIT).await {
         Ok(value) => value,
         Err(error) => {
-            let response =
-                ControlResponse::err(0, ControlErrorDetail::invalid_json(&error.to_string()));
+            let response = ControlResponse::err(0, control_read_error_detail(&error));
             write_response(stream, response).await?;
             return Ok(());
         }
@@ -2565,7 +2658,39 @@ async fn write_response(
     stream: &mut UnixStream,
     resp: ControlResponse,
 ) -> Result<(), RuntimeError> {
+    let encoded_len = serde_json::to_vec(&resp)
+        .map(|payload| payload.len() + 1)
+        .map_err(|e| RuntimeError::Internal(format!("序列化控制响应失败：{e}")))?;
+    if encoded_len > CONTROL_RESPONSE_LIMIT {
+        let fallback = ControlResponse::err(
+            resp.id,
+            ControlErrorDetail::new(
+                "RESPONSE_TOO_LARGE",
+                format!("控制响应超过 {} 字节上限", CONTROL_RESPONSE_LIMIT),
+            ),
+        );
+        return write_control_json(stream, &fallback, CONTROL_RESPONSE_LIMIT).await;
+    }
     write_control_json(stream, &resp, CONTROL_RESPONSE_LIMIT).await
+}
+
+fn control_read_error_detail(error: &RuntimeError) -> ControlErrorDetail {
+    let message = error.to_string();
+    if message.contains("超过") {
+        ControlErrorDetail::new("REQUEST_TOO_LARGE", message)
+    } else if message.contains("超时") {
+        ControlErrorDetail::new("REQUEST_TIMEOUT", message)
+    } else if message.contains("完整 JSON 到达前关闭") {
+        ControlErrorDetail::new("INCOMPLETE_REQUEST", message)
+    } else if message.contains("missing field `request`") {
+        ControlErrorDetail::missing_request()
+    } else if message.contains("unknown variant") {
+        ControlErrorDetail::new("UNSUPPORTED_OPERATION", message)
+    } else if message.contains("unknown field") {
+        ControlErrorDetail::new("INVALID_REQUEST", message)
+    } else {
+        ControlErrorDetail::invalid_json(&message)
+    }
 }
 
 /// 控制接口每条连接一问一答，JSON 可分片传输，大小与总等待时间均受限。
@@ -2699,6 +2824,40 @@ mod transport_tests {
             data: None,
             error: error.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn control_read_errors_keep_protocol_categories() {
+        let too_large = RuntimeError::Internal("控制数据超过 10 字节上限".to_string());
+        assert_eq!(
+            control_read_error_detail(&too_large).code,
+            "REQUEST_TOO_LARGE"
+        );
+        let missing = RuntimeError::Internal("missing field `request`".to_string());
+        assert_eq!(control_read_error_detail(&missing).code, "MISSING_REQUEST");
+        let unknown = RuntimeError::Internal("unknown variant `future`".to_string());
+        assert_eq!(
+            control_read_error_detail(&unknown).code,
+            "UNSUPPORTED_OPERATION"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_response_is_replaced_with_structured_error() {
+        let (mut writer, mut reader) = UnixStream::pair().expect("创建 UnixStream pair");
+        let large = ControlResponse::ok(
+            7,
+            serde_json::json!({"payload": "x".repeat(CONTROL_RESPONSE_LIMIT)}),
+        );
+        write_response(&mut writer, large)
+            .await
+            .expect("应能写入结构化超限错误");
+        let response: ControlResponse = read_control_json(&mut reader, 1024)
+            .await
+            .expect("应能读取超限错误");
+        assert!(!response.ok);
+        assert_eq!(response.error.as_ref().unwrap().code, "RESPONSE_TOO_LARGE");
+        assert_eq!(response.id, 7);
     }
 
     #[test]

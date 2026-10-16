@@ -129,6 +129,50 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn conversations_share_external_id_across_types_but_not_within_type() {
+        let storage = setup_storage().await;
+        let repo = crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+            storage.pool().clone(),
+        );
+        let now = chrono::Utc::now();
+        let group_id = repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Group,
+                external_id: "same-platform-id".into(),
+                name: Some("群聊".into()),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let private_id = repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Private,
+                external_id: "same-platform-id".into(),
+                name: Some("私聊".into()),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        assert_ne!(group_id, private_id);
+
+        let duplicate = repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Group,
+                external_id: "same-platform-id".into(),
+                name: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await;
+        assert!(duplicate.is_err());
+    }
+
+    #[tokio::test]
     async fn test_allocate_sequence_uses_sqlite_atomic_update() {
         let storage = setup_storage().await;
         let repo = crate::infrastructure::storage::repository::SqliteConversationRepository::new(
@@ -873,6 +917,25 @@ mod storage_tests {
             .expect("find memories failed");
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].content, "User likes cats");
+
+        // 乐观并发更新：旧快照不能覆盖已经提交的新内容。
+        let expected = memories[0].clone();
+        let mut committed = expected.clone();
+        committed.content = "User likes dogs".to_string();
+        assert!(mem_repo
+            .update_if_unchanged(&committed, &expected)
+            .await
+            .unwrap());
+        let mut stale = expected.clone();
+        stale.content = "stale overwrite".to_string();
+        assert!(!mem_repo
+            .update_if_unchanged(&stale, &expected)
+            .await
+            .unwrap());
+        assert_eq!(
+            mem_repo.find_by_id(mem_id).await.unwrap().unwrap().content,
+            "User likes dogs"
+        );
     }
 
     #[tokio::test]

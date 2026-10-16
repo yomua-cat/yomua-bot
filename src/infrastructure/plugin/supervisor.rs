@@ -98,6 +98,8 @@ pub fn restart_decision(
 struct ChildHandle {
     /// `stop()` 请求终止（notify_waiters 可并发触发）。
     stop_request: Arc<Notify>,
+    /// 全局强制关停请求；监控任务收到后必须显式 kill + wait 子进程。
+    force_request: Arc<Notify>,
     /// monitor 完成终止/清理后通知 `stop()` 继续。
     done: Arc<Notify>,
 }
@@ -106,6 +108,7 @@ impl ChildHandle {
     fn new() -> Self {
         Self {
             stop_request: Arc::new(Notify::new()),
+            force_request: Arc::new(Notify::new()),
             done: Arc::new(Notify::new()),
         }
     }
@@ -247,11 +250,10 @@ impl PluginSupervisor {
             .drain()
             .map(|(_, handle)| handle)
             .collect();
+        let deadline = tokio::time::Instant::now() + self.core.cfg.shutdown_timeout;
         for mut handle in handles {
-            if tokio::time::timeout(self.core.cfg.shutdown_timeout, &mut handle)
-                .await
-                .is_err()
-            {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, &mut handle).await.is_err() {
                 handle.abort();
                 let _ = handle.await;
             }
@@ -268,8 +270,20 @@ impl PluginSupervisor {
         Ok(())
     }
 
-    /// 整体关停超时的兜底：取消生命周期任务，Child 的 kill_on_drop 清理子进程。
+    /// 整体关停超时的兜底：要求监控任务显式 kill + wait 子进程，避免
+    /// 只依赖 `kill_on_drop` 而留下 Unix zombie。
     pub async fn force_shutdown(&self) {
+        let handles: Vec<_> = self
+            .core
+            .handles
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        for handle in handles {
+            handle.force_request.notify_waiters();
+        }
         let tasks: Vec<_> = self
             .core
             .tasks
@@ -278,11 +292,14 @@ impl PluginSupervisor {
             .drain()
             .map(|(_, task)| task)
             .collect();
-        for task in &tasks {
-            task.abort();
-        }
-        for task in tasks {
-            let _ = task.await;
+        let deadline = tokio::time::Instant::now() + self.core.cfg.shutdown_timeout;
+        for mut task in tasks {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, &mut task).await.is_err() {
+                tracing::error!("插件生命周期任务未能在强制关停期限内完成");
+                task.abort();
+                let _ = task.await;
+            }
         }
         for record in self.core.registry.all() {
             self.core.registry.clear_conn(&record.manifest.name);
@@ -589,6 +606,11 @@ async fn monitor_instance(
                     kill_and_reap(&mut inst.child).await;
                 }
                 // 兜底：等待窗口内未退出则 SIGKILL，并统一收尾。
+                finalize_stopped(core, &mut inst, &name).await;
+                return Trigger::Stopped;
+            }
+            _ = inst.handle.force_request.notified() => {
+                // 强制路径也必须走同一套显式回收逻辑，不能直接丢弃 Child。
                 finalize_stopped(core, &mut inst, &name).await;
                 return Trigger::Stopped;
             }

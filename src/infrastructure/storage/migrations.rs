@@ -938,8 +938,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_external_id
-    ON conversations(external_id);
+-- 会话外部 ID 只在会话类型内唯一；同一个平台 ID 可能同时是私聊用户号和群号。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_external_type
+    ON conversations(external_id, conversation_type);
 
 -- Character ↔ Conversation bindings
 CREATE TABLE IF NOT EXISTS conversation_bindings (
