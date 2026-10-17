@@ -402,9 +402,8 @@ impl MessageRepository for SqliteMessageRepository {
         platform_message_id: i64,
     ) -> Result<bool, RepositoryError> {
         let mut tx = self.pool.begin().await?;
-        let task: Option<(i64, Option<String>, i64, Option<i64>)> = sqlx::query_as(
-            r#"SELECT task.character_id, task.content, message.conversation_id,
-                       message.conversation_sequence
+        let task: Option<(i64, Option<String>, i64)> = sqlx::query_as(
+            r#"SELECT task.character_id, task.content, message.conversation_id
                   FROM reply_tasks task
                   JOIN messages message ON message.id = task.message_id
                  WHERE task.message_id = ? AND task.status = 'unknown'"#,
@@ -412,7 +411,7 @@ impl MessageRepository for SqliteMessageRepository {
         .bind(message_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((character_id, content, conversation_id, conversation_sequence)) = task else {
+        let Some((character_id, content, conversation_id)) = task else {
             tx.rollback().await?;
             return Ok(false);
         };
@@ -434,6 +433,15 @@ impl MessageRepository for SqliteMessageRepository {
         }
 
         if let Some(content) = content {
+            // 核查确认只补写 assistant 历史，不应复用入站消息的序号。
+            // 重新从会话计数器分配一个新的顺序号，避免历史排序、批次冻结
+            // 和后续 outbox 顺序被确认路径破坏。
+            let assistant_sequence: i64 = sqlx::query_scalar(
+                "UPDATE conversations SET sequence_counter = COALESCE(sequence_counter, 0) + 1 WHERE id = ? RETURNING sequence_counter",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await?;
             let external_id = format!("character:{character_id}");
             sqlx::query(
                 r#"INSERT OR IGNORE INTO participants
@@ -483,7 +491,7 @@ impl MessageRepository for SqliteMessageRepository {
             )
             .bind(character_id)
             .bind(platform_message_id)
-            .bind(conversation_sequence)
+            .bind(assistant_sequence)
             .bind(chrono::Utc::now().to_rfc3339())
             .bind(chrono::Utc::now().to_rfc3339())
             .bind(conversation_id)

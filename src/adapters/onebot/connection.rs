@@ -163,15 +163,32 @@ impl ConnectionShared {
     ///
     /// 如果请求已超时被清理，返回 false。
     pub fn complete_request(&self, id: u64, response: ActionResponse) -> bool {
-        if let Some(req) = self.pending.lock().unwrap().remove(&id) {
+        let mut pending = self.pending.lock().unwrap();
+        let Some(req) = pending.get(&id) else {
+            tracing::warn!(target: "adapter", id, "response received for unknown or timed-out request");
+            return false;
+        };
+        // OneBot 11 的部分实现省略 action 字段，因此空 action 仍按 echo
+        // 关联；如果平台明确返回了不同动作，必须保留 pending，等待正确回执
+        // 或请求超时，不能把别的请求结果交给当前发送者。
+        if !response.action.is_empty() && response.action != req.action {
+            tracing::warn!(
+                target: "adapter",
+                id,
+                expected_action = %req.action,
+                response_action = %response.action,
+                "响应动作与请求不匹配，忽略响应"
+            );
+            return false;
+        }
+        let req = pending.remove(&id).expect("pending 请求刚刚确认存在");
+        drop(pending);
+        {
             // 通知已等待的调用方。
             // 如果接收端已被 drop（调用方超时），send 会失败但这是正常现象。
             let _ = req.response_tx.send(response);
             tracing::debug!(target: "adapter", id, "pending request completed");
             true
-        } else {
-            tracing::warn!(target: "adapter", id, "response received for unknown or timed-out request");
-            false
         }
     }
 
@@ -609,6 +626,50 @@ mod tests {
         response.status = "ok".into();
         response.retcode = Some(1);
         assert!(!response.is_ok());
+    }
+
+    #[test]
+    fn mismatched_action_does_not_consume_pending_request() {
+        let bus = crate::application::event_bus::EventBus::new();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let (response_tx, _response_rx) = mpsc::channel(1);
+        let shared = ConnectionShared {
+            state: Arc::new(Mutex::new(OneBotConnectionState::Connected)),
+            bus,
+            outbound_tx,
+            response_tx,
+            pending: Arc::new(StdMutex::new(HashMap::new())),
+            request_id_counter: Arc::new(AtomicU64::new(1)),
+            request_timeout_secs: 10,
+        };
+        let (id, mut response_rx) = shared.insert_pending("send_group_msg".into());
+
+        assert!(!shared.complete_request(
+            id,
+            ActionResponse {
+                id,
+                action: "get_msg".into(),
+                status: "ok".into(),
+                retcode: Some(0),
+                data: None,
+                error: None,
+            }
+        ));
+        assert_eq!(shared.pending.lock().unwrap().len(), 1);
+
+        assert!(shared.complete_request(
+            id,
+            ActionResponse {
+                id,
+                action: "send_group_msg".into(),
+                status: "ok".into(),
+                retcode: Some(0),
+                data: None,
+                error: None,
+            }
+        ));
+        assert!(response_rx.try_recv().is_ok());
+        assert!(shared.pending.lock().unwrap().is_empty());
     }
 
     // ------------------------------------------------------------------

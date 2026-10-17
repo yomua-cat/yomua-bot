@@ -660,6 +660,19 @@ mod storage_tests {
             .assistant_history_exists(conversation_id, message_id)
             .await
             .unwrap());
+        let assistant_sequence: Option<i64> = sqlx::query_scalar(
+            "SELECT conversation_sequence FROM messages WHERE conversation_id = ? AND json_extract(metadata, '$.reply_task') = ? AND json_extract(metadata, '$.author_kind') = 'assistant'",
+        )
+        .bind(conversation_id)
+        .bind(message_id)
+        .fetch_optional(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            assistant_sequence,
+            Some(1),
+            "确认路径必须分配新的会话顺序号"
+        );
     }
 
     #[tokio::test]
