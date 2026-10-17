@@ -2119,10 +2119,10 @@ async fn test_character_card_reassign_rollback_on_nonexistent_target() {
     assert!(old_state.is_some(), "旧 ID 的 character_state 应该仍然存在");
 }
 
-/// 验证真实 mid-transaction rollback：故障注入发生在第 3 个 UPDATE 成功后。
+/// 验证真实 mid-transaction rollback：数据库触发器在第 3 个 UPDATE 时失败。
 /// 测试确保：
-/// 1. 前 3 个 UPDATE 已经成功执行
-/// 2. 故障注入触发 ROLLBACK
+/// 1. 前两个 UPDATE 已经成功执行
+/// 2. 数据库错误触发 ROLLBACK
 /// 3. 通过独立 connection 验证数据库状态未改变
 /// 4. FK 状态在 connection 归还前已恢复
 #[tokio::test]
@@ -2275,25 +2275,35 @@ async fn test_character_card_reassign_mid_transaction_rollback() {
         .await
         .expect("插入 memory 失败");
 
-    // ========== 故障注入：第 3 个 UPDATE 后失败 ==========
+    // ========== 故障注入：第 3 个 UPDATE 失败 ==========
     // UPDATE 顺序：
     // 1. messages.active_character_id
     // 2. conversation_bindings.character_id
-    // 3. character_states.character_id  <-- 在此之后注入故障
+    // 3. character_states.character_id  <-- 由触发器注入故障
     // 4. memories.character_id
     // ...
     let new_id = old_id + 1000;
 
-    // 设置环境变量触发故障注入
-    std::env::set_var("YOMUA_TEST_FAIL_AFTER", "3");
+    // 使用数据库触发器注入故障，避免通过进程级环境变量污染并行测试。
+    sqlx::query(&format!(
+        "CREATE TRIGGER test_reassign_failure BEFORE UPDATE OF character_id ON character_states
+         WHEN OLD.character_id = {old_id}
+         BEGIN SELECT RAISE(ABORT, '测试故障：character_states 更新失败'); END"
+    ))
+    .execute(&pool)
+    .await
+    .expect("创建故障注入触发器失败");
     let result = char_svc.reassign_id(old_id, new_id).await;
-    std::env::remove_var("YOMUA_TEST_FAIL_AFTER");
+    sqlx::query("DROP TRIGGER test_reassign_failure")
+        .execute(&pool)
+        .await
+        .expect("删除故障注入触发器失败");
 
     // 验证返回了错误
     assert!(result.is_err(), "应该返回错误（故障注入）");
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("测试故障"),
+        err_msg.contains("测试故障") || err_msg.contains("character_states"),
         "错误信息应该包含测试故障标记，实际: {}",
         err_msg
     );

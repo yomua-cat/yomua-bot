@@ -840,6 +840,32 @@ impl MessageRepository for SqliteMessageRepository {
         Ok(messages)
     }
 
+    async fn find_after_sequence(
+        &self,
+        conversation_id: i64,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<Vec<Message>, RepositoryError> {
+        let rows: Vec<MessageRow> = sqlx::query_as(
+            r#"SELECT id, conversation_id, sender_id, content, timestamp,
+                    reply_to, mentions, attachments, metadata, active_character_id,
+                    platform_message_id, conversation_sequence,
+                    occurred_at, ingested_at
+               FROM messages
+               WHERE conversation_id = ?
+                 AND conversation_sequence > ?
+               ORDER BY conversation_sequence ASC, id ASC
+               LIMIT ?"#,
+        )
+        .bind(conversation_id)
+        .bind(after_sequence)
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(parse_message_row).collect()
+    }
+
     async fn accept_message(
         &self,
         input: &AcceptedMessageInput,

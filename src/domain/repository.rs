@@ -601,6 +601,21 @@ pub trait MessageRepository: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// 检索指定 Conversation 中某个入口序号之后的消息，按入口序号升序返回。
+    ///
+    /// 回复批次冻结必须从当前事件之后读取，而不能先取“最近 N 条”再过滤；
+    /// 否则高流量会话中的历史噪声可能把真正的连续消息挤出候选集。
+    /// 默认实现供轻量测试仓储使用，生产 SQLite 仓储覆盖此方法。
+    async fn find_after_sequence(
+        &self,
+        conversation_id: i64,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<Vec<Message>, RepositoryError> {
+        let _ = (conversation_id, after_sequence, limit);
+        Ok(Vec::new())
+    }
+
     /// 接受一条消息：在单一事务内分配 sequence、生成 identity 并插入。
     ///
     /// 这是 C2-3 Temporal Architecture 的核心操作，保证：

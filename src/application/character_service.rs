@@ -1,7 +1,6 @@
 //! 角色卡服务 —— 角色全局状态与 ID 操作.
 
 use sqlx::{Acquire, SqlitePool};
-use std::env;
 
 use crate::error::RuntimeError;
 
@@ -149,36 +148,14 @@ impl CharacterService {
             ("characters", "id"),
         ];
 
-        // 读取测试故障注入配置（环境变量，仅测试环境使用）
-        let fail_after: Option<usize> = env::var("YOMUA_TEST_FAIL_AFTER")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok());
-
         // 执行所有 ID 重写
-        for (idx, (tbl, col)) in tables.iter().enumerate() {
+        for (tbl, col) in tables.iter() {
             let q = format!("UPDATE {} SET {} = ? WHERE {} = ?", tbl, col, col);
             let update_result = sqlx::query(&q)
                 .bind(new_id)
                 .bind(old_id)
                 .execute(&mut *tx)
                 .await;
-
-            // 检查是否是测试故障注入点（UPDATE 已经成功）
-            if let Some(fail_after_n) = fail_after {
-                if idx + 1 == fail_after_n {
-                    // UPDATE 已成功，现在注入错误触发 rollback
-                    let _ = tx.rollback().await;
-                    // 恢复 FK 状态后返回错误
-                    let _ = sqlx::query("PRAGMA foreign_keys = ON")
-                        .execute(&mut *conn)
-                        .await;
-                    return Err(RuntimeError::Internal(format!(
-                        "测试故障：第 {} 个 UPDATE({}) 已成功，注入错误",
-                        idx + 1,
-                        tbl
-                    )));
-                }
-            }
 
             if let Err(e) = update_result {
                 // 出错时回滚并恢复 FK

@@ -15,14 +15,14 @@
 - `cargo check --locked --all-targets --offline`：通过。
 - `cargo test --locked --all-targets --no-run --offline`：通过编译检查。
 - `cargo fmt --all -- --check`：通过。
-- `cargo test --locked --all-targets`：库 440 个、主程序 5 个、ctl 38 个、alpha 集成 8 个、控制集成 83 个通过；插件 Unix socket 测试按 `#[ignore]` 标记跳过。
+- `cargo test --locked --all-targets --offline`：库 458 个、主程序 5 个、ctl 39 个、alpha 集成 8 个、控制集成 84 个通过；15 个插件 Unix socket 测试按 `#[ignore]` 标记跳过。
 - `cargo test --locked --lib infrastructure::plugin::transport::tests --offline -- --ignored --test-threads=1`：15 个插件 Unix socket 测试全部通过。
 - 临时 Unix socket 模拟服务配合真实 `yomua-bot-ctl status --raw`：通过，确认发送的是版本化 `ControlEnvelope`，不含旧 `cmd` 字段。
 - CLI 解析测试：覆盖一段、二段、三段命令、短别名归一化和危险命令确认。
 - SQLite 存储测试：覆盖平台消息去重、稳定用户关系、角色归属历史和记忆可见范围。
 - 配置模板验证：首次启动在临时目录生成 `runtime.toml`、`onebot.toml`、`llm.toml`、`decision.toml`；可选 OneBot 字段留空时仍可解析，真实配置密钥未参与验证。
 
-本次核查的基线为：库 440 个通过、主程序 5 个、ctl 38 个、alpha 集成 8 个、控制集成 83 个；另有 15 个插件 Unix socket 测试在普通全目标测试中按 `#[ignore]` 跳过，并通过显式 `--ignored` 运行。
+本次核查的基线为：库 458 个通过、主程序 5 个、ctl 39 个、alpha 集成 8 个、控制集成 84 个；另有 15 个插件 Unix socket 测试在普通全目标测试中按 `#[ignore]` 跳过。插件 socket 的显式运行结果沿用此前记录，本次未重新执行。
 
 ## 已实现的重点行为
 
@@ -67,7 +67,7 @@
 
 ## 当前限制和未完成项
 
-- 连续消息在回复任务边界冻结：普通消息等待 1.5 秒，@ 消息等待 0.5 秒；原消息逐条保存，生成期间新消息留给下一轮。仍需用真实 OneBot 流量验证时序和体验。
+- 连续消息在回复任务边界冻结：普通消息等待 1.5 秒，@ 消息等待 0.5 秒；从当前消息的会话序号之后读取候选，避免旧历史挤出新消息；原消息逐条保存，生成期间新消息留给下一轮。当前没有独立持久化的批次实体，仍需用真实 OneBot 流量验证时序和体验。
 - `unknown` 发送结果记录为终态并等待核查。先执行 `reply unknown list`；有平台消息 ID 时再执行 `reply unknown check <消息ID>`。平台明确返回未找到时会自动重新排队；没有平台消息 ID 或查询失败都不能当作未发送证明，此时才使用 `reply unknown retry <消息ID> --confirm`。
 - 记忆候选的自动后台确认、自然语言修改请求消费和矛盾修订尚未完成；当前 ctl 提供摘要查询、显式原文读取、删除、修改请求登记，以及跨会话隐私策略的请求、确认和取消。
 - 世界书暂不参与上下文组装。
@@ -92,7 +92,7 @@ cargo clippy --locked --offline --all-targets --all-features -- -D warnings
 
 ## 后续源码整顿顺序
 
-1. 建立持久化回复批次，完成连续消息聚合和生成期间的下一轮隔离。
+1. 评估是否需要持久化回复批次，并补齐批次冻结与进程重启之间的故障注入测试。
 2. 完成记忆候选确认、来源、修订和隐私禁用流程。
 3. 补齐配置热重载、统一关停和插件进程级测试。
 4. 将结构化控制协议纳入真实 ctl 子进程测试，再提升 CI 门槛。

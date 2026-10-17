@@ -788,6 +788,105 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn find_after_sequence_is_not_displaced_by_old_history_noise() {
+        let storage = setup_storage().await;
+        let conversation_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let message_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let character_id: i64 =
+            sqlx::query_scalar("INSERT INTO characters(name) VALUES('批次冻结角色') RETURNING id")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let conversation_id = conversation_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Group,
+                external_id: "batch-freeze-noise".into(),
+                name: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let sender_id: i64 = sqlx::query_scalar(
+            "INSERT INTO participants(conversation_id,external_id,display_name,role,metadata) VALUES(?,?,?,?,?) RETURNING id",
+        )
+        .bind(conversation_id)
+        .bind("batch-user")
+        .bind("批次用户")
+        .bind("user")
+        .bind("{}")
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+
+        let pool = storage.pool().clone();
+        let accept = |sequence_hint: i64, text: &str, platform_message_id: i64| {
+            let pool = pool.clone();
+            let text = text.to_string();
+            async move {
+                let now = chrono::Utc::now();
+                let repo =
+                    crate::infrastructure::storage::repository::SqliteMessageRepository::new(pool);
+                let metadata = serde_json::json!({
+                    "author_kind": "user",
+                    "external_sender_id": "batch-user",
+                });
+                let payload = serde_json::json!({
+                    "event_uuid": format!("batch-freeze-{sequence_hint}"),
+                    "conversation_id": conversation_id,
+                    "sender_id": sender_id,
+                    "message_id": 0,
+                    "content": text,
+                    "timestamp": now,
+                    "is_mentioned": false,
+                    "character_id": character_id,
+                    "conversation_sequence": 0,
+                    "platform_message_id": platform_message_id,
+                    "ingested_at": now,
+                    "metadata": metadata,
+                });
+                repo.accept_message(&AcceptedMessageInput {
+                    conversation_id,
+                    sender_id,
+                    content_json: serde_json::json!({"Text": text}).to_string(),
+                    timestamp: now.to_rfc3339(),
+                    platform_message_id: Some(platform_message_id),
+                    character_id,
+                    event_uuid: format!("batch-freeze-event-{sequence_hint}"),
+                    outbox_payload: payload.to_string(),
+                })
+                .await
+                .unwrap()
+            }
+        };
+
+        // 旧历史超过原先的“最近 20 条”窗口，不能影响当前消息之后的候选。
+        for index in 0..30 {
+            accept(index, &format!("旧历史 {index}"), 10_000 + index).await;
+        }
+        let current = accept(30, "当前消息", 10_030).await;
+        let next = accept(31, "后续一", 10_031).await;
+        let next_two = accept(32, "后续二", 10_032).await;
+
+        let messages = message_repo
+            .find_after_sequence(conversation_id, current.1, 20)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].id, next.0);
+        assert_eq!(messages[1].id, next_two.0);
+        assert!(messages
+            .iter()
+            .all(|message| message.conversation_sequence.unwrap() > current.1));
+    }
+
+    #[tokio::test]
     async fn message_acceptance_publishes_one_canonical_event_for_duplicate_delivery() {
         let storage = setup_storage().await;
         let conv_repo =

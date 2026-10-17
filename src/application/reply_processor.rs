@@ -126,21 +126,24 @@ impl ReplyProcessor {
         };
         self.delay_executor.delay(wait_ms).await;
         let deadline = event.ingested_at + chrono::Duration::milliseconds(wait_ms as i64);
-        let messages = repo
-            .find_recent(event.conversation_id, MAX_BATCH_MESSAGES as i64)
-            .await?;
-        let mut ordered = messages;
-        ordered.sort_by_key(|message| message.conversation_sequence.unwrap_or(i64::MAX));
+        let ordered = if event.message_id > 0 && event.conversation_sequence > 0 {
+            repo.find_after_sequence(
+                event.conversation_id,
+                event.conversation_sequence,
+                MAX_BATCH_MESSAGES as i64,
+            )
+            .await?
+        } else {
+            let mut messages = repo
+                .find_recent(event.conversation_id, MAX_BATCH_MESSAGES as i64)
+                .await?;
+            messages.sort_by_key(|message| message.conversation_sequence.unwrap_or(i64::MAX));
+            messages
+        };
         let mut batch = Vec::new();
-        let mut found_current = event.message_id == 0;
         for message in ordered {
             let sequence = message.conversation_sequence.unwrap_or(i64::MAX);
-            if event.message_id > 0 && message.id == event.message_id {
-                found_current = true;
-                batch.push(message);
-                continue;
-            }
-            if !found_current || sequence <= event.conversation_sequence {
+            if event.message_id > 0 && sequence <= event.conversation_sequence {
                 continue;
             }
             if message.ingested_at.is_some_and(|at| at > deadline) {
@@ -152,7 +155,7 @@ impl ReplyProcessor {
                 .and_then(|value| value.as_str())
                 .unwrap_or("user");
             if author_kind != "user" {
-                continue;
+                break;
             }
             if message.sender_id != event.sender_id
                 || message.active_character_id != Some(event.character_id)
@@ -180,14 +183,14 @@ impl ReplyProcessor {
                 additional_messages,
             });
         }
-        if batch.len() <= 1 {
+        if batch.is_empty() {
             return Ok(FrozenBatch {
                 content: event.content.clone(),
                 additional_messages: Vec::new(),
             });
         }
 
-        let mut combined = Vec::new();
+        let mut combined = vec![event.content.clone()];
         let mut additional_messages = Vec::new();
         for message in batch.iter() {
             if let crate::domain::message::MessageContent::Text(text) = &message.content {
@@ -195,11 +198,9 @@ impl ReplyProcessor {
                     combined.push(text.trim().to_string());
                 }
             }
-            if message.id != event.message_id {
-                self.mark_task_ignored_if_pending(message.id, event.character_id)
-                    .await?;
-                additional_messages.push(message.clone());
-            }
+            self.mark_task_ignored_if_pending(message.id, event.character_id)
+                .await?;
+            additional_messages.push(message.clone());
         }
         let combined = combine_batch_contents(combined);
         Ok(FrozenBatch {
