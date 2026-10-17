@@ -64,7 +64,7 @@ ctl 按命令校验参数：选项只对声明的命令开放，`status --energy
 | `character show <id> [--raw]` | 角色详情 |
 | `conversation list [--raw]` | 会话列表；交互输入可用 `ss list` |
 | `character state get <角色ID> [--conversation <ID>] [--raw]` | 全局或会话状态；交互输入可用 `st get` |
-| `character state set --character <ID> [--conversation <ID>] [--energy N] [--stress N] [--mood N] [--activity 文本] --confirm` | 状态修改；会话范围 mood 与全局 activity 各有作用域 |
+| `character state set [<角色ID>] [--character <ID>] [--conversation <ID>] [--energy N] [--stress N] [--mood N] [--activity 文本] --confirm` | 状态修改；角色 ID 可用位置参数或 `--character`，会话范围 mood 与全局 activity 各有作用域 |
 | `character state refresh [--raw]` | 更新全局状态时间戳 |
 | `blacklist list` | 已存储的黑名单列表 |
 | `blacklist add <外部用户ID> [--reason 文本] --confirm` | 添加用户黑名单记录 |

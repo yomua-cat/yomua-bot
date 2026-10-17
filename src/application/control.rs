@@ -383,8 +383,9 @@ fn handle_shutdown(handle: &RuntimeHandle, id: u64, _params: serde_json::Value) 
         if let Some(result) = handle.shutdown_result.read().await.clone() {
             return Ok(ControlResponse::ok(id, result));
         }
-        let wait_for =
-            Duration::from_secs(handle.effective_config().shutdown_timeout_secs.max(1) + 5);
+        let wait_for = Duration::from_secs(control_shutdown_wait_secs(
+            handle.effective_config().shutdown_timeout_secs,
+        ));
         if tokio::time::timeout(wait_for, completed).await.is_err() {
             return Ok(ControlResponse::ok(
                 id,
@@ -2804,8 +2805,11 @@ async fn run_control_server(
         }
     }
 
-    // 已接受的 shutdown 命令有机会写完应答；其余连接受整体关停时限约束。
-    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+    // 已接受的 shutdown 命令有机会写完应答；其余连接受运行时关停时限约束。
+    // 固定 5 秒会在配置的关停时限更长时提前丢弃 shutdown 响应，客户端只能看到断连。
+    let shutdown_wait_secs =
+        control_shutdown_wait_secs(handle.effective_config().shutdown_timeout_secs);
+    let _ = tokio::time::timeout(Duration::from_secs(shutdown_wait_secs), async {
         while connections.join_next().await.is_some() {}
     })
     .await;
@@ -2988,6 +2992,10 @@ pub const CONTROL_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
 // 先由服务端读超时。命令处理保留少量响应写入余量。
 pub const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(50);
 pub const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(40);
+
+fn control_shutdown_wait_secs(configured_secs: u64) -> u64 {
+    configured_secs.max(1).saturating_add(5)
+}
 
 pub async fn read_control_json<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
     reader: &mut R,
@@ -3214,6 +3222,13 @@ mod transport_tests {
     fn control_timeouts_leave_room_for_client_response() {
         assert!(CONTROL_IO_TIMEOUT > Duration::from_secs(45));
         assert!(CONTROL_COMMAND_TIMEOUT < Duration::from_secs(45));
+    }
+
+    #[test]
+    fn shutdown_wait_uses_configured_timeout_with_response_margin() {
+        assert_eq!(control_shutdown_wait_secs(0), 6);
+        assert_eq!(control_shutdown_wait_secs(10), 15);
+        assert_eq!(control_shutdown_wait_secs(u64::MAX), u64::MAX);
     }
 
     #[test]
