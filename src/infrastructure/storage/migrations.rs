@@ -608,7 +608,8 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
                     WHEN json_valid(metadata) THEN metadata ELSE '{}'
                   END, '$.stable_user_key', external_id)
             WHERE role = 'user'
-              AND json_extract(metadata, '$.stable_user_key') IS NULL"#,
+              AND CASE WHEN json_valid(metadata)
+                       THEN json_extract(metadata, '$.stable_user_key') END IS NULL"#,
     )
     .execute(pool)
     .await
@@ -670,8 +671,8 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
     // 旧数据没有平台字段时按现有 OneBot 适配器命名空间回填；未来适配器必须显式写入平台。
     sqlx::query(
         r#"INSERT OR IGNORE INTO users(platform, external_id)
-           SELECT COALESCE(NULLIF(json_extract(metadata, '$.platform'), ''), 'onebot_qq'),
-                  COALESCE(NULLIF(json_extract(metadata, '$.stable_user_key'), ''), external_id)
+           SELECT COALESCE(NULLIF(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.platform') END, ''), 'onebot_qq'),
+                  COALESCE(NULLIF(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.stable_user_key') END, ''), external_id)
              FROM participants
             WHERE role='user'"#,
     )
@@ -682,11 +683,11 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
         r#"UPDATE participants
               SET user_id = (
                   SELECT u.id FROM users u
-                   WHERE u.platform = COALESCE(NULLIF(json_extract(participants.metadata, '$.platform'), ''), 'onebot_qq')
-                     AND u.external_id = COALESCE(NULLIF(json_extract(participants.metadata, '$.stable_user_key'), ''), participants.external_id)
+                   WHERE u.platform = COALESCE(NULLIF(CASE WHEN json_valid(participants.metadata) THEN json_extract(participants.metadata, '$.platform') END, ''), 'onebot_qq')
+                     AND u.external_id = COALESCE(NULLIF(CASE WHEN json_valid(participants.metadata) THEN json_extract(participants.metadata, '$.stable_user_key') END, ''), participants.external_id)
               ),
                   metadata = json_set(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
-                                      '$.platform', COALESCE(NULLIF(json_extract(metadata, '$.platform'), ''), 'onebot_qq'))
+                                      '$.platform', COALESCE(NULLIF(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.platform') END, ''), 'onebot_qq'))
             WHERE role='user' AND user_id IS NULL"#,
     )
     .execute(pool)
@@ -709,9 +710,11 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
     sqlx::query(
         r#"UPDATE memories
               SET user_id = (SELECT p.user_id FROM participants p
-                               WHERE p.id = json_extract(memories.metadata, '$.source_participant_id'))
+                               WHERE p.id = CASE WHEN json_valid(memories.metadata)
+                                                 THEN json_extract(memories.metadata, '$.source_participant_id') END)
             WHERE user_id IS NULL
-              AND json_extract(metadata, '$.source_participant_id') IS NOT NULL"#,
+              AND CASE WHEN json_valid(metadata)
+                       THEN json_extract(metadata, '$.source_participant_id') END IS NOT NULL"#,
     )
     .execute(pool)
     .await

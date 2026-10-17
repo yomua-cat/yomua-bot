@@ -2615,6 +2615,67 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn migration_tolerates_invalid_legacy_metadata_without_wrong_user_mapping() {
+        let storage = setup_storage().await;
+        let conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type,external_id) VALUES('group','invalid-metadata') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let participant_id: i64 = sqlx::query_scalar(
+            "INSERT INTO participants(conversation_id,external_id,display_name,role,metadata) VALUES(?, 'legacy-user', '旧用户', 'user', '{}') RETURNING id",
+        )
+        .bind(conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        sqlx::query("DROP TRIGGER participants_fill_user_identity_on_update")
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE participants SET user_id=NULL, metadata=? WHERE id=?")
+            .bind(serde_json::json!({"stable_user_key":"different-account"}).to_string())
+            .bind(participant_id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        storage.migrate().await.expect("可解析的稳定键应正常回填");
+        let parsed_user_id: i64 = sqlx::query_scalar("SELECT user_id FROM participants WHERE id=?")
+            .bind(participant_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+
+        sqlx::query("UPDATE participants SET user_id=NULL, metadata='not-json' WHERE id=?")
+            .bind(participant_id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        storage
+            .migrate()
+            .await
+            .expect("损坏的旧 metadata 不应中断迁移");
+
+        let mapped_user_id: i64 = sqlx::query_scalar("SELECT user_id FROM participants WHERE id=?")
+            .bind(participant_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        let identity: (String, String) =
+            sqlx::query_as("SELECT platform, external_id FROM users WHERE id=?")
+                .bind(mapped_user_id)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_ne!(mapped_user_id, parsed_user_id);
+        assert_eq!(
+            identity,
+            ("onebot_qq".to_string(), "legacy-user".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn migration_merges_legacy_relationship_interactions_by_global_user() {
         let storage = setup_storage().await;
         let char_id: i64 =

@@ -23,7 +23,9 @@ use crate::domain::message::Message;
 use crate::domain::repository::CharacterBindingRepository;
 use crate::domain::repository::{MemoryRepository, MessageRepository};
 use crate::error::RuntimeError;
-use crate::infrastructure::llm::{LlmMessage, LlmRequest, LlmRole};
+use crate::infrastructure::llm::{
+    ApproximateTokenEstimator, LlmMessage, LlmRequest, LlmRole, ModelCapabilities, TokenEstimator,
+};
 
 /// 认知驱动的默认 tick 间隔（5 分钟）。
 const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(300);
@@ -33,6 +35,16 @@ const DEFAULT_COOLDOWN: Duration = Duration::from_secs(600);
 
 /// 认知驱动的默认 idle 阈值（5 分钟无新消息则视为 idle）。
 const DEFAULT_IDLE_THRESHOLD: Duration = Duration::from_secs(300);
+
+/// 认知摘要的最大输出预算。
+///
+/// 认知只保存一段短摘要，不应占用对话任务的输出额度。实际请求会再受
+/// cognition 路由中模型能力的上限约束。
+const COGNITION_OUTPUT_RESERVATION: usize = 256;
+
+/// 单次认知从仓储读取的候选消息上限。最终送给模型的消息数量由上下文预算决定。
+/// 该上限只保护后台任务的内存使用，不能替代上下文预算。
+const COGNITION_CANDIDATE_LIMIT: i64 = 256;
 
 /// 冷却时间映射 —— 冷却边界是“角色 × 会话”，避免一个会话阻塞同角色的其他会话。
 type CooldownMap = RwLock<HashMap<(i64, i64), DateTime<Utc>>>;
@@ -256,7 +268,12 @@ impl CognitionDriver {
         };
         let recent_messages = match self
             .message_repo
-            .find_cognition_batch(binding.character_id, binding.conversation_id, watermark, 40)
+            .find_cognition_batch(
+                binding.character_id,
+                binding.conversation_id,
+                watermark,
+                COGNITION_CANDIDATE_LIMIT,
+            )
             .await
         {
             Ok(messages) => messages,
@@ -272,11 +289,34 @@ impl CognitionDriver {
             }
             Err(e) => return Err(RuntimeError::Repository(e)),
         };
-        let Some(last_message) = recent_messages.last() else {
+        if recent_messages.is_empty() {
             return Ok(());
-        };
+        }
 
-        let prompt = self.build_cognition_prompt(&character, &recent_messages);
+        let capabilities = self
+            .llm_scheduler
+            .capabilities_for("cognition")
+            .ok_or_else(|| {
+                RuntimeError::Llm(
+                    "认知模型未提供 context_window，无法安全计算认知上下文预算".into(),
+                )
+            })?;
+        let output_reservation = capabilities
+            .max_output_tokens()
+            .unwrap_or(COGNITION_OUTPUT_RESERVATION)
+            .min(COGNITION_OUTPUT_RESERVATION);
+        let (prompt, selected_messages) = self
+            .build_budgeted_cognition_prompt(
+                &character,
+                &recent_messages,
+                &capabilities,
+                output_reservation,
+            )
+            .map_err(RuntimeError::Llm)?;
+        let processed_through = selected_messages
+            .last()
+            .expect("预算裁剪必须至少保留一条消息")
+            .id;
 
         // 调用 LLM。
         let request = LlmRequest {
@@ -287,7 +327,10 @@ impl CognitionDriver {
             }],
             model: None,
             temperature: Some(0.7),
-            max_tokens: Some(256),
+            max_tokens: Some(
+                u32::try_from(output_reservation)
+                    .map_err(|_| RuntimeError::Llm("认知输出预算超过协议上限".into()))?,
+            ),
             priority: 3, // P3，后台任务
             metadata: serde_json::json!({
                 "character_id": binding.character_id,
@@ -316,7 +359,7 @@ impl CognitionDriver {
                     binding.character_id,
                     binding.conversation_id,
                     watermark,
-                    last_message.id,
+                    processed_through,
                     &[],
                 )
                 .await
@@ -339,12 +382,12 @@ impl CognitionDriver {
         );
         memory.embedding = embedding.and_then(|v| serde_json::to_string(&v).ok());
         memory.metadata = serde_json::json!({
-            "source_message_ids": recent_messages.iter().map(|m| m.id).collect::<Vec<_>>(),
-            "source_participant_ids": recent_messages.iter().map(|m| m.sender_id).collect::<Vec<_>>(),
+            "source_message_ids": selected_messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            "source_participant_ids": selected_messages.iter().map(|m| m.sender_id).collect::<Vec<_>>(),
             "source_conversation_id": binding.conversation_id,
-            "source_occurred_at": recent_messages
+            "source_occurred_at": selected_messages
                 .iter()
-                .filter_map(|m| m.occurred_at.or(Some(m.timestamp)))
+            .filter_map(|m| m.occurred_at.or(Some(m.timestamp)))
                 .next(),
             "visibility": "conversation",
             "shared": false,
@@ -359,7 +402,7 @@ impl CognitionDriver {
                 binding.character_id,
                 binding.conversation_id,
                 watermark,
-                last_message.id,
+                processed_through,
                 &[memory],
             )
             .await
@@ -417,6 +460,61 @@ impl CognitionDriver {
              === 最近对话 ===\n{}\n\n=== 认知 ===",
             character.definition.name, dialogue
         )
+    }
+
+    /// 根据认知模型的实际能力裁剪历史，保留连续的未处理消息和固定认知指令。
+    ///
+    /// 仓储返回的消息按时间升序排列。从最早的未处理消息开始选择连续批次，
+    /// 这样预算不足时不会越过未送入模型的消息推进处理进度。连第一条都无法
+    /// 容纳时直接失败，调用方不会提交 cognition_progress，下一轮仍可重试。
+    fn build_budgeted_cognition_prompt(
+        &self,
+        character: &crate::domain::character::Character,
+        recent_messages: &[Message],
+        capabilities: &crate::infrastructure::llm::FixedModelCapabilities,
+        output_reservation: usize,
+    ) -> Result<(String, Vec<Message>), String> {
+        let context_window = capabilities
+            .context_window()
+            .ok_or_else(|| "认知模型未提供 context_window".to_string())?;
+        if output_reservation >= context_window {
+            return Err(format!(
+                "认知模型上下文窗口 {context_window} 小于等于输出预算 {output_reservation}"
+            ));
+        }
+
+        let estimator = ApproximateTokenEstimator;
+        let available_budget = context_window - output_reservation;
+        let system_tokens = character
+            .definition
+            .system_prompt
+            .as_ref()
+            .map(|prompt| estimator.estimate_text(prompt))
+            .unwrap_or(0);
+
+        let mut selected = Vec::new();
+        let mut selected_prompt = String::new();
+        for count in 1..=recent_messages.len() {
+            let candidate = &recent_messages[..count];
+            let prompt = self.build_cognition_prompt(character, candidate);
+            let message = LlmMessage {
+                role: LlmRole::User,
+                content: prompt.clone(),
+            };
+            let estimated = system_tokens + estimator.estimate_message(&message);
+            if estimated > available_budget {
+                break;
+            }
+            selected = candidate.to_vec();
+            selected_prompt = prompt;
+        }
+
+        if selected.is_empty() {
+            return Err(format!(
+                "认知上下文超预算：第一条未处理消息无法放入可用输入预算 {available_budget}"
+            ));
+        }
+        Ok((selected_prompt, selected))
     }
 }
 
@@ -731,6 +829,15 @@ mod tests {
                 truncated: false,
             })
         }
+
+        fn capabilities_for(
+            &self,
+            role: &str,
+        ) -> Option<crate::infrastructure::llm::FixedModelCapabilities> {
+            (role == "cognition").then(|| {
+                crate::infrastructure::llm::FixedModelCapabilities::new(Some(4096), Some(256))
+            })
+        }
     }
 
     fn make_character(id: i64, name: &str) -> Character {
@@ -944,5 +1051,67 @@ mod tests {
 
         // 未启用主动的绑定应在 find_all_enabled 中被过滤掉，不报错。
         driver.tick().await.expect("tick 不应报错");
+    }
+
+    #[test]
+    fn cognition_budget_processes_oldest_contiguous_batch_and_rejects_unfittable_first() {
+        let clock = FakeClock::at(2026, 9, 5, 12, 0);
+        let driver = CognitionDriver::with_config(
+            Arc::new(FakeEmbeddingScheduler),
+            Arc::new(FakeLlmScheduler),
+            Arc::new(FakeMemoryRepo),
+            Arc::new(FakeBindingRepo {
+                bindings: Mutex::new(Vec::new()),
+            }),
+            Arc::new(FakeMessageRepo::new()),
+            Arc::new(FakeCharacterRepo {
+                characters: Mutex::new(HashMap::new()),
+            }),
+            Arc::new(
+                crate::application::character_history::RepositoryCharacterHistoryProvider::new(
+                    Arc::new(FakeMessageRepo::new()),
+                ),
+            ),
+            Arc::new(clock),
+            Duration::from_secs(300),
+            Duration::from_secs(600),
+            Duration::from_secs(300),
+        );
+        let character = make_character(100, "小爱");
+        let messages: Vec<Message> = (1..=20)
+            .map(|id| Message {
+                id,
+                conversation_id: 1,
+                sender_id: 7,
+                content: MessageContent::Text(
+                    "这是一条较长的历史消息，用来验证认知上下文会按序分批处理。".into(),
+                ),
+                timestamp: Utc::now(),
+                reply_to: None,
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+                metadata: serde_json::json!({}),
+                active_character_id: Some(100),
+                platform_message_id: None,
+                conversation_sequence: None,
+                occurred_at: None,
+                ingested_at: None,
+            })
+            .collect();
+        let capabilities =
+            crate::infrastructure::llm::FixedModelCapabilities::new(Some(900), Some(256));
+        let (prompt, selected) = driver
+            .build_budgeted_cognition_prompt(&character, &messages, &capabilities, 256)
+            .expect("第一条未处理消息应能放入预算");
+        assert!(!selected.is_empty());
+        assert_eq!(selected.first().map(|m| m.id), Some(1));
+        assert!(prompt.contains("M") || prompt.contains("这是一条较长的历史消息"));
+        assert!(selected.len() < messages.len());
+
+        let tiny = crate::infrastructure::llm::FixedModelCapabilities::new(Some(260), Some(256));
+        let error = driver
+            .build_budgeted_cognition_prompt(&character, &messages, &tiny, 256)
+            .expect_err("无法容纳第一条未处理消息时必须失败");
+        assert!(error.contains("超预算") || error.contains("上下文窗口"));
     }
 }

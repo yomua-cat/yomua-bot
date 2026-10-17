@@ -166,6 +166,6 @@ budget_tokens = 1024
 
 ## 修改与重载
 
-`reload-config` 会读取并校验 `runtime.toml`、`onebot.toml`、`llm.toml` 和 `decision.toml` 四份配置。只有运行时可热更新字段会整体替换当前运行设置，并同步更新日志过滤器；数据目录、插件目录、OneBot 连接、LLM Provider/模型和决策模型等启动装配项会返回 `restart_required`，当前配置保持不变，需要受控关停后重启。
+`reload-config` 会读取并校验 `runtime.toml`、`onebot.toml`、`llm.toml` 和 `decision.toml` 四份配置。只有运行时可热更新字段会整体替换当前运行设置，并同步更新日志过滤器；数据目录、插件目录、OneBot 连接、LLM Provider/模型、决策模型和 `shutdown_timeout_secs` 等启动装配项会返回 `restart_required`，当前配置保持不变，需要受控关停后重启。关停超时值在启动时被插件监督器等组件读取，不能只更新配置快照。
 
 配置文件可能包含令牌和密钥，全部 TOML 默认忽略，只有根 `Cargo.toml` 入库。提交问题时使用占位值，不粘贴真实配置。

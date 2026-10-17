@@ -793,6 +793,9 @@ impl ConfigurationBundle {
         if self.runtime.default_character_id != next.runtime.default_character_id {
             fields.push("runtime.default_character_id");
         }
+        if self.runtime.shutdown_timeout_secs != next.runtime.shutdown_timeout_secs {
+            fields.push("runtime.shutdown_timeout_secs");
+        }
         if serde_json::to_value(&self.onebot).ok() != serde_json::to_value(&next.onebot).ok() {
             fields.push("onebot");
         }
@@ -937,6 +940,22 @@ mod tests {
             cfg.admin_users,
             Some(vec!["10001".to_string(), "10002".to_string()])
         );
+    }
+
+    #[test]
+    fn shutdown_timeout_change_requires_restart() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("runtime.toml"),
+            "admin_users = [\"test-admin\"]\n",
+        )
+        .unwrap();
+        let current = ConfigurationBundle::load(dir.path()).unwrap();
+        let mut next = current.clone();
+        next.runtime.shutdown_timeout_secs += 1;
+        assert!(current
+            .restart_required(&next)
+            .contains(&"runtime.shutdown_timeout_secs"));
     }
 
     #[test]

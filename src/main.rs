@@ -578,7 +578,6 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
             tracing::warn!(error = %error, "停止插件失败");
         }
         auxiliary_tasks.join().await;
-        storage.close().await;
     };
     let cleanup_timed_out = tokio::time::timeout_at(deadline, cleanup).await.is_err();
     let unfinished_tasks = if cleanup_timed_out {
@@ -592,14 +591,6 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         supervisor
             .force_shutdown_with_timeout(Duration::from_millis(250))
             .await;
-        // cleanup future 可能在 storage.close 前被取消；显式再关一次，
-        // 避免连接池在主流程退出后仍持有文件句柄。
-        if tokio::time::timeout(Duration::from_secs(1), storage.close())
-            .await
-            .is_err()
-        {
-            tracing::warn!("数据库连接池未能在强制关停窗口内关闭");
-        }
         Some(count)
     } else {
         Some(0)
@@ -626,6 +617,12 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         tracing::warn!("控制服务未能在关停窗口内退出，取消其任务");
         control_task.abort();
         let _ = control_task.await;
+    }
+    if tokio::time::timeout(Duration::from_secs(1), storage.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!("数据库连接池未能在关停窗口内关闭");
     }
     start_result?;
 
