@@ -27,7 +27,7 @@ impl RelationshipRepository for SqliteRelationshipRepository {
         character_id: i64,
         participant_id: i64,
         source_message_id: i64,
-    ) -> Result<bool, RepositoryError> {
+    ) -> Result<Option<i64>, RepositoryError> {
         let mut tx = self.pool.begin().await?;
         let user_id: i64 =
             sqlx::query_scalar("SELECT user_id FROM participants WHERE id=? AND role='user'")
@@ -48,7 +48,7 @@ impl RelationshipRepository for SqliteRelationshipRepository {
         .rows_affected();
         if inserted == 0 {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(None);
         }
 
         let row = sqlx::query_as::<_, RelationshipRow>(
@@ -69,7 +69,7 @@ impl RelationshipRepository for SqliteRelationshipRepository {
         relationship.record_interaction();
         upsert_relationship(&mut tx, &relationship).await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(Some(user_id))
     }
 
     async fn find(

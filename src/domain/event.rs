@@ -143,7 +143,8 @@ pub struct EmotionChangedEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelationshipChangedEvent {
     pub character_id: i64,
-    pub participant_id: i64,
+    /// 全域用户 ID；关系本身按 Character × User 存储。
+    pub user_id: i64,
     pub timestamp: DateTime<Utc>,
 }
 

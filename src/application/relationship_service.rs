@@ -80,7 +80,7 @@ impl RelationshipService {
         self.event_bus
             .publish(&CoreEvent::RelationshipChanged(RelationshipChangedEvent {
                 character_id,
-                participant_id,
+                user_id: rel.user_id,
                 timestamp: Utc::now(),
             }));
 
@@ -94,19 +94,21 @@ impl RelationshipService {
         participant_id: i64,
         source_message_id: i64,
     ) -> Result<bool, crate::error::RepositoryError> {
-        let recorded = self
+        let user_id = self
             .relationship_repo
             .record_interaction_once(character_id, participant_id, source_message_id)
             .await?;
-        if recorded {
+        if let Some(user_id) = user_id {
             self.event_bus
                 .publish(&CoreEvent::RelationshipChanged(RelationshipChangedEvent {
                     character_id,
-                    participant_id,
+                    user_id,
                     timestamp: Utc::now(),
                 }));
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(recorded)
     }
 }
 
@@ -213,7 +215,7 @@ mod tests {
         match event {
             CoreEvent::RelationshipChanged(e) => {
                 assert_eq!(e.character_id, 1);
-                assert_eq!(e.participant_id, 2);
+                assert_eq!(e.user_id, 2);
             }
             other => panic!("期望 RelationshipChanged，实际 {other:?}"),
         }

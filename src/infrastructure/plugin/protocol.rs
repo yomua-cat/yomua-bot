@@ -619,7 +619,7 @@ mod tests {
             }),
             CoreEvent::RelationshipChanged(RelationshipChangedEvent {
                 character_id: 4,
-                participant_id: 2,
+                user_id: 2,
                 timestamp: ts(),
             }),
             CoreEvent::MemoryCreated(MemoryCreatedEvent {

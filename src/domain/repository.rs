@@ -1020,7 +1020,7 @@ pub trait RelationshipRepository: Send + Sync {
         _character_id: i64,
         _participant_id: i64,
         _source_message_id: i64,
-    ) -> Result<bool, RepositoryError> {
+    ) -> Result<Option<i64>, RepositoryError> {
         Err(RepositoryError::NotImplemented("关系交互幂等记录".into()))
     }
 }

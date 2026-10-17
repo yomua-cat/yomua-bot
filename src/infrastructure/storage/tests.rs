@@ -2077,6 +2077,12 @@ mod storage_tests {
             })
             .await
             .unwrap();
+        let global_user_id: i64 =
+            sqlx::query_scalar("SELECT user_id FROM participants WHERE id = ? AND role = 'user'")
+                .bind(user_a)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
         let message_a = msg_repo
             .insert(&make_test_message(
                 conv_a,
@@ -2098,18 +2104,27 @@ mod storage_tests {
             .await
             .unwrap();
 
-        assert!(rel_repo
-            .record_interaction_once(char_id, user_a, message_a)
-            .await
-            .unwrap());
-        assert!(rel_repo
-            .record_interaction_once(char_id, user_b, message_b)
-            .await
-            .unwrap());
-        assert!(!rel_repo
-            .record_interaction_once(char_id, user_b, message_b)
-            .await
-            .unwrap());
+        assert_eq!(
+            rel_repo
+                .record_interaction_once(char_id, user_a, message_a)
+                .await
+                .unwrap(),
+            Some(global_user_id)
+        );
+        assert_eq!(
+            rel_repo
+                .record_interaction_once(char_id, user_b, message_b)
+                .await
+                .unwrap(),
+            Some(global_user_id)
+        );
+        assert_eq!(
+            rel_repo
+                .record_interaction_once(char_id, user_b, message_b)
+                .await
+                .unwrap(),
+            None
+        );
 
         let relationship = rel_repo.find(char_id, user_b).await.unwrap().unwrap();
         assert_eq!(relationship.interaction_count, 2);
@@ -2346,6 +2361,12 @@ mod storage_tests {
             })
             .await
             .unwrap();
+        let user_id: i64 =
+            sqlx::query_scalar("SELECT user_id FROM participants WHERE id = ? AND role = 'user'")
+                .bind(participant_id)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
         let message_id = msg_repo
             .insert(&make_test_message(
                 conversation_id,
@@ -2357,14 +2378,20 @@ mod storage_tests {
             .await
             .unwrap();
 
-        assert!(rel_repo
-            .record_interaction_once(character_id, participant_id, message_id)
-            .await
-            .unwrap());
-        assert!(!rel_repo
-            .record_interaction_once(character_id, participant_id, message_id)
-            .await
-            .unwrap());
+        assert_eq!(
+            rel_repo
+                .record_interaction_once(character_id, participant_id, message_id)
+                .await
+                .unwrap(),
+            Some(user_id)
+        );
+        assert_eq!(
+            rel_repo
+                .record_interaction_once(character_id, participant_id, message_id)
+                .await
+                .unwrap(),
+            None
+        );
         assert_eq!(
             rel_repo
                 .find(character_id, participant_id)
@@ -3035,7 +3062,7 @@ mod storage_tests {
             .record_interaction_once(character_id, source, source_message_id)
             .await
             .unwrap();
-        assert!(!inserted_again);
+        assert_eq!(inserted_again, None);
         let merged_count_after_replay: i64 = sqlx::query_scalar(
             "SELECT interaction_count FROM relationships WHERE character_id=? AND user_id=?",
         )

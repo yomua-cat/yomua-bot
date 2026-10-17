@@ -74,3 +74,5 @@ RPC 请求使用 `id`、`method`、`params`，响应使用相同 `id`、`ok`、`
 例如 `permissions = ["message.read", "character.read"]`。权限名必须使用清单支持的 dotted 名称。读取接口必须带明确范围：`message.read` 使用 `conversation_id`，`character.read` 使用 `character_id`，`binding.read` 使用 `conversation_id`，`relationship.read` 使用 `character_id` 和全域 `user_id`。插件不能通过省略范围参数读取全局数据。参数、返回值和作用域应按[PluginApi](../src/application/plugin_api.rs)核对，授权规则见[权限模块](../src/infrastructure/plugin/permissions.rs)。
 
 当前角色状态 API 面向全局精力、压力和活动；不能据此假定具备全部会话状态管理。插件 LLM 请求仍受 LLM 开关与 `conversation` 路由约束。`memory.read` 必须提供当前 `conversation_id`，核心先按会话可见范围排除候选和其他会话记忆；默认返回脱敏摘要，只有显式 `raw: true` 才返回原文。
+
+`relationship.changed` 事件中的 `user_id` 是全域用户 ID，可以直接用于 `relationship.read`；它不是当前会话的 `participant_id`。消息事件仍同时保留会话消息作者的 `sender_id`，需要显示名或会话成员信息时再按会话查询参与者。
