@@ -336,12 +336,25 @@ struct ControlResponse {
 }
 
 impl ControlResponse {
-    fn error_message(&self) -> String {
-        self.error
-            .as_ref()
-            .map(|e| e.message.as_str())
-            .unwrap_or("未知错误")
-            .to_string()
+    fn safe_error_message(&self) -> &'static str {
+        match self.error.as_ref().map(|e| e.code.as_str()) {
+            Some("INVALID_JSON") => "请求格式无效",
+            Some("INVALID_REQUEST") | Some("INVALID_PARAMS") => "请求参数无效",
+            Some("CONFIRMATION_REQUIRED") => "此操作需要明确确认",
+            Some("NOT_FOUND")
+            | Some("CHARACTER_NOT_FOUND")
+            | Some("CONVERSATION_NOT_FOUND")
+            | Some("MEMORY_NOT_FOUND")
+            | Some("USER_NOT_FOUND") => "目标不存在",
+            Some("COMMAND_TIMEOUT") => "命令处理超时",
+            Some("RELOAD_UNAVAILABLE") => "当前不支持配置重载",
+            Some("UNSUPPORTED_OPERATION") => "当前操作不支持",
+            Some("INTERNAL_ERROR") | Some("COMMAND_FAILED") | Some("STORAGE_ERROR") => {
+                "服务端处理失败"
+            }
+            Some(_) => "命令执行失败",
+            None => "未知错误",
+        }
     }
 }
 
@@ -386,7 +399,7 @@ impl OutputFormatter {
                 .as_ref()
                 .map(|e| e.code.as_str())
                 .unwrap_or("UNKNOWN");
-            eprintln!("错误[{code}]: {}", resp.error_message());
+            eprintln!("错误[{code}]: {}", resp.safe_error_message());
             return;
         }
 
@@ -404,7 +417,7 @@ impl OutputFormatter {
             if let Ok(s) = serde_json::to_string_pretty(data) {
                 println!("{s}");
             } else {
-                println!("{data}");
+                println!("响应数据无法显示");
             }
         }
     }
@@ -1607,7 +1620,11 @@ async fn run_tui_loop(stdout: &mut io::Stdout, socket: &PathBuf) -> Result<(), S
                     message = match response {
                         Ok(resp) if resp.ok => summarize_tui_response(&resp),
                         Ok(resp) => {
-                            format!("失败 [{}]: {}", response_code(&resp), resp.error_message())
+                            format!(
+                                "失败 [{}]: {}",
+                                response_code(&resp),
+                                resp.safe_error_message()
+                            )
                         }
                         Err(error) => format!("错误: {error}"),
                     };
@@ -2576,6 +2593,22 @@ mod tests {
         assert_eq!(encoded["id"], serde_json::json!(7));
         assert_eq!(encoded["ok"], serde_json::json!(false));
         assert_eq!(encoded["error"]["code"], serde_json::json!("BAD"));
+    }
+
+    #[test]
+    fn human_error_summary_does_not_expose_server_details() {
+        let response = ControlResponse {
+            id: 8,
+            ok: false,
+            data: None,
+            error: Some(ControlErrorDetail {
+                code: "INTERNAL_ERROR".into(),
+                message: "api_key=secret-value /private/data/path".into(),
+            }),
+        };
+
+        assert_eq!(response.safe_error_message(), "服务端处理失败");
+        assert!(!response.safe_error_message().contains("secret-value"));
     }
 
     #[test]

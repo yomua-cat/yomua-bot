@@ -2983,6 +2983,12 @@ async fn handle_connection(
         return Ok(());
     }
 
+    if let Err(message) = control_schema::validate_request(&envelope.request) {
+        let response = ControlResponse::err(id, ControlErrorDetail::new("INVALID_PARAMS", message));
+        write_response(stream, response).await?;
+        return Ok(());
+    }
+
     let operation = envelope.request.operation;
     let command_name = operation.canonical_name();
     if control_schema::requires_confirmation(command_name)

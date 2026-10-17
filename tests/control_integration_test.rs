@@ -1469,6 +1469,50 @@ async fn test_character_show_non_object_params() {
     assert_eq!(resp["error"]["code"], "INVALID_PARAMS");
 }
 
+#[tokio::test]
+async fn test_control_rejects_unknown_and_mistyped_params_before_dispatch() {
+    let env = create_env().await;
+
+    let unknown = send_json(
+        &env.socket_path,
+        &serde_json::json!({
+            "version": 1,
+            "id": 205,
+            "request": { "operation": "character_show", "params": { "id": 1, "unexpected": true } }
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(unknown["ok"], false);
+    assert_eq!(unknown["error"]["code"], "INVALID_PARAMS");
+
+    let wrong_type = send_json(
+        &env.socket_path,
+        &serde_json::json!({
+            "version": 1,
+            "id": 206,
+            "request": { "operation": "character_show", "params": { "id": "1" } }
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(wrong_type["ok"], false);
+    assert_eq!(wrong_type["error"]["code"], "INVALID_PARAMS");
+
+    let stray_confirmation = send_json(
+        &env.socket_path,
+        &serde_json::json!({
+            "version": 1,
+            "id": 207,
+            "request": { "operation": "character_show", "params": { "id": 1, "confirm": true } }
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stray_confirmation["ok"], false);
+    assert_eq!(stray_confirmation["error"]["code"], "INVALID_PARAMS");
+}
+
 // ============================================================================
 // Character Card 命令测试
 // ============================================================================

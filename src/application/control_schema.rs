@@ -119,6 +119,172 @@ impl ControlOperation {
             _ => None,
         }
     }
+
+    /// 返回该操作接受的 JSON 参数字段及类型。此处定义服务端协议字段，
+    /// ctl 负责把人类输入转换成这些字段；handler 继续负责业务约束。
+    pub const fn params(self) -> &'static [ControlParamSpec] {
+        use param_specs::*;
+        use ControlOperation::*;
+        match self {
+            Status
+            | Help
+            | ReloadConfig
+            | Shutdown
+            | CharacterCardList
+            | ConversationList
+            | CharacterStateRefresh
+            | BlacklistList
+            | SessionDeleteAll => NONE,
+            CharacterList => CHARACTER_LIST,
+            CharacterShow | CharacterCardEnable | CharacterCardDisable => ID,
+            CharacterCardReassign => REASSIGN,
+            CharacterStateGet => STATE_GET,
+            CharacterStateSet => STATE_SET,
+            UserMerge => USER_MERGE,
+            UserDelete => USER_DELETE,
+            BlacklistAdd => BLACKLIST_ADD,
+            BlacklistRemove => BLACKLIST_REMOVE,
+            BlacklistBan => BLACKLIST_BAN,
+            MemoryList => MEMORY_LIST,
+            MemoryDelete => MEMORY_DELETE,
+            MemoryUpdate => MEMORY_UPDATE,
+            MemorySharingRequest | MemorySharingConfirm | MemorySharingCancel => MEMORY_SHARING,
+            ReplyUnknownList => REPLY_UNKNOWN_LIST,
+            ReplyUnknownCheck | ReplyUnknownRetry => MESSAGE_ID,
+            SessionDeleteCharacter => CHARACTER_ID,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlParamKind {
+    PositiveInteger,
+    NonNegativeInteger,
+    Number,
+    String,
+    Boolean,
+    TargetType,
+    MemoryType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlParamSpec {
+    pub name: &'static str,
+    pub kind: ControlParamKind,
+}
+
+mod param_specs {
+    use super::{ControlParamKind as K, ControlParamSpec as P};
+
+    const fn p(name: &'static str, kind: K) -> P {
+        P { name, kind }
+    }
+
+    pub const NONE: &[P] = &[];
+    pub const CHARACTER_LIST: &[P] = &[
+        p("limit", K::PositiveInteger),
+        p("offset", K::NonNegativeInteger),
+    ];
+    pub const ID: &[P] = &[p("id", K::PositiveInteger)];
+    pub const REASSIGN: &[P] = &[
+        p("old_id", K::PositiveInteger),
+        p("new_id", K::PositiveInteger),
+    ];
+    pub const STATE_GET: &[P] = &[
+        p("character_id", K::PositiveInteger),
+        p("conversation_id", K::PositiveInteger),
+    ];
+    pub const STATE_SET: &[P] = &[
+        p("character_id", K::PositiveInteger),
+        p("conversation_id", K::PositiveInteger),
+        p("energy", K::Number),
+        p("stress", K::Number),
+        p("mood", K::Number),
+        p("activity", K::String),
+    ];
+    pub const USER_MERGE: &[P] = &[
+        p("source_user_id", K::PositiveInteger),
+        p("target_user_id", K::PositiveInteger),
+    ];
+    pub const USER_DELETE: &[P] = &[p("user_id", K::PositiveInteger)];
+    pub const BLACKLIST_ADD: &[P] = &[
+        p("target", K::String),
+        p("target_type", K::TargetType),
+        p("reason", K::String),
+    ];
+    pub const BLACKLIST_REMOVE: &[P] = &[p("target", K::String), p("target_type", K::TargetType)];
+    pub const BLACKLIST_BAN: &[P] = &[
+        p("target", K::String),
+        p("target_type", K::TargetType),
+        p("duration_secs", K::PositiveInteger),
+        p("reason", K::String),
+    ];
+    pub const MEMORY_LIST: &[P] = &[
+        p("character_id", K::PositiveInteger),
+        p("conversation_id", K::PositiveInteger),
+        p("memory_type", K::MemoryType),
+        p("limit", K::PositiveInteger),
+        p("raw", K::Boolean),
+    ];
+    pub const MEMORY_DELETE: &[P] = &[p("memory_id", K::PositiveInteger)];
+    pub const MEMORY_UPDATE: &[P] = &[
+        p("memory_id", K::PositiveInteger),
+        p("instruction", K::String),
+    ];
+    pub const MEMORY_SHARING: &[P] = &[
+        p("character_id", K::PositiveInteger),
+        p("user_id", K::PositiveInteger),
+        p("reason", K::String),
+    ];
+    pub const REPLY_UNKNOWN_LIST: &[P] = &[p("limit", K::PositiveInteger), p("raw", K::Boolean)];
+    pub const MESSAGE_ID: &[P] = &[p("message_id", K::PositiveInteger)];
+    pub const CHARACTER_ID: &[P] = &[p("character_id", K::PositiveInteger)];
+}
+
+/// 在命令 handler 前验证协议参数的对象形状、未知字段和字段类型。
+/// 必填项及字段间关系仍由各 handler 的业务校验负责。
+pub fn validate_request(request: &ControlRequest) -> Result<(), String> {
+    let params = request
+        .params
+        .as_object()
+        .ok_or_else(|| "params 必须是 JSON 对象".to_string())?;
+    let operation = request.operation;
+    let specs = operation.params();
+    for (name, value) in params {
+        if name == "confirm" {
+            if !requires_confirmation(operation.canonical_name()) {
+                return Err("参数 confirm 仅适用于需要确认的命令".into());
+            }
+            if !value.is_boolean() {
+                return Err("参数 confirm 必须是布尔值".into());
+            }
+            continue;
+        }
+        let Some(spec) = specs.iter().find(|spec| spec.name == name) else {
+            return Err(format!(
+                "命令 {} 不接受参数 {name}",
+                operation.canonical_name()
+            ));
+        };
+        let valid = match spec.kind {
+            ControlParamKind::PositiveInteger => value.as_i64().is_some_and(|v| v > 0),
+            ControlParamKind::NonNegativeInteger => value.as_i64().is_some_and(|v| v >= 0),
+            ControlParamKind::Number => value.as_f64().is_some(),
+            ControlParamKind::String => value.as_str().is_some(),
+            ControlParamKind::Boolean => value.is_boolean(),
+            ControlParamKind::TargetType => {
+                matches!(value.as_str(), Some("user" | "group"))
+            }
+            ControlParamKind::MemoryType => matches!(
+                value.as_str(),
+                Some("episodic" | "semantic" | "relationship" | "system")
+            ),
+        };
+        if !valid {
+            return Err(format!("参数 {name} 的类型或取值不正确"));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
