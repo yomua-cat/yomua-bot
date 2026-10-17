@@ -183,8 +183,11 @@ impl MemoryService {
             return None;
         }
 
-        // 类型判定优先级：关系 > 自我描述 > 事件（默认 episodic）。
-        let memory_type = if has_rel {
+        // 发生过的事情优先按经历处理。像“我们昨天吵架了”同时包含
+        // 关系词和时间词，不能因为“我们”命中就被误判为可跨会话共享的关系事实。
+        let memory_type = if has_epi {
+            MemoryType::Episodic
+        } else if has_rel {
             MemoryType::Relationship
         } else if has_sem {
             MemoryType::Semantic
@@ -345,6 +348,15 @@ mod tests {
             .evaluate("我妹妹下周要结婚了，我要去参加", 1)
             .expect("应产生候选");
         assert_eq!(c.memory_type, MemoryType::Relationship);
+    }
+
+    #[test]
+    fn dated_relationship_event_stays_episodic() {
+        let (svc, _repo) = service();
+        let c = svc
+            .evaluate("我们昨天吵架了，后来谁都没有再说话", 1)
+            .expect("应产生候选");
+        assert_eq!(c.memory_type, MemoryType::Episodic);
     }
 
     #[tokio::test]

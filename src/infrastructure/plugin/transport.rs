@@ -729,6 +729,8 @@ pub(crate) mod test_support {
                 retcode: Some(0),
                 data: None,
                 error: None,
+                message: None,
+                wording: None,
             })
         }
         async fn send_private_message(
@@ -743,6 +745,8 @@ pub(crate) mod test_support {
                 retcode: Some(0),
                 data: None,
                 error: None,
+                message: None,
+                wording: None,
             })
         }
     }

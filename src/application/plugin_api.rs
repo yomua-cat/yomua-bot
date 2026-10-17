@@ -1076,6 +1076,8 @@ mod tests {
                 retcode: Some(0),
                 data: None,
                 error: None,
+                message: None,
+                wording: None,
             })
         }
         async fn send_private_message(
@@ -1094,6 +1096,8 @@ mod tests {
                 retcode: Some(0),
                 data: None,
                 error: None,
+                message: None,
+                wording: None,
             })
         }
     }

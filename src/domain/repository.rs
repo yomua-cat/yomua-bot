@@ -409,6 +409,30 @@ pub trait MessageRepository: Send + Sync {
         self.save_reply_task(message_id, character_id, status, content)
             .await
     }
+
+    /// 在发送外部平台消息前原子取得发送栅栏。
+    ///
+    /// 生产仓储必须同时校验 MessageAccepted outbox 事件的租约，避免旧
+    /// worker 在租约失效后仍把回复任务推进到 sending。返回 false 表示
+    /// 当前 worker 已失去发送资格。
+    async fn begin_reply_task_delivery(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        lease_token: &str,
+    ) -> Result<bool, RepositoryError> {
+        if !self.owns_outbox_lease(message_id, lease_token).await? {
+            return Ok(false);
+        }
+        self.save_reply_task(
+            message_id,
+            character_id,
+            crate::domain::message::ReplyTaskStatus::Sending,
+            None,
+        )
+        .await
+        .map(|_| true)
+    }
     /// 在恢复路径中把尚未确认的发送任务原子转为 unknown。
     /// 默认实现兼容简单测试仓储；生产 SQLite 实现会限定原状态为 sending。
     async fn mark_reply_task_unknown_if_sending(
@@ -439,6 +463,36 @@ pub trait MessageRepository: Send + Sync {
         let _ = (error, platform_message_id);
         self.save_reply_task(message_id, character_id, status, content)
             .await
+    }
+
+    /// 在当前 Outbox 租约仍归调用者所有时更新发送状态。
+    ///
+    /// 返回 `false` 表示任务状态或租约已经变化，调用者不得继续推进旧任务。
+    /// SQLite 实现必须把租约检查和状态更新放在同一条条件更新中，不能先查再写。
+    #[allow(clippy::too_many_arguments)]
+    async fn save_reply_task_delivery_owned(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        lease_token: &str,
+        status: crate::domain::message::ReplyTaskStatus,
+        content: Option<&str>,
+        error: Option<&str>,
+        platform_message_id: Option<i64>,
+    ) -> Result<bool, RepositoryError> {
+        if !self.owns_outbox_lease(message_id, lease_token).await? {
+            return Ok(false);
+        }
+        self.save_reply_task_delivery(
+            message_id,
+            character_id,
+            status,
+            content,
+            error,
+            platform_message_id,
+        )
+        .await
+        .map(|_| true)
     }
 
     /// 在人工确认平台确实未发送后，将未知任务恢复为可安全重试状态。
@@ -600,6 +654,17 @@ pub trait MessageRepository: Send + Sync {
 #[async_trait]
 pub trait MemoryRepository: Send + Sync {
     async fn find_by_id(&self, id: i64) -> Result<Option<Memory>, RepositoryError>;
+
+    /// 查询仍等待模型处理的自然语言修改请求。
+    ///
+    /// 请求状态保存在记忆元数据中，进程崩溃后由后台维护任务重新拾取。
+    /// 默认实现返回空集，供不支持该能力的轻量测试仓储使用。
+    async fn find_pending_edit_requests(
+        &self,
+        _limit: i64,
+    ) -> Result<Vec<Memory>, RepositoryError> {
+        Ok(Vec::new())
+    }
 
     /// 自动确认可以由程序安全判断的候选记忆。
     ///

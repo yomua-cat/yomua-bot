@@ -19,6 +19,22 @@ impl SqliteMemoryRepository {
 
 #[async_trait]
 impl MemoryRepository for SqliteMemoryRepository {
+    async fn find_pending_edit_requests(&self, limit: i64) -> Result<Vec<Memory>, RepositoryError> {
+        let rows: Vec<MemoryRow> = sqlx::query_as(
+            r#"SELECT id, character_id, user_id, conversation_id, memory_type, content,
+                      importance, created_at, last_accessed, metadata, embedding
+                 FROM memories
+                WHERE json_valid(metadata)
+                  AND json_extract(metadata, '$.edit_request.status') = 'pending'
+                ORDER BY json_extract(metadata, '$.edit_request.requested_at') ASC, id ASC
+                LIMIT ?"#,
+        )
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(parse_memory_row).collect()
+    }
+
     async fn promote_safe_candidates(&self, limit: i64) -> Result<u64, RepositoryError> {
         let mut tx = self.pool.begin().await?;
         let ids: Vec<i64> = sqlx::query_scalar(

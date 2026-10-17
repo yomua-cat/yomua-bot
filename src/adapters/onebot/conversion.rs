@@ -48,6 +48,8 @@ pub struct InboundMessage {
     pub is_mentioned: bool,
     /// 事件发送者是否就是本次连接对应的机器人账号。
     pub is_self_echo: bool,
+    /// 平台明确标记发送者为其他 Bot。
+    pub is_other_bot: bool,
     pub mention_targets: Vec<i64>,
     pub reply_to: Option<i64>,
     /// 非文本段的结构化摘要；不代表模型已经理解了媒体内容。
@@ -120,6 +122,17 @@ pub fn onebot_event_to_inbound(event: &OneBotEvent) -> Result<InboundMessage, Ru
         .unwrap_or("未知用户")
         .to_string();
 
+    let is_other_bot = data
+        .get("sender")
+        .and_then(|sender| sender.get("is_bot"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || data
+            .get("sender")
+            .and_then(|sender| sender.get("role"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|role| role.eq_ignore_ascii_case("bot"));
+
     // 提取消息内容（支持 CQ 码字符串或消息分段数组）。
     let mut content = extract_text_content(data.get("message"))?;
     let content_metadata = message_content_metadata(data.get("message"));
@@ -145,6 +158,7 @@ pub fn onebot_event_to_inbound(event: &OneBotEvent) -> Result<InboundMessage, Ru
         unix_time: event.time,
         is_mentioned,
         is_self_echo: sender_id == event.self_id,
+        is_other_bot: sender_id != event.self_id && is_other_bot,
         mention_targets,
         reply_to,
         content_metadata,
@@ -463,6 +477,27 @@ mod tests {
 
         let inbound = onebot_event_to_inbound(&event).unwrap();
         assert!(inbound.is_self_echo);
+    }
+
+    #[test]
+    fn sender_marked_as_bot_is_not_treated_as_self_echo() {
+        let event = OneBotEvent {
+            post_type: "message".to_string(),
+            time: 100,
+            self_id: 123456,
+            data: json!({
+                "message_type": "group",
+                "message_id": 10,
+                "group_id": 500000,
+                "user_id": 654321,
+                "message": "其他机器人消息",
+                "sender": {"user_id": 654321, "nickname": "其他 Bot", "is_bot": true}
+            }),
+        };
+
+        let inbound = onebot_event_to_inbound(&event).unwrap();
+        assert!(inbound.is_other_bot);
+        assert!(!inbound.is_self_echo);
     }
 
     #[test]

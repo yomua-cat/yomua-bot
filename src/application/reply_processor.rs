@@ -94,6 +94,11 @@ pub struct ReplyProcessor {
     message_repo: Option<Arc<dyn crate::domain::repository::MessageRepository>>,
 }
 
+struct FrozenBatch {
+    content: String,
+    additional_messages: Vec<crate::domain::message::Message>,
+}
+
 impl ReplyProcessor {
     fn event_expired(event: &MessageReceivedEvent) -> bool {
         event.message_id > 0 && (Utc::now() - event.ingested_at).num_seconds() > 120
@@ -104,9 +109,15 @@ impl ReplyProcessor {
     /// 入站消息仍逐条保存；这里只把已经落库、同一会话同一发送者、紧邻当前序号的
     /// 消息合并成一次模型输入。等待结束后才读取数据库，因此生成期间到达的消息
     /// 不会混入本轮，而会由后续 Outbox 任务处理。
-    async fn freeze_batch(&self, event: &MessageReceivedEvent) -> Result<String, RuntimeError> {
+    async fn freeze_batch(
+        &self,
+        event: &MessageReceivedEvent,
+    ) -> Result<FrozenBatch, RuntimeError> {
         let Some(repo) = &self.message_repo else {
-            return Ok(event.content.clone());
+            return Ok(FrozenBatch {
+                content: event.content.clone(),
+                additional_messages: Vec::new(),
+            });
         };
         let wait_ms = if event.is_mentioned {
             MENTION_BATCH_WAIT_MS
@@ -155,20 +166,29 @@ impl ReplyProcessor {
         }
         if event.message_id == 0 {
             let mut combined = vec![event.content.clone()];
+            let mut additional_messages = Vec::new();
             for message in batch {
                 self.mark_task_ignored_if_pending(message.id, event.character_id)
                     .await?;
-                if let crate::domain::message::MessageContent::Text(text) = message.content {
-                    combined.push(text);
+                if let crate::domain::message::MessageContent::Text(text) = &message.content {
+                    combined.push(text.clone());
                 }
+                additional_messages.push(message);
             }
-            return Ok(combine_batch_contents(combined));
+            return Ok(FrozenBatch {
+                content: combine_batch_contents(combined),
+                additional_messages,
+            });
         }
         if batch.len() <= 1 {
-            return Ok(event.content.clone());
+            return Ok(FrozenBatch {
+                content: event.content.clone(),
+                additional_messages: Vec::new(),
+            });
         }
 
         let mut combined = Vec::new();
+        let mut additional_messages = Vec::new();
         for message in batch.iter() {
             if let crate::domain::message::MessageContent::Text(text) = &message.content {
                 if !text.trim().is_empty() {
@@ -178,14 +198,18 @@ impl ReplyProcessor {
             if message.id != event.message_id {
                 self.mark_task_ignored_if_pending(message.id, event.character_id)
                     .await?;
+                additional_messages.push(message.clone());
             }
         }
         let combined = combine_batch_contents(combined);
-        if combined.is_empty() {
-            Ok(event.content.clone())
-        } else {
-            Ok(combined)
-        }
+        Ok(FrozenBatch {
+            content: if combined.is_empty() {
+                event.content.clone()
+            } else {
+                combined
+            },
+            additional_messages,
+        })
     }
 
     async fn mark_task_ignored_if_pending(
@@ -518,6 +542,56 @@ impl ReplyProcessor {
         Ok(())
     }
 
+    /// 更新发送阶段状态时绑定当前 Outbox 租约。
+    ///
+    /// 发送调用可能跨越租约续期边界；所有发送结果都必须通过带租约条件的
+    /// 仓储写入，旧 worker 失去所有权后不能覆盖新 worker 的状态。
+    async fn save_delivery_owned(
+        &self,
+        event: &MessageReceivedEvent,
+        lease: Option<&str>,
+        status: ReplyTaskStatus,
+        content: Option<&str>,
+        error: Option<&str>,
+        platform_message_id: Option<i64>,
+    ) -> Result<(), RuntimeError> {
+        let Some(repo) = &self.message_repo else {
+            return Ok(());
+        };
+        if event.message_id <= 0 {
+            return Ok(());
+        }
+        let updated = if let Some(token) = lease {
+            repo.save_reply_task_delivery_owned(
+                event.message_id,
+                event.character_id,
+                token,
+                status,
+                content,
+                error,
+                platform_message_id,
+            )
+            .await?
+        } else {
+            repo.save_reply_task_delivery(
+                event.message_id,
+                event.character_id,
+                status,
+                content,
+                error,
+                platform_message_id,
+            )
+            .await?;
+            true
+        };
+        if !updated {
+            return Err(RuntimeError::Repository(
+                crate::error::RepositoryError::OwnershipLost,
+            ));
+        }
+        Ok(())
+    }
+
     /// 在会话删除、角色切换或租约恢复后，阻止已失效事件继续产生副作用。
     ///
     /// Outbox 删除只能把事件标记为终态，无法撤回已经被 worker 领取的事件；
@@ -716,9 +790,9 @@ impl ReplyProcessor {
                             Some(platform_message_id),
                         )
                         .await?;
-                        repo.save_reply_task_delivery(
-                            event.message_id,
-                            event.character_id,
+                        self.save_delivery_owned(
+                            event,
+                            lease,
                             ReplyTaskStatus::Sent,
                             None,
                             None,
@@ -728,13 +802,25 @@ impl ReplyProcessor {
                         return Ok(());
                     }
                 }
-                let changed = repo
-                    .mark_reply_task_unknown_if_sending(
+                let changed = if let Some(token) = lease {
+                    repo.save_reply_task_delivery_owned(
+                        event.message_id,
+                        event.character_id,
+                        token,
+                        ReplyTaskStatus::Unknown,
+                        None,
+                        Some("进程在发送平台回执前退出，发送结果未知，需要核查"),
+                        None,
+                    )
+                    .await?
+                } else {
+                    repo.mark_reply_task_unknown_if_sending(
                         event.message_id,
                         event.character_id,
                         "进程在发送平台回执前退出，发送结果未知，需要核查",
                     )
-                    .await?;
+                    .await?
+                };
                 if changed {
                     tracing::warn!(
                         message_id = event.message_id,
@@ -788,17 +874,8 @@ impl ReplyProcessor {
                 .ok_or_else(|| RuntimeError::Internal("历史修复任务缺少回复内容".into()))?;
             self.persist_assistant_history(event, &character, content, None)
                 .await?;
-            if let Some(repo) = &self.message_repo {
-                repo.save_reply_task_delivery(
-                    event.message_id,
-                    event.character_id,
-                    ReplyTaskStatus::Sent,
-                    None,
-                    None,
-                    None,
-                )
+            self.save_delivery_owned(event, lease, ReplyTaskStatus::Sent, None, None, None)
                 .await?;
-            }
             return Ok(());
         }
         if stored
@@ -811,22 +888,29 @@ impl ReplyProcessor {
             .metadata
             .get("external_sender_id")
             .and_then(|value| value.as_str());
-        let synthetic_proactive = event
+        let non_human_source = event
             .metadata
             .get("author_kind")
             .and_then(|value| value.as_str())
-            == Some("system");
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "system" | "system_command" | "platform_echo" | "other_bot"
+                )
+            });
         let relationship_participant_id = self
             .relationship_service
             .canonical_participant_id(event.character_id, event.sender_id, stable_user_key)
             .await?;
         self.ensure_event_still_owned(event, lease).await?;
-        if event.message_id > 0 && !synthetic_proactive {
+        if event.message_id > 0 && !non_human_source {
             self.memory_service
                 .extract_and_store(
                     event.character_id,
                     Some(event.conversation_id),
-                    relationship_participant_id,
+                    // 记忆来源必须保留当前事件的实际参与者；关系服务的
+                    // canonical participant 只用于稳定关系键，不能替代来源会话。
+                    event.sender_id,
                     &event.content,
                     event.message_id,
                     event.timestamp,
@@ -834,7 +918,7 @@ impl ReplyProcessor {
                 .await?;
         }
         self.ensure_event_still_owned(event, lease).await?;
-        if event.message_id > 0 && !synthetic_proactive {
+        if event.message_id > 0 && !non_human_source {
             match self
                 .relationship_service
                 .record_interaction_once(
@@ -856,7 +940,39 @@ impl ReplyProcessor {
             }
         }
         self.ensure_event_still_owned(event, lease).await?;
-        let batch_content = self.freeze_batch(event).await?;
+        let frozen_batch = self.freeze_batch(event).await?;
+        for message in &frozen_batch.additional_messages {
+            self.ensure_event_still_owned(event, lease).await?;
+            let stable_user_key = message
+                .metadata
+                .get("external_sender_id")
+                .and_then(|value| value.as_str());
+            let participant_id = self
+                .relationship_service
+                .canonical_participant_id(event.character_id, message.sender_id, stable_user_key)
+                .await?;
+            if let crate::domain::message::MessageContent::Text(text) = &message.content {
+                self.memory_service
+                    .extract_and_store(
+                        event.character_id,
+                        Some(event.conversation_id),
+                        message.sender_id,
+                        text,
+                        message.id,
+                        message.occurred_at.unwrap_or(message.timestamp),
+                    )
+                    .await?;
+            }
+            match self
+                .relationship_service
+                .record_interaction_once(event.character_id, participant_id, message.id)
+                .await
+            {
+                Ok(_) | Err(crate::error::RepositoryError::NotImplemented(_)) => {}
+                Err(error) => return Err(RuntimeError::Repository(error)),
+            }
+        }
+        let batch_content = frozen_batch.content;
         let decision = self
             .decision_orchestrator
             .evaluate_response(
@@ -915,7 +1031,7 @@ impl ReplyProcessor {
                 self.save_task(event, ReplyTaskStatus::Generating, None)
                     .await?;
             }
-            let content = self
+            let content = match self
                 .generate_reply(
                     event,
                     &character,
@@ -923,7 +1039,17 @@ impl ReplyProcessor {
                     relationship_participant_id,
                     &batch_content,
                 )
-                .await?;
+                .await
+            {
+                Ok(content) => content,
+                Err(error) => {
+                    // 生成失败不能把任务永久留在 generating；恢复为 pending
+                    // 后，Outbox 的重试才能再次取得生成权。
+                    self.save_task_error(event, ReplyTaskStatus::Pending, None, &error.to_string())
+                        .await?;
+                    return Err(error);
+                }
+            };
             self.ensure_event_still_owned(event, lease).await?;
             if Self::event_expired(event) {
                 self.save_task(event, ReplyTaskStatus::Expired, Some(&content))
@@ -965,9 +1091,21 @@ impl ReplyProcessor {
                 ));
             }
         }
-        // 在发送之前写入状态；进程在 API 回执前退出时不能自动重复发送。
-        self.save_task(event, ReplyTaskStatus::Sending, None)
-            .await?;
+        // 在发送之前原子取得发送栅栏；租约失效的旧 worker 不能继续调用平台。
+        if let (Some(repo), Some(token)) = (&self.message_repo, lease) {
+            if !repo
+                .begin_reply_task_delivery(event.message_id, event.character_id, token)
+                .await?
+            {
+                return Err(RuntimeError::Repository(
+                    crate::error::RepositoryError::OwnershipLost,
+                ));
+            }
+        } else {
+            // 非 outbox 的直接调用路径没有租约，保留原有本地任务状态记录。
+            self.save_task(event, ReplyTaskStatus::Sending, None)
+                .await?;
+        }
         match self
             .action_dispatcher
             .execute_send_message_with_response(event.conversation_id, &content)
@@ -979,12 +1117,12 @@ impl ReplyProcessor {
                     .as_ref()
                     .and_then(|data| data.get("message_id"))
                     .and_then(|value| value.as_i64());
-                if let Some(repo) = &self.message_repo {
+                if let Some(_repo) = &self.message_repo {
                     // 先持久化正文和平台消息 ID，但保持 sending。若本地历史写入
                     // 失败，重启后可据此补写，而不需要再次发送。
-                    repo.save_reply_task_delivery(
-                        event.message_id,
-                        event.character_id,
+                    self.save_delivery_owned(
+                        event,
+                        lease,
                         ReplyTaskStatus::Sending,
                         Some(&content),
                         None,
@@ -995,9 +1133,9 @@ impl ReplyProcessor {
                         .persist_assistant_history(event, &character, &content, platform_message_id)
                         .await
                     {
-                        repo.save_reply_task_delivery(
-                            event.message_id,
-                            event.character_id,
+                        self.save_delivery_owned(
+                            event,
+                            lease,
                             ReplyTaskStatus::Sending,
                             Some(&content),
                             Some(&format!("{ASSISTANT_HISTORY_REPAIR_PREFIX}: {error}")),
@@ -1006,9 +1144,9 @@ impl ReplyProcessor {
                         .await?;
                         return Err(error);
                     }
-                    repo.save_reply_task_delivery(
-                        event.message_id,
-                        event.character_id,
+                    self.save_delivery_owned(
+                        event,
+                        lease,
                         ReplyTaskStatus::Sent,
                         None,
                         None,
@@ -1020,8 +1158,15 @@ impl ReplyProcessor {
                 }
             }
             Ok(response) => {
-                self.save_task(event, ReplyTaskStatus::Generated, None)
-                    .await?;
+                self.save_delivery_owned(
+                    event,
+                    lease,
+                    ReplyTaskStatus::Generated,
+                    Some(&content),
+                    Some(&response.error_message()),
+                    None,
+                )
+                .await?;
                 return Err(RuntimeError::SendRejected(format!(
                     "OneBot 明确拒绝发送：status={}, retcode={:?}, error={:?}",
                     response.status, response.retcode, response.error
@@ -1030,15 +1175,24 @@ impl ReplyProcessor {
             Err(e) => {
                 let definitely_not_sent = matches!(e, RuntimeError::SendRejected(_));
                 if definitely_not_sent {
-                    self.save_task(event, ReplyTaskStatus::Generated, None)
-                        .await?;
+                    self.save_delivery_owned(
+                        event,
+                        lease,
+                        ReplyTaskStatus::Generated,
+                        Some(&content),
+                        Some(&e.to_string()),
+                        None,
+                    )
+                    .await?;
                     return Err(e);
                 }
-                self.save_task_error(
+                self.save_delivery_owned(
                     event,
+                    lease,
                     ReplyTaskStatus::Unknown,
                     Some(&content),
-                    &e.to_string(),
+                    Some(&e.to_string()),
+                    None,
                 )
                 .await?;
                 tracing::error!(conversation_id=event.conversation_id,message_id=event.message_id,error=%e,"发送结果未知，停止自动补发，等待核查");
@@ -1765,6 +1919,8 @@ mod tests {
                 retcode: Some(0),
                 data: None,
                 error: None,
+                message: None,
+                wording: None,
             })
         }
         async fn send_private_message(
@@ -1783,6 +1939,8 @@ mod tests {
                 retcode: Some(0),
                 data: None,
                 error: None,
+                message: None,
+                wording: None,
             })
         }
     }

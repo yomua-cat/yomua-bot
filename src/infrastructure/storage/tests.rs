@@ -129,6 +129,395 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn latest_message_time_returns_none_for_empty_conversation() {
+        let storage = setup_storage().await;
+        let repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+
+        let latest = repo
+            .latest_message_time(999)
+            .await
+            .expect("查询空会话的最新消息时间不应失败");
+        assert!(latest.is_none());
+    }
+
+    #[tokio::test]
+    async fn reply_delivery_requires_current_outbox_lease() {
+        let storage = setup_storage().await;
+        let repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let character_repo =
+            crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+                storage.pool().clone(),
+            );
+        let character_id = character_repo
+            .insert(&Character {
+                id: 0,
+                definition: CharacterDefinition {
+                    name: "Lease Test".into(),
+                    description: None,
+                    personality: None,
+                    scenario: None,
+                    style: None,
+                    background: None,
+                    greetings: vec![],
+                    example_messages: vec![],
+                    system_prompt: None,
+                    post_history_instructions: None,
+                    lorebook: vec![],
+                    metadata: serde_json::json!({}),
+                },
+                enabled: true,
+                state: CharacterState::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("插入测试角色失败");
+        let conversation_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let conversation_id = conversation_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Group,
+                external_id: "lease-test-conversation".into(),
+                name: Some("租约测试".into()),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("插入测试会话失败");
+        let participant_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+        let sender_id = participant_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id,
+                external_id: "lease-test-user".into(),
+                display_name: "测试用户".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform": "onebot_qq"}),
+            })
+            .await
+            .expect("插入测试参与者失败");
+        let message_id = repo
+            .insert(&make_test_message(
+                conversation_id,
+                sender_id,
+                MessageContent::Text("测试发送租约".into()),
+                chrono::Utc::now(),
+                Some(character_id),
+            ))
+            .await
+            .expect("插入测试消息失败");
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"INSERT INTO outbox_events(
+                   event_uuid, entity_id, entity_type, event_type, event_version,
+                   payload, ordering_key, ordering_seq, created_at, available_at,
+                   status, attempts, last_error, locked_until, processed_at, lease_token
+               ) VALUES (?, ?, 'messages', 'MessageAccepted', 1, '{}', ?, 1, ?, ?,
+                         'processing', 1, NULL, ?, NULL, ?)"#,
+        )
+        .bind("delivery-lease-test")
+        .bind(message_id)
+        .bind(format!("conversation:{conversation_id}"))
+        .bind(&now)
+        .bind(&now)
+        .bind((chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339())
+        .bind("lease-a")
+        .execute(storage.pool())
+        .await
+        .expect("插入测试 outbox 事件失败");
+
+        assert!(!repo
+            .begin_reply_task_delivery(message_id, character_id, "lease-b")
+            .await
+            .expect("失效租约检查失败"));
+        assert!(repo
+            .reply_task(message_id)
+            .await
+            .expect("查询回复任务失败")
+            .is_none());
+
+        assert!(repo
+            .begin_reply_task_delivery(message_id, character_id, "lease-a")
+            .await
+            .expect("有效租约检查失败"));
+        let task = repo
+            .reply_task(message_id)
+            .await
+            .expect("查询回复任务失败")
+            .expect("回复任务未创建");
+        assert_eq!(task.status, ReplyTaskStatus::Sending);
+    }
+
+    #[tokio::test]
+    async fn reply_delivery_result_cannot_be_overwritten_after_lease_changes() {
+        let storage = setup_storage().await;
+        let repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let character_repo =
+            crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+                storage.pool().clone(),
+            );
+        let character_id = character_repo
+            .insert(&Character {
+                id: 0,
+                definition: CharacterDefinition {
+                    name: "Lease Result Test".into(),
+                    description: None,
+                    personality: None,
+                    scenario: None,
+                    style: None,
+                    background: None,
+                    greetings: vec![],
+                    example_messages: vec![],
+                    system_prompt: None,
+                    post_history_instructions: None,
+                    lorebook: vec![],
+                    metadata: serde_json::json!({}),
+                },
+                enabled: true,
+                state: CharacterState::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("插入测试角色失败");
+        let conversation_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let conversation_id = conversation_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Group,
+                external_id: "lease-result-conversation".into(),
+                name: Some("租约结果测试".into()),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("插入测试会话失败");
+        let participant_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+        let sender_id = participant_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id,
+                external_id: "lease-result-user".into(),
+                display_name: "测试用户".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform": "onebot_qq"}),
+            })
+            .await
+            .expect("插入测试参与者失败");
+        let message_id = repo
+            .insert(&make_test_message(
+                conversation_id,
+                sender_id,
+                MessageContent::Text("租约结果".into()),
+                chrono::Utc::now(),
+                Some(character_id),
+            ))
+            .await
+            .expect("插入测试消息失败");
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"INSERT INTO outbox_events(
+                   event_uuid, entity_id, entity_type, event_type, event_version,
+                   payload, ordering_key, ordering_seq, created_at, available_at,
+                   status, attempts, last_error, locked_until, processed_at, lease_token
+               ) VALUES (?, ?, 'messages', 'MessageAccepted', 1, '{}', ?, 1, ?, ?,
+                         'processing', 1, NULL, ?, NULL, ?)
+            "#,
+        )
+        .bind("delivery-result-lease-test")
+        .bind(message_id)
+        .bind(format!("conversation:{conversation_id}"))
+        .bind(&now)
+        .bind(&now)
+        .bind((chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339())
+        .bind("lease-a")
+        .execute(storage.pool())
+        .await
+        .expect("插入测试 outbox 事件失败");
+
+        assert!(repo
+            .begin_reply_task_delivery(message_id, character_id, "lease-a")
+            .await
+            .expect("取得发送栅栏失败"));
+        assert!(repo
+            .save_reply_task_delivery_owned(
+                message_id,
+                character_id,
+                "lease-a",
+                ReplyTaskStatus::Sent,
+                Some("第一条回复"),
+                None,
+                Some(101),
+            )
+            .await
+            .expect("当前租约写入失败"));
+
+        sqlx::query(
+            "UPDATE outbox_events SET lease_token = ?, locked_until = ? WHERE entity_id = ?",
+        )
+        .bind("lease-b")
+        .bind((chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339())
+        .bind(message_id)
+        .execute(storage.pool())
+        .await
+        .expect("切换测试租约失败");
+
+        assert!(!repo
+            .save_reply_task_delivery_owned(
+                message_id,
+                character_id,
+                "lease-a",
+                ReplyTaskStatus::Unknown,
+                Some("旧 worker 覆盖"),
+                Some("stale"),
+                None,
+            )
+            .await
+            .expect("失效租约写入检查失败"));
+        let task = repo
+            .reply_task(message_id)
+            .await
+            .expect("查询回复任务失败")
+            .expect("回复任务缺失");
+        assert_eq!(task.status, ReplyTaskStatus::Sent);
+        assert_eq!(task.content.as_deref(), Some("第一条回复"));
+        assert_eq!(task.platform_message_id, Some(101));
+    }
+
+    #[tokio::test]
+    async fn history_queries_hide_internal_messages() {
+        let storage = setup_storage().await;
+        let character_repo =
+            crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+                storage.pool().clone(),
+            );
+        let character_id = character_repo
+            .insert(&Character {
+                id: 0,
+                definition: CharacterDefinition {
+                    name: "History Filter".into(),
+                    description: None,
+                    personality: None,
+                    scenario: None,
+                    style: None,
+                    background: None,
+                    greetings: vec![],
+                    example_messages: vec![],
+                    system_prompt: None,
+                    post_history_instructions: None,
+                    lorebook: vec![],
+                    metadata: serde_json::json!({}),
+                },
+                enabled: true,
+                state: CharacterState::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("插入测试角色失败");
+        let conversation_repo =
+            crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                storage.pool().clone(),
+            );
+        let conversation_id = conversation_repo
+            .insert(&Conversation {
+                id: 0,
+                conversation_type: ConversationType::Group,
+                external_id: "history-filter-conversation".into(),
+                name: Some("历史过滤测试".into()),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("插入测试会话失败");
+        let participant_repo =
+            crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+                storage.pool().clone(),
+            );
+        let sender_id = participant_repo
+            .insert(&Participant {
+                id: 0,
+                conversation_id,
+                external_id: "history-filter-user".into(),
+                display_name: "测试用户".into(),
+                role: ParticipantRole::User,
+                metadata: serde_json::json!({"platform": "onebot_qq"}),
+            })
+            .await
+            .expect("插入测试参与者失败");
+        let message_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let base = chrono::Utc::now();
+        for (content, metadata, offset) in [
+            ("用户内容", serde_json::json!({"author_kind": "user"}), 0),
+            (
+                "管理命令",
+                serde_json::json!({"author_kind": "system_command"}),
+                1,
+            ),
+            (
+                "平台回声",
+                serde_json::json!({"author_kind": "platform_echo"}),
+                2,
+            ),
+            (
+                "主动依据",
+                serde_json::json!({"author_kind": "system", "proactive": true}),
+                3,
+            ),
+        ] {
+            let mut message = make_test_message(
+                conversation_id,
+                sender_id,
+                MessageContent::Text(content.into()),
+                base + chrono::Duration::seconds(offset),
+                Some(character_id),
+            );
+            message.metadata = metadata;
+            message_repo
+                .insert(&message)
+                .await
+                .expect("插入历史消息失败");
+        }
+
+        let recent = message_repo
+            .find_recent(conversation_id, 20)
+            .await
+            .expect("查询普通历史失败");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].content, MessageContent::Text("用户内容".into()));
+
+        let cognition = message_repo
+            .find_cognition_batch(character_id, conversation_id, 0, 20)
+            .await
+            .expect("查询认知批次失败");
+        assert_eq!(cognition.len(), 1);
+        assert_eq!(
+            cognition[0].content,
+            MessageContent::Text("用户内容".into())
+        );
+    }
+
+    #[tokio::test]
     async fn conversations_share_external_id_across_types_but_not_within_type() {
         let storage = setup_storage().await;
         let repo = crate::infrastructure::storage::repository::SqliteConversationRepository::new(
@@ -1000,6 +1389,58 @@ mod storage_tests {
             mem_repo.find_by_id(mem_id).await.unwrap().unwrap().content,
             "User likes dogs"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_memory_edit_requests_survive_restart_scan() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let mem_repo = crate::infrastructure::storage::repository::SqliteMemoryRepository::new(
+            storage.pool().clone(),
+        );
+        let character = Character {
+            id: 0,
+            definition: CharacterDefinition {
+                name: "PendingEditTest".to_string(),
+                description: None,
+                personality: None,
+                scenario: None,
+                style: None,
+                background: None,
+                greetings: vec![],
+                example_messages: vec![],
+                system_prompt: None,
+                post_history_instructions: None,
+                lorebook: vec![],
+                metadata: serde_json::json!({}),
+            },
+            enabled: true,
+            state: CharacterState::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let character_id = char_repo.insert(&character).await.unwrap();
+        let mut memory = Memory::new(
+            character_id,
+            None,
+            MemoryType::Semantic,
+            "用户喜欢猫".to_string(),
+            0.8,
+        );
+        memory.metadata["edit_request"] = serde_json::json!({
+            "instruction": "改成用户喜欢狗",
+            "status": "pending",
+            "requested_at": "2026-10-17T00:00:00Z"
+        });
+        let id = mem_repo.insert(&memory).await.unwrap();
+
+        let pending = mem_repo.find_pending_edit_requests(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].content, "用户喜欢猫");
+        assert_eq!(pending[0].metadata["edit_request"]["status"], "pending");
     }
 
     #[tokio::test]

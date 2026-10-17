@@ -261,6 +261,7 @@ impl ContextAssembler {
             role: LlmRole::System,
             content,
         });
+        let post_history_present = post_history.is_some();
         let mut system_components = components.clone();
         system_components.instructions = None;
 
@@ -301,8 +302,12 @@ impl ContextAssembler {
 
             // 8c. 如果仍然超出预算，执行 history degradation
             if total_tokens > available_budget {
-                let (degraded_messages, degraded_total) =
-                    self.degrade_history_with_budget(messages, available_budget, system_tokens);
+                let (degraded_messages, degraded_total) = self.degrade_history_with_budget(
+                    messages,
+                    available_budget,
+                    system_tokens,
+                    usize::from(post_history_present),
+                );
                 messages = degraded_messages;
                 total_tokens = degraded_total;
             }
@@ -465,15 +470,31 @@ impl ContextAssembler {
                 let base_content = match &msg.content {
                     crate::domain::message::MessageContent::Text(t) => {
                         if role == LlmRole::User {
-                            format!(
-                                "[{} | 用户 {}] {}",
-                                msg.metadata
-                                    .get("display_name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("群成员"),
-                                external_id(&msg.metadata, msg.sender_id),
-                                t
-                            )
+                            let author_label =
+                                if msg.metadata.get("author_kind").and_then(|v| v.as_str())
+                                    == Some("other_bot")
+                                {
+                                    "其他 Bot"
+                                } else {
+                                    msg.metadata
+                                        .get("display_name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("群成员")
+                                };
+                            let identity = if author_label == "其他 Bot" {
+                                format!(
+                                    "{} {}",
+                                    author_label,
+                                    external_id(&msg.metadata, msg.sender_id)
+                                )
+                            } else {
+                                format!(
+                                    "{} | 用户 {}",
+                                    author_label,
+                                    external_id(&msg.metadata, msg.sender_id)
+                                )
+                            };
+                            format!("[{}] {}", identity, t)
                         } else {
                             t.clone()
                         }
@@ -519,14 +540,19 @@ impl ContextAssembler {
         mut messages: Vec<LlmMessage>,
         available_budget: usize,
         system_tokens: usize,
+        protected_tail_count: usize,
     ) -> (Vec<LlmMessage>, usize) {
-        // messages 的最后一个是 CurrentTurn，前面都是 History
+        // messages 的最后一个是 CurrentTurn，紧邻它的 protected_tail_count
+        // 条消息是不可删除的历史后指令，其余才是可降级历史。
         if messages.is_empty() {
             return (messages, system_tokens);
         }
 
         // 保护 CurrentTurn（最后一个）
         let current_turn = messages.pop();
+        let protected_count = protected_tail_count.min(messages.len());
+        let split_at = messages.len() - protected_count;
+        let mut protected_tail = messages.split_off(split_at);
         let history_messages = messages;
 
         // 从最旧的消息开始删除（history 是 oldest-first，所以从前面开始）
@@ -535,11 +561,15 @@ impl ContextAssembler {
             .as_ref()
             .map(|m| self.token_estimator.estimate_message(m))
             .unwrap_or(0);
+        let protected_tokens: usize = protected_tail
+            .iter()
+            .map(|m| self.token_estimator.estimate_message(m))
+            .sum();
         let history_tokens: usize = degraded_history
             .iter()
             .map(|m| self.token_estimator.estimate_message(m))
             .sum();
-        let mut total_tokens = system_tokens + history_tokens + current_tokens;
+        let mut total_tokens = system_tokens + history_tokens + protected_tokens + current_tokens;
 
         while total_tokens > available_budget && !degraded_history.is_empty() {
             degraded_history.remove(0); // 删除最旧的消息
@@ -547,12 +577,15 @@ impl ContextAssembler {
                 .iter()
                 .map(|m| self.token_estimator.estimate_message(m))
                 .sum();
-            total_tokens = system_tokens + new_history_tokens + current_tokens;
+            total_tokens = system_tokens + new_history_tokens + protected_tokens + current_tokens;
         }
 
-        // 恢复 CurrentTurn
-        let final_messages: Vec<LlmMessage> =
-            degraded_history.into_iter().chain(current_turn).collect();
+        // 恢复历史后指令和 CurrentTurn，保持原有顺序。
+        let final_messages: Vec<LlmMessage> = degraded_history
+            .into_iter()
+            .chain(protected_tail.drain(..))
+            .chain(current_turn)
+            .collect();
 
         (final_messages, total_tokens)
     }
@@ -1272,10 +1305,10 @@ mod tests {
     #[test]
     fn test_layered_degradation() {
         // 小 budget，强制触发 degradation
-        // context_window = 200，output_reservation = 50（使用 with_config 覆盖默认值）
+        // context_window = 220，output_reservation = 50（使用 with_config 覆盖默认值）
         let estimator = Arc::new(MockTokenEstimator);
         let model = Arc::new(MockModelCapabilities {
-            context_window: 200,
+            context_window: 220,
         });
         let config = ContextAssemblyConfig {
             degradation_enabled: true,
@@ -1323,7 +1356,7 @@ mod tests {
             .map(|m| m.content == "当前消息")
             .unwrap_or(false));
         // 估算 token 不超过可用预算（考虑 degradation）
-        // context_window=200, output_reservation=50, available_budget=150
+        // context_window=220, output_reservation=50, available_budget=170
         assert!(result.total_tokens <= 200);
     }
 
@@ -1565,10 +1598,10 @@ mod tests {
     #[test]
     fn test_history_degradation_removes_oldest_first() {
         let estimator = Arc::new(MockTokenEstimator);
-        // context_window = 200, output_reservation = 50（使用 with_config）
-        // available_budget = 150，强制触发 history degradation
+        // context_window = 220, output_reservation = 50（使用 with_config）
+        // available_budget = 170，强制触发 history degradation
         let model = Arc::new(MockModelCapabilities {
-            context_window: 200,
+            context_window: 220,
         });
         let config = ContextAssemblyConfig {
             degradation_enabled: true,
@@ -1625,6 +1658,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn history_degradation_preserves_post_history_instruction() {
+        let assembler = ContextAssembler::with_config(
+            Arc::new(MockTokenEstimator),
+            Arc::new(MockModelCapabilities {
+                context_window: 240,
+            }),
+            ContextAssemblyConfig {
+                degradation_enabled: true,
+                output_reservation: 50,
+                runtime_max_output_tokens: None,
+            },
+        );
+        let messages: Vec<Message> = (1..=10)
+            .map(|i| Message {
+                id: i,
+                conversation_id: 1,
+                sender_id: 99,
+                content: MessageContent::Text(format!("历史消息 {}", i)),
+                timestamp: Utc::now(),
+                reply_to: None,
+                mentions: vec![],
+                attachments: vec![],
+                metadata: serde_json::json!({}),
+                active_character_id: None,
+                platform_message_id: None,
+                conversation_sequence: None,
+                occurred_at: None,
+                ingested_at: None,
+            })
+            .collect();
+        let result = assembler
+            .assemble(
+                &test_ctx(messages),
+                CurrentTurn {
+                    content: "当前消息".into(),
+                    participant_id: 99,
+                    timestamp: Utc::now(),
+                },
+            )
+            .expect("降级后应保留历史后指令并满足预算");
+
+        assert!(result
+            .messages
+            .iter()
+            .any(|message| message.role == LlmRole::System
+                && message.content == "请以 Alice 的身份回答"));
+        assert_eq!(
+            result.messages.last().map(|m| m.content.as_str()),
+            Some("当前消息")
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Test: System Degradation
     // -------------------------------------------------------------------------
@@ -1633,10 +1719,10 @@ mod tests {
     #[test]
     fn test_system_degradation_removes_low_priority_first() {
         let estimator = Arc::new(MockTokenEstimator);
-        // context_window = 160, output_reservation = 20
-        // available_budget = 140，需要触发 system degradation，同时保留硬约束。
+        // context_window = 180, output_reservation = 20
+        // available_budget = 160，需要触发 system degradation，同时保留硬约束。
         let model = Arc::new(MockModelCapabilities {
-            context_window: 160,
+            context_window: 180,
         });
         let config = ContextAssemblyConfig {
             degradation_enabled: true,

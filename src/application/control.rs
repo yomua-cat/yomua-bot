@@ -1865,6 +1865,147 @@ fn handle_memory_update(
     })
 }
 
+/// 重放一个进程崩溃前已经持久化为 pending 的自然语言记忆修改请求。
+///
+/// 该函数不向控制客户端返回记忆正文，只返回是否已应用。请求内容和失败原因
+/// 始终留在记忆元数据中，供后续重试和审计使用。
+pub(crate) async fn replay_pending_memory_edit(
+    memory_repo: &dyn MemoryRepository,
+    scheduler: &dyn LlmScheduler,
+    pending: &crate::domain::memory::Memory,
+) -> Result<bool, RuntimeError> {
+    let Some(request_meta) = pending.metadata.get("edit_request") else {
+        return Ok(false);
+    };
+    if request_meta
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("pending")
+    {
+        return Ok(false);
+    }
+    let Some(instruction) = request_meta
+        .get("instruction")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+
+    let request = LlmRequest {
+        system: Some(
+            "你是记忆修改建议器。只返回 JSON，不要 Markdown，不要解释。格式必须是：".to_string()
+                + r#"{"action":"replace|append|no_change","content":"...","reason":"..."}。"#
+                + "只能根据原记忆和用户意图提出建议；不能删除记忆，不能输出额外字段。",
+        ),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: serde_json::json!({
+                "memory_id": pending.id,
+                "memory_type": format!("{:?}", pending.memory_type).to_lowercase(),
+                "current_content": pending.content,
+                "instruction": instruction,
+            })
+            .to_string(),
+        }],
+        model: None,
+        temperature: Some(0.0),
+        max_tokens: Some(512),
+        priority: 2,
+        metadata: serde_json::json!({
+            "llm_role": "decision",
+            "purpose": "memory_edit_suggestion",
+            "memory_id": pending.id,
+            "recovery": true,
+        }),
+    };
+
+    let response = match scheduler.submit(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            let mut retry = pending.clone();
+            let mut meta = request_meta.clone();
+            if let Some(object) = meta.as_object_mut() {
+                object.insert(
+                    "last_error".to_string(),
+                    serde_json::Value::String(error.to_string()),
+                );
+                object.insert(
+                    "last_attempt_at".to_string(),
+                    serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+                );
+                object.insert(
+                    "attempts".to_string(),
+                    serde_json::Value::from(
+                        object
+                            .get("attempts")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0)
+                            .saturating_add(1),
+                    ),
+                );
+            }
+            retry.metadata["edit_request"] = meta;
+            let _ = memory_repo.update_if_unchanged(&retry, pending).await?;
+            return Err(error);
+        }
+    };
+
+    let suggestion = match parse_memory_edit_suggestion(&response.content) {
+        Ok(value) => value,
+        Err(error) => {
+            let mut rejected = pending.clone();
+            rejected.metadata["edit_request"] = serde_json::json!({
+                "instruction": instruction,
+                "status": "rejected",
+                "requested_at": request_meta["requested_at"],
+                "error": error,
+                "recovered": true,
+            });
+            let _ = memory_repo.update_if_unchanged(&rejected, pending).await?;
+            return Ok(false);
+        }
+    };
+
+    let mut updated = pending.clone();
+    let old_content = updated.content.clone();
+    match suggestion.action.as_str() {
+        "replace" => updated.content = suggestion.content,
+        "append" => {
+            updated.content = format!("{}\n{}", updated.content.trim_end(), suggestion.content)
+        }
+        "no_change" => {}
+        _ => unreachable!("parse_memory_edit_suggestion 已校验 action"),
+    }
+    if updated.content.chars().count() > 20_000 {
+        updated.content = pending.content.clone();
+        updated.metadata["edit_request"] = serde_json::json!({
+            "instruction": instruction,
+            "status": "rejected",
+            "requested_at": request_meta["requested_at"],
+            "error": "修改后的记忆超过 20000 个字符",
+            "recovered": true,
+        });
+        let _ = memory_repo.update_if_unchanged(&updated, pending).await?;
+        return Ok(false);
+    }
+    updated.metadata["edit_request"] = serde_json::json!({
+        "instruction": instruction,
+        "status": "applied",
+        "action": suggestion.action,
+        "reason": suggestion.reason,
+        "requested_at": request_meta["requested_at"],
+        "applied_at": chrono::Utc::now().to_rfc3339(),
+        "model": response.model,
+        "recovered": true,
+    });
+    updated.metadata["updated_by"] = serde_json::Value::String("llm_memory_edit".to_string());
+    if !memory_repo.update_if_unchanged(&updated, pending).await? {
+        return Ok(false);
+    }
+    Ok(old_content != updated.content || suggestion.action == "no_change")
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct MemoryEditSuggestion {
     action: String,
@@ -3134,6 +3275,8 @@ mod transport_tests {
             retcode,
             data: None,
             error: error.map(str::to_string),
+            message: None,
+            wording: None,
         }
     }
 
@@ -3216,6 +3359,14 @@ mod transport_tests {
             None,
             Some(100),
         )));
+
+        let mut wording_response = action_response(None, Some(100));
+        wording_response.wording = Some("消息未找到".to_string());
+        assert!(response_explicitly_confirms_not_sent(&wording_response));
+
+        let mut message_response = action_response(None, Some(100));
+        message_response.message = Some("message not found".to_string());
+        assert!(response_explicitly_confirms_not_sent(&message_response));
     }
 
     #[test]

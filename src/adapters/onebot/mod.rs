@@ -521,11 +521,15 @@ impl InboundProcessor {
 
         // 硬性约束 B：指令消息不进入普通角色上下文，但必须先持久化为系统消息
         // 和 Outbox 事件。这样指令执行与回复才能在断线、重启和未知回执时恢复。
-        let classified_command = crate::application::command::classify(
-            &inbound.content,
-            inbound.is_mentioned,
-            inbound.conversation_type,
-        );
+        let classified_command = if inbound.is_other_bot {
+            None
+        } else {
+            crate::application::command::classify(
+                &inbound.content,
+                inbound.is_mentioned,
+                inbound.conversation_type,
+            )
+        };
         if let Some(command) = classified_command {
             let Some(conversation_id) = self
                 .conversation_manager
@@ -652,7 +656,7 @@ impl InboundProcessor {
                 Some(inbound.platform_message_id),
                 character_id,
                 inbound.is_mentioned,
-                serde_json::json!({"author_kind":"user","external_sender_id":inbound.external_sender_id,"display_name":inbound.display_name,"mentions":inbound.mention_targets,"reply_to_platform_message_id":inbound.reply_to,"content_metadata":inbound.content_metadata,"binding_id":sorted[0].id,"binding_version":sorted[0].switched_at}),
+                serde_json::json!({"author_kind": if inbound.is_other_bot { "other_bot" } else { "user" },"external_sender_id":inbound.external_sender_id,"display_name":inbound.display_name,"mentions":inbound.mention_targets,"reply_to_platform_message_id":inbound.reply_to,"content_metadata":inbound.content_metadata,"binding_id":sorted[0].id,"binding_version":sorted[0].switched_at}),
             )
             .await;
 

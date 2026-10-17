@@ -507,7 +507,13 @@ impl LlmConfig {
                     model.provider
                 )));
             }
-            if model.context_window == Some(0) || model.max_output_tokens == Some(0) {
+            if model.context_window == Some(0)
+                || model.max_output_tokens == Some(0)
+                || model
+                    .max_output_tokens
+                    .is_some_and(|value| value > u32::MAX as usize)
+                || matches!((model.context_window, model.max_output_tokens), (Some(context), Some(output)) if output >= context)
+            {
                 return Err(RuntimeError::Config(
                     "decision.toml 的上下文和输出预算必须大于 0".into(),
                 ));

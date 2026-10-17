@@ -352,16 +352,19 @@ impl LlmScheduler for DefaultLlmScheduler {
         &self,
         role: &str,
     ) -> Option<crate::infrastructure::llm::FixedModelCapabilities> {
-        self.routes
-            .as_ref()?
-            .get(role)
-            .and_then(|route| route.models.first())
-            .map(|model| {
-                crate::infrastructure::llm::FixedModelCapabilities::new(
-                    model.context_window,
-                    model.max_output_tokens,
-                )
-            })
+        let route = self.routes.as_ref()?.get(role)?;
+        let context_window = route.models.iter().try_fold(None, |minimum, model| {
+            let value = model.context_window?;
+            Some(Some(minimum.unwrap_or(value).min(value)))
+        })?;
+        let max_output_tokens = route.models.iter().try_fold(None, |minimum, model| {
+            let value = model.max_output_tokens?;
+            Some(Some(minimum.unwrap_or(value).min(value)))
+        })?;
+        Some(crate::infrastructure::llm::FixedModelCapabilities::new(
+            context_window,
+            max_output_tokens,
+        ))
     }
 }
 
@@ -1031,5 +1034,44 @@ mod tests {
         assert_eq!(backup.call_count(), 1);
         assert_eq!(primary.captured_max_tokens(), vec![Some(256)]);
         assert_eq!(backup.captured_max_tokens(), vec![Some(256)]);
+    }
+
+    #[test]
+    fn capabilities_for_uses_smallest_model_in_fallback_chain() {
+        let provider = Arc::new(FakeProvider::new(false, "provider"));
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "provider".to_string(),
+            provider.clone() as Arc<dyn LlmProvider>,
+        );
+        let routes = std::collections::HashMap::from([(
+            "conversation".to_string(),
+            LlmRouteConfig {
+                models: vec![
+                    crate::application::config::LlmModelInstanceConfig {
+                        provider: "provider".into(),
+                        model: "large".into(),
+                        context_window: Some(32_768),
+                        max_output_tokens: Some(2_048),
+                    },
+                    crate::application::config::LlmModelInstanceConfig {
+                        provider: "provider".into(),
+                        model: "small".into(),
+                        context_window: Some(8_192),
+                        max_output_tokens: Some(512),
+                    },
+                ],
+                max_attempts: 2,
+                budget_tokens: None,
+            },
+        )]);
+        let scheduler =
+            DefaultLlmScheduler::with_provider_routes(provider, 2, 2, providers, routes);
+
+        let capabilities = scheduler
+            .capabilities_for("conversation")
+            .expect("应返回备用链能力");
+        assert_eq!(capabilities.context_window, Some(8_192));
+        assert_eq!(capabilities.max_output, Some(512));
     }
 }

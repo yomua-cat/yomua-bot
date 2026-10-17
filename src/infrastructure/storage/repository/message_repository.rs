@@ -146,7 +146,7 @@ impl MessageRepository for SqliteMessageRepository {
         after_message_id: i64,
         limit: i64,
     ) -> Result<Vec<Message>, RepositoryError> {
-        let rows:Vec<MessageRow>=sqlx::query_as("SELECT id,conversation_id,sender_id,content,timestamp,reply_to,mentions,attachments,metadata,active_character_id,platform_message_id,conversation_sequence,occurred_at,ingested_at FROM messages WHERE active_character_id=? AND conversation_id=? AND id>? AND COALESCE(json_extract(metadata,'$.proactive'),0)!=1 ORDER BY id LIMIT ?")
+        let rows:Vec<MessageRow>=sqlx::query_as("SELECT id,conversation_id,sender_id,content,timestamp,reply_to,mentions,attachments,metadata,active_character_id,platform_message_id,conversation_sequence,occurred_at,ingested_at FROM messages WHERE active_character_id=? AND conversation_id=? AND id>? AND COALESCE(json_extract(metadata,'$.proactive'),0)!=1 AND COALESCE(json_extract(metadata,'$.author_kind'),'') NOT IN ('system_command','platform_echo','system') ORDER BY id LIMIT ?")
         .bind(character_id).bind(conversation_id).bind(after_message_id).bind(limit.max(0)).fetch_all(&self.pool).await?;
         rows.into_iter().map(parse_message_row).collect()
     }
@@ -323,6 +323,44 @@ impl MessageRepository for SqliteMessageRepository {
             .bind(message_id).bind(character_id).bind(status.to_string()).bind(content).bind(error).bind(chrono::Utc::now().to_rfc3339()).execute(&self.pool).await?;
         Ok(())
     }
+
+    async fn begin_reply_task_delivery(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        lease_token: &str,
+    ) -> Result<bool, RepositoryError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let updated = sqlx::query(
+            r#"INSERT INTO reply_tasks(
+                   message_id, character_id, status, content, error, updated_at
+               )
+               SELECT ?, ?, 'sending', NULL, NULL, ?
+               FROM outbox_events
+               WHERE entity_id = ?
+                 AND entity_type = 'messages'
+                 AND event_type = 'MessageAccepted'
+                 AND status = 'processing'
+                 AND lease_token = ?
+                 AND locked_until > ?
+               LIMIT 1
+               ON CONFLICT(message_id) DO UPDATE SET
+                   status = 'sending',
+                   error = NULL,
+                   updated_at = excluded.updated_at
+               WHERE reply_tasks.character_id = excluded.character_id
+                 AND reply_tasks.status IN ('pending', 'generated')"#,
+        )
+        .bind(message_id)
+        .bind(character_id)
+        .bind(&now)
+        .bind(message_id)
+        .bind(lease_token)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
     async fn mark_reply_task_unknown_if_sending(
         &self,
         message_id: i64,
@@ -354,6 +392,53 @@ impl MessageRepository for SqliteMessageRepository {
         sqlx::query("INSERT INTO reply_tasks(message_id,character_id,status,content,error,platform_message_id,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET status=excluded.status,content=COALESCE(excluded.content,reply_tasks.content),error=excluded.error,platform_message_id=COALESCE(excluded.platform_message_id,reply_tasks.platform_message_id),updated_at=excluded.updated_at")
             .bind(message_id).bind(character_id).bind(status.to_string()).bind(content).bind(error).bind(platform_message_id).bind(chrono::Utc::now().to_rfc3339()).execute(&self.pool).await?;
         Ok(())
+    }
+
+    async fn save_reply_task_delivery_owned(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        lease_token: &str,
+        status: crate::domain::message::ReplyTaskStatus,
+        content: Option<&str>,
+        error: Option<&str>,
+        platform_message_id: Option<i64>,
+    ) -> Result<bool, RepositoryError> {
+        // 租约校验与任务状态更新必须在同一条 UPDATE 中完成。否则旧 worker
+        // 可能在校验后失去租约，随后覆盖新 worker 已写入的发送结果。
+        let result = sqlx::query(
+            r#"UPDATE reply_tasks
+                  SET status = ?,
+                      content = COALESCE(?, content),
+                      error = ?,
+                      platform_message_id = COALESCE(?, platform_message_id),
+                      updated_at = ?
+                WHERE message_id = ?
+                  AND character_id = ?
+                  AND status IN ('sending', 'generated', 'pending', 'generating', 'unknown')
+                  AND EXISTS (
+                      SELECT 1 FROM outbox_events
+                       WHERE entity_id = ?
+                         AND entity_type = 'messages'
+                         AND event_type = 'MessageAccepted'
+                         AND status = 'processing'
+                         AND lease_token = ?
+                         AND locked_until > ?
+                  )"#,
+        )
+        .bind(status.to_string())
+        .bind(content)
+        .bind(error)
+        .bind(platform_message_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(message_id)
+        .bind(character_id)
+        .bind(message_id)
+        .bind(lease_token)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn requeue_unknown_reply_task(&self, message_id: i64) -> Result<bool, RepositoryError> {
@@ -529,7 +614,11 @@ impl MessageRepository for SqliteMessageRepository {
                     reply_to, mentions, attachments, metadata, active_character_id,
                     platform_message_id, conversation_sequence,
                     occurred_at, ingested_at
-               FROM messages WHERE conversation_id = ?
+               FROM messages
+               WHERE conversation_id = ?
+                 AND COALESCE(json_extract(metadata, '$.author_kind'), '')
+                     NOT IN ('system_command', 'platform_echo', 'system')
+                 AND COALESCE(json_extract(metadata, '$.proactive'), 0) != 1
                ORDER BY timestamp DESC, id DESC LIMIT ?"#,
         )
         .bind(conversation_id)
@@ -560,6 +649,9 @@ impl MessageRepository for SqliteMessageRepository {
                     occurred_at, ingested_at
                FROM messages
                WHERE conversation_id = ? AND active_character_id = ?
+                 AND COALESCE(json_extract(metadata, '$.author_kind'), '')
+                     NOT IN ('system_command', 'platform_echo', 'system')
+                 AND COALESCE(json_extract(metadata, '$.proactive'), 0) != 1
                ORDER BY timestamp DESC, id DESC
                LIMIT ?"#,
         )
@@ -662,14 +754,14 @@ impl MessageRepository for SqliteMessageRepository {
         &self,
         conversation_id: i64,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, RepositoryError> {
-        let row: Option<(String,)> =
+        let row: Option<(Option<String>,)> =
             sqlx::query_as(r#"SELECT MAX(timestamp) FROM messages WHERE conversation_id = ?"#)
                 .bind(conversation_id)
                 .fetch_optional(&self.pool)
                 .await?;
 
-        match row {
-            Some((timestamp,)) => {
+        match row.and_then(|(timestamp,)| timestamp) {
+            Some(timestamp) => {
                 let dt = super::timestamp::parse_timestamp(&timestamp)?;
                 Ok(Some(dt))
             }
@@ -693,6 +785,9 @@ impl MessageRepository for SqliteMessageRepository {
                WHERE conversation_id = ?
                  AND active_character_id = ?
                  AND conversation_sequence < ?
+                 AND COALESCE(json_extract(metadata, '$.author_kind'), '')
+                     NOT IN ('system_command', 'platform_echo', 'system')
+                 AND COALESCE(json_extract(metadata, '$.proactive'), 0) != 1
                ORDER BY conversation_sequence DESC, id DESC
                LIMIT ?"#,
         )
@@ -724,6 +819,9 @@ impl MessageRepository for SqliteMessageRepository {
                     occurred_at, ingested_at
                FROM messages
                WHERE conversation_id = ?
+                 AND COALESCE(json_extract(metadata, '$.author_kind'), '')
+                     NOT IN ('system_command', 'platform_echo', 'system')
+                 AND COALESCE(json_extract(metadata, '$.proactive'), 0) != 1
                ORDER BY conversation_sequence DESC, id DESC
                LIMIT ?"#,
         )

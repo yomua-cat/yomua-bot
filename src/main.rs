@@ -1150,9 +1150,20 @@ fn build_app_layer(
         .clone()
         .map(|scheduler| scheduler as Arc<dyn LlmScheduler>);
     let resolved = llm_cfg.resolve()?;
+    // 上下文预算必须兼容整条备用链，取调度器解析后的最小能力，避免主模型
+    // 失败切换到更小的备用模型时请求在 Provider 侧超限。
+    let conversation_capabilities = llm_scheduler
+        .as_ref()
+        .and_then(|scheduler| scheduler.capabilities_for("conversation"));
     let conversation_model = resolved.as_ref().map(|config| config.conversation_model());
-    let context_window = conversation_model.and_then(|model| model.context_window);
-    let max_output_tokens = conversation_model.and_then(|model| model.max_output_tokens);
+    let context_window = conversation_capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.context_window)
+        .or_else(|| conversation_model.and_then(|model| model.context_window));
+    let max_output_tokens = conversation_capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.max_output)
+        .or_else(|| conversation_model.and_then(|model| model.max_output_tokens));
     let output_reservation = max_output_tokens.unwrap_or(512);
     let token_estimator = Arc::new(TokenEstimatorAdapter(Arc::new(ApproximateTokenEstimator)));
     let model_capabilities = Arc::new(ModelCapabilitiesProviderAdapter(Arc::new(
@@ -1225,7 +1236,12 @@ fn spawn_background_tasks(
     let mut tasks = BackgroundTasks::default();
     let reply_processor_for_outbox = reply_processor.clone();
 
-    let memory_maintenance = Arc::new(MemoryMaintenanceDriver::new(repos.memory_repo.clone()));
+    let memory_maintenance = MemoryMaintenanceDriver::new(repos.memory_repo.clone());
+    let memory_maintenance = match app.llm_scheduler.clone() {
+        Some(scheduler) => memory_maintenance.with_llm_scheduler(scheduler),
+        None => memory_maintenance,
+    };
+    let memory_maintenance = Arc::new(memory_maintenance);
     let memory_shutdown = shutdown_rx.clone();
     tasks
         .handles

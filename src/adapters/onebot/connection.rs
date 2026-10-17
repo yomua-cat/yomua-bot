@@ -49,6 +49,10 @@ pub struct ActionResponse {
     pub data: Option<serde_json::Value>,
     /// 错误信息。
     pub error: Option<String>,
+    /// OneBot 标准失败回执中的简短消息。
+    pub message: Option<String>,
+    /// NapCat 常用的面向用户错误说明。
+    pub wording: Option<String>,
 }
 
 impl ActionResponse {
@@ -59,8 +63,18 @@ impl ActionResponse {
 
     /// 将错误信息格式化为字符串。
     pub fn error_message(&self) -> String {
-        if let Some(msg) = &self.error {
-            return msg.clone();
+        let mut messages = Vec::new();
+        for value in [&self.error, &self.message, &self.wording]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+        {
+            if !value.trim().is_empty() && !messages.iter().any(|item| item == &value) {
+                messages.push(value);
+            }
+        }
+        if !messages.is_empty() {
+            return messages.join(" | ");
         }
         if let Some(code) = self.retcode {
             if code != 0 {
@@ -399,6 +413,14 @@ fn classify_incoming_message(text: &str) -> IncomingMessage {
                 .get("error")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let message = json
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let wording = json
+                .get("wording")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
             return IncomingMessage::Response(ActionResponse {
                 id,
                 action,
@@ -406,6 +428,8 @@ fn classify_incoming_message(text: &str) -> IncomingMessage {
                 retcode,
                 data,
                 error,
+                message,
+                wording,
             });
         }
     }
@@ -619,6 +643,8 @@ mod tests {
             retcode: Some(0),
             data: None,
             error: None,
+            message: None,
+            wording: None,
         };
         assert!(response.is_ok());
         response.status = "failed".into();
@@ -626,6 +652,19 @@ mod tests {
         response.status = "ok".into();
         response.retcode = Some(1);
         assert!(!response.is_ok());
+    }
+
+    #[test]
+    fn classify_response_preserves_message_and_wording() {
+        let incoming = classify_incoming_message(
+            r#"{"status":"failed","retcode":100,"message":"消息不存在","wording":"消息未找到","echo":"7"}"#,
+        );
+        let IncomingMessage::Response(response) = incoming else {
+            panic!("应解析为 Action 响应");
+        };
+        assert_eq!(response.message.as_deref(), Some("消息不存在"));
+        assert_eq!(response.wording.as_deref(), Some("消息未找到"));
+        assert!(response.error_message().contains("消息未找到"));
     }
 
     #[test]
@@ -653,6 +692,8 @@ mod tests {
                 retcode: Some(0),
                 data: None,
                 error: None,
+                message: None,
+                wording: None,
             }
         ));
         assert_eq!(shared.pending.lock().unwrap().len(), 1);
@@ -666,6 +707,8 @@ mod tests {
                 retcode: Some(0),
                 data: None,
                 error: None,
+                message: None,
+                wording: None,
             }
         ));
         assert!(response_rx.try_recv().is_ok());
