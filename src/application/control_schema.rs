@@ -372,7 +372,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: CHARACTER_STATE_SET,
-            usage: "character state set --character <id> [--conversation <id>] [--energy N] [--stress N] [--mood N] [--activity <text>]",
+            usage: "character state set --character <id> [--conversation <id>] [--energy N] [--stress N] [--mood N] [--activity <text>] --confirm",
             group: "状态",
             description: "修改角色状态",
             destructive: true,
@@ -432,7 +432,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: BLACKLIST_ADD,
-            usage: "blacklist add <qq-id> [--reason <text>]",
+            usage: "blacklist add <qq-id> [--reason <text>] --confirm",
             group: "黑名单",
             description: "添加黑名单",
             destructive: true,
@@ -444,7 +444,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: BLACKLIST_REMOVE,
-            usage: "blacklist remove <qq-id>",
+            usage: "blacklist remove <qq-id> --confirm",
             group: "黑名单",
             description: "移除黑名单",
             destructive: true,
@@ -685,6 +685,17 @@ mod tests {
         assert_eq!(canonicalize("m list"), Some(MEMORY_LIST));
         assert_eq!(canonicalize("ss delete-all"), Some(SESSION_DELETE_ALL));
         assert!(!requires_confirmation("ss delete-all"));
+    }
+
+    #[test]
+    fn destructive_help_usage_requires_explicit_confirmation() {
+        for spec in specs().iter().filter(|spec| spec.requires_confirmation) {
+            assert!(
+                spec.usage.contains("--confirm"),
+                "危险命令帮助必须显示 --confirm: {}",
+                spec.name
+            );
+        }
     }
 
     #[test]

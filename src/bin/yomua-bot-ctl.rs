@@ -77,6 +77,38 @@ fn command_from_path(path: &[String]) -> Option<BuiltinCommand> {
     ControlOperation::from_canonical_name(canonical)
 }
 
+fn parse_positive_option(value: Option<&&str>, name: &str) -> Result<i64, String> {
+    let value = value.ok_or_else(|| format!("{name} 需要一个正整数"))?;
+    let parsed = value
+        .parse::<i64>()
+        .map_err(|_| format!("{name} 需要一个正整数"))?;
+    if parsed <= 0 {
+        return Err(format!("{name} 需要一个正整数"));
+    }
+    Ok(parsed)
+}
+
+fn parse_non_negative_option(value: Option<&&str>, name: &str) -> Result<i64, String> {
+    let value = value.ok_or_else(|| format!("{name} 需要一个非负整数"))?;
+    let parsed = value
+        .parse::<i64>()
+        .map_err(|_| format!("{name} 需要一个非负整数"))?;
+    if parsed < 0 {
+        return Err(format!("{name} 需要一个非负整数"));
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_id(value: &str, name: &str) -> Result<i64, String> {
+    let parsed = value
+        .parse::<i64>()
+        .map_err(|_| format!("{name} 必须是正整数"))?;
+    if parsed <= 0 {
+        return Err(format!("{name} 必须是正整数"));
+    }
+    Ok(parsed)
+}
+
 // ============================================================================
 // 第二节：解析后的命令
 // ============================================================================
@@ -145,72 +177,44 @@ impl ParsedCommand {
                         if tokens.get(i).is_none_or(|value| value.starts_with("--")) {
                             return Err("--limit 需要一个数值".to_string());
                         }
-                        opts.limit = Some(
-                            tokens
-                                .get(i)
-                                .and_then(|v| v.parse().ok())
-                                .ok_or_else(|| "--limit 需要一个数值".to_string())?,
-                        );
+                        opts.limit = Some(parse_positive_option(tokens.get(i), "--limit")?);
                     }
                     "offset" => {
                         i += 1;
                         if tokens.get(i).is_none_or(|value| value.starts_with("--")) {
                             return Err("--offset 需要一个数值".to_string());
                         }
-                        opts.offset = Some(
-                            tokens
-                                .get(i)
-                                .and_then(|v| v.parse().ok())
-                                .ok_or_else(|| "--offset 需要一个数值".to_string())?,
-                        );
+                        opts.offset = Some(parse_non_negative_option(tokens.get(i), "--offset")?);
                     }
                     "id" => {
                         i += 1;
                         if tokens.get(i).is_none_or(|value| value.starts_with("--")) {
                             return Err("--id 需要一个正整数".to_string());
                         }
-                        opts.id = Some(
-                            tokens
-                                .get(i)
-                                .and_then(|v| v.parse().ok())
-                                .ok_or_else(|| "--id 需要一个正整数".to_string())?,
-                        );
+                        opts.id = Some(parse_positive_option(tokens.get(i), "--id")?);
                     }
                     "character" | "character-id" => {
                         i += 1;
                         if tokens.get(i).is_none_or(|value| value.starts_with("--")) {
                             return Err("--character 需要一个正整数".to_string());
                         }
-                        opts.character_id = Some(
-                            tokens
-                                .get(i)
-                                .and_then(|v| v.parse().ok())
-                                .ok_or_else(|| "--character 需要一个正整数".to_string())?,
-                        );
+                        opts.character_id =
+                            Some(parse_positive_option(tokens.get(i), "--character")?);
                     }
                     "conversation" | "conversation-id" => {
                         i += 1;
                         if tokens.get(i).is_none_or(|value| value.starts_with("--")) {
                             return Err("--conversation 需要一个正整数".to_string());
                         }
-                        opts.conversation_id = Some(
-                            tokens
-                                .get(i)
-                                .and_then(|v| v.parse().ok())
-                                .ok_or_else(|| "--conversation 需要一个正整数".to_string())?,
-                        );
+                        opts.conversation_id =
+                            Some(parse_positive_option(tokens.get(i), "--conversation")?);
                     }
                     "user" | "user-id" => {
                         i += 1;
                         if tokens.get(i).is_none_or(|value| value.starts_with("--")) {
                             return Err("--user 需要一个正整数".to_string());
                         }
-                        opts.user_id = Some(
-                            tokens
-                                .get(i)
-                                .and_then(|v| v.parse().ok())
-                                .ok_or_else(|| "--user 需要一个正整数".to_string())?,
-                        );
+                        opts.user_id = Some(parse_positive_option(tokens.get(i), "--user")?);
                     }
                     "mood" => {
                         i += 1;
@@ -281,12 +285,7 @@ impl ParsedCommand {
                         if tokens.get(i).is_none_or(|value| value.starts_with("--")) {
                             return Err("--memory-id 需要一个正整数".to_string());
                         }
-                        opts.memory_id = Some(
-                            tokens
-                                .get(i)
-                                .and_then(|v| v.parse().ok())
-                                .ok_or_else(|| "--memory-id 需要一个正整数".to_string())?,
-                        );
+                        opts.memory_id = Some(parse_positive_option(tokens.get(i), "--memory-id")?);
                     }
                     "type" | "memory-type" => {
                         i += 1;
@@ -953,12 +952,11 @@ fn build_request(
         | ControlOperation::CharacterStateGet
         | ControlOperation::CharacterStateSet => {
             if let Some(arg) = args.first() {
-                if let Ok(v) = arg.parse() {
-                    if matches!(builtin, ControlOperation::CharacterStateSet) {
-                        opts.character_id = Some(v);
-                    } else {
-                        opts.id = Some(v);
-                    }
+                let v = parse_positive_id(arg, "角色 ID")?;
+                if matches!(builtin, ControlOperation::CharacterStateSet) {
+                    opts.character_id = Some(v);
+                } else {
+                    opts.id = Some(v);
                 }
             }
         }
@@ -971,44 +969,32 @@ fn build_request(
         }
         ControlOperation::MemoryDelete => {
             if let Some(arg) = args.first() {
-                if let Ok(v) = arg.parse() {
-                    opts.memory_id = Some(v);
-                }
+                opts.memory_id = Some(parse_positive_id(arg, "记忆 ID")?);
             }
         }
         ControlOperation::MemoryUpdate => {
             if let Some(arg) = args.first() {
-                if let Ok(v) = arg.parse() {
-                    opts.memory_id = Some(v);
-                }
+                opts.memory_id = Some(parse_positive_id(arg, "记忆 ID")?);
             }
         }
         ControlOperation::MemorySharingRequest
         | ControlOperation::MemorySharingConfirm
         | ControlOperation::MemorySharingCancel => {
             if let Some(arg) = args.first() {
-                if let Ok(v) = arg.parse() {
-                    opts.character_id = Some(v);
-                }
+                opts.character_id = Some(parse_positive_id(arg, "角色 ID")?);
             }
             if let Some(arg) = args.get(1) {
-                if let Ok(v) = arg.parse() {
-                    opts.user_id = Some(v);
-                }
+                opts.user_id = Some(parse_positive_id(arg, "用户 ID")?);
             }
         }
         ControlOperation::ReplyUnknownCheck | ControlOperation::ReplyUnknownRetry => {
             if let Some(arg) = args.first() {
-                if let Ok(v) = arg.parse() {
-                    opts.id = Some(v);
-                }
+                opts.id = Some(parse_positive_id(arg, "消息 ID")?);
             }
         }
         ControlOperation::SessionDeleteCharacter => {
             if let Some(arg) = args.first() {
-                if let Ok(v) = arg.parse() {
-                    opts.character_id = Some(v);
-                }
+                opts.character_id = Some(parse_positive_id(arg, "角色 ID")?);
             }
         }
         _ => {}
@@ -1061,8 +1047,8 @@ fn build_request(
             if args.len() != 2 {
                 return Err("需要 <old-id> <new-id> 两个参数".to_string());
             }
-            let old_id: i64 = args[0].parse().map_err(|_| "old-id 必须是整数")?;
-            let new_id: i64 = args[1].parse().map_err(|_| "new-id 必须是整数")?;
+            let old_id = parse_positive_id(&args[0], "old-id")?;
+            let new_id = parse_positive_id(&args[1], "new-id")?;
             let mut p = serde_json::Map::new();
             p.insert("old_id".to_string(), json!(old_id));
             p.insert("new_id".to_string(), json!(new_id));
@@ -1240,8 +1226,8 @@ fn build_request(
             if args.len() != 2 {
                 return Err("需要 <source-user-id> <target-user-id> 两个参数".to_string());
             }
-            let source: i64 = args[0].parse().map_err(|_| "source-user-id 必须是整数")?;
-            let target: i64 = args[1].parse().map_err(|_| "target-user-id 必须是整数")?;
+            let source = parse_positive_id(&args[0], "source-user-id")?;
+            let target = parse_positive_id(&args[1], "target-user-id")?;
             Ok((
                 "user merge",
                 json!({ "source_user_id": source, "target_user_id": target }),
@@ -1250,8 +1236,8 @@ fn build_request(
         ControlOperation::UserDelete => {
             let user_id = args
                 .first()
-                .and_then(|value| value.parse::<i64>().ok())
-                .ok_or_else(|| "需要 <user-id>".to_string())?;
+                .ok_or_else(|| "需要 <user-id>".to_string())
+                .and_then(|value| parse_positive_id(value, "user-id"))?;
             Ok(("user delete", json!({ "user_id": user_id })))
         }
     }
@@ -2273,6 +2259,34 @@ mod tests {
         let r = ParsedCommand::parse(&tokens);
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("需要"));
+    }
+
+    #[test]
+    fn positional_ids_reject_non_numeric_and_non_positive_values() {
+        for tokens in [
+            vec!["character", "show", "abc"],
+            vec!["character", "show", "0"],
+            vec!["character", "show", "-1"],
+            vec!["memory", "delete", "abc"],
+            vec!["user", "delete", "0", "--confirm"],
+        ] {
+            let parsed = ParsedCommand::parse(&tokens).expect("词法解析应保留位置参数");
+            let operation = command_from_path(&parsed.path).expect("命令应存在");
+            let error = build_request(operation, &parsed.opts, &parsed.args, 1)
+                .expect_err("非法 ID 不应进入结构化请求");
+            assert!(
+                error.contains("正整数") || error.contains("ID"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_options_reject_negative_values() {
+        assert!(ParsedCommand::parse(&["character", "list", "--limit", "0"]).is_err());
+        assert!(ParsedCommand::parse(&["character", "list", "--limit", "-1"]).is_err());
+        assert!(ParsedCommand::parse(&["character", "list", "--offset", "-1"]).is_err());
+        assert!(ParsedCommand::parse(&["character", "list", "--offset", "0"]).is_ok());
     }
 
     #[test]
