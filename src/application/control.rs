@@ -106,6 +106,7 @@ impl CommandRegistry {
             })
             .unwrap_or(control_schema::ControlCommandSpec {
                 name,
+                params: &[],
                 usage: name,
                 group: "扩展",
                 description: fallback_description,

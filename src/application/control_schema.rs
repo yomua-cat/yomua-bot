@@ -46,6 +46,40 @@ pub enum ControlOperation {
 }
 
 impl ControlOperation {
+    pub const ALL: &'static [Self] = &[
+        Self::Status,
+        Self::Help,
+        Self::ReloadConfig,
+        Self::Shutdown,
+        Self::CharacterList,
+        Self::CharacterShow,
+        Self::CharacterCardList,
+        Self::CharacterCardEnable,
+        Self::CharacterCardDisable,
+        Self::CharacterCardReassign,
+        Self::ConversationList,
+        Self::CharacterStateGet,
+        Self::CharacterStateSet,
+        Self::CharacterStateRefresh,
+        Self::UserMerge,
+        Self::UserDelete,
+        Self::BlacklistList,
+        Self::BlacklistAdd,
+        Self::BlacklistRemove,
+        Self::BlacklistBan,
+        Self::MemoryList,
+        Self::MemoryDelete,
+        Self::MemoryUpdate,
+        Self::MemorySharingRequest,
+        Self::MemorySharingConfirm,
+        Self::MemorySharingCancel,
+        Self::ReplyUnknownList,
+        Self::ReplyUnknownCheck,
+        Self::ReplyUnknownRetry,
+        Self::SessionDeleteAll,
+        Self::SessionDeleteCharacter,
+    ];
+
     pub const fn canonical_name(self) -> &'static str {
         match self {
             Self::Status => STATUS,
@@ -122,37 +156,12 @@ impl ControlOperation {
 
     /// 返回该操作接受的 JSON 参数字段及类型。此处定义服务端协议字段，
     /// ctl 负责把人类输入转换成这些字段；handler 继续负责业务约束。
-    pub const fn params(self) -> &'static [ControlParamSpec] {
-        use param_specs::*;
-        use ControlOperation::*;
-        match self {
-            Status
-            | Help
-            | ReloadConfig
-            | Shutdown
-            | CharacterCardList
-            | ConversationList
-            | CharacterStateRefresh
-            | BlacklistList
-            | SessionDeleteAll => NONE,
-            CharacterList => CHARACTER_LIST,
-            CharacterShow | CharacterCardEnable | CharacterCardDisable => ID,
-            CharacterCardReassign => REASSIGN,
-            CharacterStateGet => STATE_GET,
-            CharacterStateSet => STATE_SET,
-            UserMerge => USER_MERGE,
-            UserDelete => USER_DELETE,
-            BlacklistAdd => BLACKLIST_ADD,
-            BlacklistRemove => BLACKLIST_REMOVE,
-            BlacklistBan => BLACKLIST_BAN,
-            MemoryList => MEMORY_LIST,
-            MemoryDelete => MEMORY_DELETE,
-            MemoryUpdate => MEMORY_UPDATE,
-            MemorySharingRequest | MemorySharingConfirm | MemorySharingCancel => MEMORY_SHARING,
-            ReplyUnknownList => REPLY_UNKNOWN_LIST,
-            ReplyUnknownCheck | ReplyUnknownRetry => MESSAGE_ID,
-            SessionDeleteCharacter => CHARACTER_ID,
-        }
+    pub fn params(self) -> &'static [ControlParamSpec] {
+        specs()
+            .iter()
+            .find(|spec| ControlOperation::from_canonical_name(spec.name) == Some(self))
+            .map(|spec| spec.params)
+            .unwrap_or(&[])
     }
 }
 
@@ -322,6 +331,8 @@ impl ControlEnvelope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlCommandSpec {
     pub name: &'static str,
+    /// JSON 字段及类型，与人类参数语法属于同一命令定义。
+    pub params: &'static [ControlParamSpec],
     pub usage: &'static str,
     pub group: &'static str,
     pub description: &'static str,
@@ -394,6 +405,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
     &[
         ControlCommandSpec {
             name: STATUS,
+            params: param_specs::NONE,
             usage: "status [--raw]",
             group: "系统",
             description: "查询运行时状态",
@@ -406,6 +418,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: HELP,
+            params: param_specs::NONE,
             usage: "help",
             group: "系统",
             description: "显示所有可用命令",
@@ -418,6 +431,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: RELOAD_CONFIG,
+            params: param_specs::NONE,
             usage: "reload-config",
             group: "系统",
             description: "重新加载并校验配置",
@@ -430,6 +444,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: SHUTDOWN,
+            params: param_specs::NONE,
             usage: "shutdown --confirm",
             group: "系统",
             description: "优雅关闭运行时",
@@ -442,6 +457,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: CHARACTER_LIST,
+            params: param_specs::CHARACTER_LIST,
             usage: "character list [--limit N] [--offset N]",
             group: "角色",
             description: "列出角色",
@@ -454,6 +470,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: CHARACTER_SHOW,
+            params: param_specs::ID,
             usage: "character show <id> [--raw]",
             group: "角色",
             description: "显示角色详情",
@@ -466,6 +483,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: CHARACTER_CARD_LIST,
+            params: param_specs::NONE,
             usage: "character card list [--raw]",
             group: "角色",
             description: "列出角色卡及启用状态",
@@ -478,6 +496,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: CHARACTER_CARD_ENABLE,
+            params: param_specs::ID,
             usage: "character card enable <id>",
             group: "角色",
             description: "启用角色卡",
@@ -490,6 +509,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: CHARACTER_CARD_DISABLE,
+            params: param_specs::ID,
             usage: "character card disable <id> --confirm",
             group: "角色",
             description: "停用角色卡",
@@ -502,6 +522,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: CHARACTER_CARD_REASSIGN,
+            params: param_specs::REASSIGN,
             usage: "character card reassign <old-id> <new-id> --confirm",
             group: "角色",
             description: "修改角色卡 ID",
@@ -514,6 +535,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: CONVERSATION_LIST,
+            params: param_specs::NONE,
             usage: "conversation list",
             group: "会话",
             description: "列出会话",
@@ -526,6 +548,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: CHARACTER_STATE_GET,
+            params: param_specs::STATE_GET,
             usage: "character state get <character-id> [--conversation <id>] [--raw]",
             group: "状态",
             description: "查询角色状态",
@@ -538,6 +561,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: CHARACTER_STATE_SET,
+            params: param_specs::STATE_SET,
             usage: "character state set [<character-id>] [--character <id>] [--conversation <id>] [--energy N] [--stress N] [--mood N] [--activity <text>] --confirm",
             group: "状态",
             description: "修改角色状态",
@@ -550,6 +574,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: CHARACTER_STATE_REFRESH,
+            params: param_specs::NONE,
             usage: "character state refresh",
             group: "状态",
             description: "刷新角色状态",
@@ -562,6 +587,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: USER_MERGE,
+            params: param_specs::USER_MERGE,
             usage: "user merge <source-user-id> <target-user-id> --confirm",
             group: "用户",
             description: "把一个全域用户的数据合并到另一个用户并删除来源用户",
@@ -574,6 +600,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: USER_DELETE,
+            params: param_specs::USER_DELETE,
             usage: "user delete <user-id> --confirm",
             group: "用户",
             description: "删除全域用户及其关联关系",
@@ -586,6 +613,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: BLACKLIST_LIST,
+            params: param_specs::NONE,
             usage: "blacklist list",
             group: "黑名单",
             description: "列出黑名单",
@@ -598,6 +626,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: BLACKLIST_ADD,
+            params: param_specs::BLACKLIST_ADD,
             usage: "blacklist add <qq-id> [--reason <text>] --confirm",
             group: "黑名单",
             description: "添加黑名单",
@@ -610,6 +639,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: BLACKLIST_REMOVE,
+            params: param_specs::BLACKLIST_REMOVE,
             usage: "blacklist remove <qq-id> --confirm",
             group: "黑名单",
             description: "移除黑名单",
@@ -622,6 +652,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: BLACKLIST_BAN,
+            params: param_specs::BLACKLIST_BAN,
             usage: "blacklist ban <qq-id> --duration <dur> [--reason <text>] --confirm",
             group: "黑名单",
             description: "临时封禁用户",
@@ -634,6 +665,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: MEMORY_LIST,
+            params: param_specs::MEMORY_LIST,
             usage: "memory list [--character <id>] [--conversation <id>] [--type <type>] [--limit N] [--raw]",
             group: "记忆",
             description: "查询记忆",
@@ -646,6 +678,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: MEMORY_DELETE,
+            params: param_specs::MEMORY_DELETE,
             usage: "memory delete <memory-id> --confirm",
             group: "记忆",
             description: "删除记忆",
@@ -658,6 +691,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: MEMORY_UPDATE,
+            params: param_specs::MEMORY_UPDATE,
             usage: "memory update <memory-id> --instruction <中文修改说明> --confirm",
             group: "记忆",
             description: "确认或更正记忆",
@@ -670,6 +704,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: MEMORY_SHARING_REQUEST,
+            params: param_specs::MEMORY_SHARING,
             usage: "memory sharing request <character-id> <user-id> [--reason <text>]",
             group: "记忆",
             description: "记录用户提出的跨会话记忆禁用请求",
@@ -682,6 +717,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: MEMORY_SHARING_CONFIRM,
+            params: param_specs::MEMORY_SHARING,
             usage: "memory sharing confirm <character-id> <user-id> --confirm [--reason <text>]",
             group: "记忆",
             description: "确认跨会话记忆禁用请求",
@@ -694,6 +730,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: MEMORY_SHARING_CANCEL,
+            params: param_specs::MEMORY_SHARING,
             usage: "memory sharing cancel <character-id> <user-id> --confirm [--reason <text>]",
             group: "记忆",
             description: "取消跨会话记忆禁用策略",
@@ -706,6 +743,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: REPLY_UNKNOWN_LIST,
+            params: param_specs::REPLY_UNKNOWN_LIST,
             usage: "reply unknown list [--limit N] [--raw]",
             group: "发送",
             description: "列出发送结果未知、等待核查的回复任务",
@@ -718,6 +756,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: REPLY_UNKNOWN_CHECK,
+            params: param_specs::MESSAGE_ID,
             usage: "reply unknown check <message-id>",
             group: "发送",
             description: "查询平台是否存在未知结果对应的消息",
@@ -730,6 +769,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: REPLY_UNKNOWN_RETRY,
+            params: param_specs::MESSAGE_ID,
             usage: "reply unknown retry <message-id> --confirm",
             group: "发送",
             description: "确认平台未发送后重新排队回复任务",
@@ -742,6 +782,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: SESSION_DELETE_ALL,
+            params: param_specs::NONE,
             usage: "session delete-all --confirm",
             group: "会话",
             description: "删除全部会话数据",
@@ -754,6 +795,7 @@ pub fn specs() -> &'static [ControlCommandSpec] {
         },
         ControlCommandSpec {
             name: SESSION_DELETE_CHARACTER,
+            params: param_specs::CHARACTER_ID,
             usage: "session delete-character <character-id> --confirm",
             group: "会话",
             description: "删除角色关联会话数据",
@@ -817,14 +859,11 @@ pub fn canonicalize(input: &str) -> Option<&'static str> {
 }
 
 pub fn canonical_name(input: &str) -> Option<&'static str> {
-    specs()
-        .iter()
-        .find(|spec| spec.name == input)
-        .map(|spec| spec.name)
+    canonicalize(input)
 }
 
 pub fn requires_confirmation(input: &str) -> bool {
-    canonical_name(input)
+    canonicalize(input)
         .and_then(|name| specs().iter().find(|spec| spec.name == name))
         .is_some_and(|spec| spec.requires_confirmation)
 }
@@ -850,7 +889,19 @@ mod tests {
         assert_eq!(canonicalize("s"), Some(STATUS));
         assert_eq!(canonicalize("m list"), Some(MEMORY_LIST));
         assert_eq!(canonicalize("ss delete-all"), Some(SESSION_DELETE_ALL));
-        assert!(!requires_confirmation("ss delete-all"));
+        assert!(requires_confirmation("ss delete-all"));
+    }
+
+    #[test]
+    fn every_protocol_operation_has_one_shared_spec() {
+        assert_eq!(specs().len(), ControlOperation::ALL.len());
+        for operation in ControlOperation::ALL {
+            let spec = specs()
+                .iter()
+                .find(|spec| spec.name == operation.canonical_name())
+                .expect("每个协议操作都必须有命令定义");
+            assert_eq!(operation.params(), spec.params);
+        }
     }
 
     #[test]
