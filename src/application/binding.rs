@@ -21,7 +21,37 @@ pub struct BindingManager {
     character_repo: Arc<dyn CharacterRepository>,
     conversation_repo: Arc<dyn ConversationRepository>,
     /// 同一会话的绑定变更与发送前复核共用锁，避免切换在复核后、发送前插入。
-    conversation_gates: Arc<Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>>,
+    conversation_gates: Arc<ConversationGateRegistry>,
+}
+
+/// 进程内会话 fencing 门闩。
+///
+/// 处理一条消息、切换角色和删除会话必须使用同一把门闩；否则删除事务
+/// 无法阻止已经领取的任务在删除前后继续写入关系、记忆或发送消息。
+pub struct ConversationGateRegistry {
+    gates: Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>,
+}
+
+impl ConversationGateRegistry {
+    pub fn new() -> Self {
+        Self {
+            gates: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn gate_for(&self, conversation_id: i64) -> Arc<AsyncMutex<()>> {
+        let mut gates = self.gates.lock().expect("会话绑定锁表不应中毒");
+        gates
+            .entry(conversation_id)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+}
+
+impl Default for ConversationGateRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BindingManager {
@@ -35,19 +65,31 @@ impl BindingManager {
             binding_repo,
             character_repo,
             conversation_repo,
-            conversation_gates: Arc::new(Mutex::new(HashMap::new())),
+            conversation_gates: Arc::new(ConversationGateRegistry::new()),
         }
     }
 
+    /// 使用外部共享的会话门闩，供会话删除服务与绑定管理共享 fencing。
+    pub fn new_with_gate_registry(
+        binding_repo: Arc<dyn CharacterBindingRepository>,
+        character_repo: Arc<dyn CharacterRepository>,
+        conversation_repo: Arc<dyn ConversationRepository>,
+        conversation_gates: Arc<ConversationGateRegistry>,
+    ) -> Self {
+        Self {
+            binding_repo,
+            character_repo,
+            conversation_repo,
+            conversation_gates,
+        }
+    }
+
+    pub fn gate_registry(&self) -> Arc<ConversationGateRegistry> {
+        self.conversation_gates.clone()
+    }
+
     fn gate_for(&self, conversation_id: i64) -> Arc<AsyncMutex<()>> {
-        let mut gates = self
-            .conversation_gates
-            .lock()
-            .expect("会话绑定锁表不应中毒");
-        gates
-            .entry(conversation_id)
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
+        self.conversation_gates.gate_for(conversation_id)
     }
 
     /// 获取会话绑定锁。回复发送前和角色切换必须持有同一把锁。

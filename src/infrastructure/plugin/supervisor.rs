@@ -273,6 +273,16 @@ impl PluginSupervisor {
     /// 整体关停超时的兜底：要求监控任务显式 kill + wait 子进程，避免
     /// 只依赖 `kill_on_drop` 而留下 Unix zombie。
     pub async fn force_shutdown(&self) {
+        self.force_shutdown_with_timeout(self.core.cfg.shutdown_timeout)
+            .await;
+    }
+
+    /// 在调用方剩余的时间预算内执行强制关停。
+    ///
+    /// 主运行时已经超出整体关停期限时，不能再次使用完整的插件超时，
+    /// 否则一次关停可能被多个嵌套超时叠加。超时后直接取消监督任务，
+    /// `Child::kill_on_drop` 负责兜底回收子进程。
+    pub async fn force_shutdown_with_timeout(&self, timeout: Duration) {
         let handles: Vec<_> = self
             .core
             .handles
@@ -292,7 +302,7 @@ impl PluginSupervisor {
             .drain()
             .map(|(_, task)| task)
             .collect();
-        let deadline = tokio::time::Instant::now() + self.core.cfg.shutdown_timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
         for mut task in tasks {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() || tokio::time::timeout(remaining, &mut task).await.is_err() {

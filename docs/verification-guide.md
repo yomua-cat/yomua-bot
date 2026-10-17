@@ -15,14 +15,14 @@
 - `cargo check --locked --all-targets --offline`：通过。
 - `cargo test --locked --all-targets --no-run --offline`：通过编译检查。
 - `cargo fmt --all -- --check`：通过。
-- `cargo test --locked --all-targets`：库 437 个、主程序 5 个、ctl 36 个、alpha 集成 8 个、控制集成 83 个通过；插件 Unix socket 测试按 `#[ignore]` 标记跳过。
+- `cargo test --locked --all-targets`：库 440 个、主程序 5 个、ctl 38 个、alpha 集成 8 个、控制集成 83 个通过；插件 Unix socket 测试按 `#[ignore]` 标记跳过。
 - `cargo test --locked --lib infrastructure::plugin::transport::tests --offline -- --ignored --test-threads=1`：15 个插件 Unix socket 测试全部通过。
 - 临时 Unix socket 模拟服务配合真实 `yomua-bot-ctl status --raw`：通过，确认发送的是版本化 `ControlEnvelope`，不含旧 `cmd` 字段。
 - CLI 解析测试：覆盖一段、二段、三段命令、短别名归一化和危险命令确认。
 - SQLite 存储测试：覆盖平台消息去重、稳定用户关系、角色归属历史和记忆可见范围。
 - 配置模板验证：首次启动在临时目录生成 `runtime.toml`、`onebot.toml`、`llm.toml`、`decision.toml`；可选 OneBot 字段留空时仍可解析，真实配置密钥未参与验证。
 
-本次核查的基线为：库 437 个通过、主程序 5 个、ctl 36 个、alpha 集成 8 个、控制集成 83 个；另有 15 个插件 Unix socket 测试在普通全目标测试中按 `#[ignore]` 跳过，并通过显式 `--ignored` 运行。
+本次核查的基线为：库 440 个通过、主程序 5 个、ctl 38 个、alpha 集成 8 个、控制集成 83 个；另有 15 个插件 Unix socket 测试在普通全目标测试中按 `#[ignore]` 跳过，并通过显式 `--ignored` 运行。
 
 ## 已实现的重点行为
 
@@ -30,6 +30,7 @@
 - 平台消息身份用于去重；相同文本的再次发送不会被当成重复投递。
 - 角色真正发送的消息才会在上下文中使用 `assistant`，用户和其他 Bot 保留成员身份。
 - 角色切换或停用后，发送前会再次检查绑定和启用状态。
+- 会话删除与已领取任务使用同一会话 fencing；删除会等待当前任务完成，失效的系统指令和回复事件会被确认清理，不再产生副作用。
 - 记忆候选以 `candidate` 状态保存，普通入站消息按来源消息幂等生成；候选不会直接进入正式可见记忆或默认 ctl 列表；事实/关系默认共享，具体经历默认保留会话范围。
 - 共享记忆可以在其他会话进入角色的内部上下文，但回复不得主动暴露来源会话、原始群聊或内部记忆标识；需要用带来源的提示词和真实聊天场景单独验收这一点。
 - 跨会话隐私策略可以这样验收：先执行 `memory sharing request <character-id> <user-id> --reason "用户请求"`，确认跨会话仍可读；再执行 `memory sharing confirm <character-id> <user-id> --confirm`，确认其他会话不再读到该用户的共享记忆，而来源会话仍可读；最后执行 `memory sharing cancel <character-id> <user-id> --confirm`，确认跨会话恢复。三条命令只返回状态和计数，不返回记忆正文。
@@ -44,6 +45,7 @@
 - 关系熟悉度的交互计数绑定来源消息 ID，重复投递或 Outbox 重试只计一次。
 - 主动发言每日额度持久化在 `behavior_states`，重启不会清空当日计数；静默时段当前仍按 UTC 解释。
 - 未知发送结果不会被普通 Outbox 重试自动补发；`reply unknown check` 在平台明确确认未找到时自动恢复回复任务和原始事件，网络错误或缺少平台消息 ID 时仍需人工核查；手动 `reply unknown retry` 仍必须带 `--confirm`。
+- 统一关停在配置时限内等待任务；超时会取消剩余任务、清理 OneBot/插件句柄并关闭数据库，持久化任务可在下次启动恢复。
 - 备用模型链应验证共享 `budget_tokens`：主模型遇到可重试错误后，备用模型只能使用剩余输出额度；极端控制参数应返回业务错误而不关闭 socket，插件异常退出时关停应及时结束等待。
 
 ## 模块核对清单

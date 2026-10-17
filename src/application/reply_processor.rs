@@ -367,6 +367,9 @@ impl ReplyProcessor {
             .binding_manager
             .acquire_conversation_lock(conversation_id)
             .await;
+        if repo.find_by_id(source_message_id).await?.is_none() {
+            return Ok(());
+        }
         let still_current = self
             .binding_manager
             .by_conversation(conversation_id)
@@ -520,7 +523,7 @@ impl ReplyProcessor {
     /// Outbox 删除只能把事件标记为终态，无法撤回已经被 worker 领取的事件；
     /// 因此每个不可逆副作用前都必须重新检查源消息和租约。检查失败时直接
     /// 返回所有权失效，调度器会确认事件而不会继续写关系、记忆或发送。
-    async fn ensure_event_still_owned(
+    pub(crate) async fn ensure_event_still_owned(
         &self,
         event: &MessageReceivedEvent,
         lease: Option<&str>,
@@ -650,6 +653,12 @@ impl ReplyProcessor {
         event: &MessageReceivedEvent,
         lease: Option<&str>,
     ) -> Result<(), RuntimeError> {
+        // 整个处理期间持有会话 fencing 门闩。会话删除必须等待当前任务结束，
+        // 这样删除提交后不会再有关系、记忆或发送副作用落入已删除会话。
+        let _conversation_gate = self
+            .binding_manager
+            .acquire_conversation_lock(event.conversation_id)
+            .await;
         // 会话或消息可能已在 Outbox 领取后被删除。此时事件已经失效，
         // 必须在任何关系、记忆或模型调用前直接确认，避免删除后的副作用。
         if let Some(repo) = &self.message_repo {
@@ -928,12 +937,7 @@ impl ReplyProcessor {
         self.delay_executor
             .delay(capped_delay_ms(decision.delay_ms))
             .await;
-        // 绑定切换与发送前复核必须串行。否则切换可能在复核结束后、OneBot
-        // 请求发出前插入，旧角色回复仍会发送。
-        let _binding_gate = self
-            .binding_manager
-            .acquire_conversation_lock(event.conversation_id)
-            .await;
+        // 绑定切换与发送前复核已经由整个处理期间持有的会话门闩串行化。
         if Self::event_expired(event) {
             self.save_task(event, ReplyTaskStatus::Expired, Some(&content))
                 .await?;
@@ -1054,6 +1058,7 @@ impl ReplyProcessor {
             Err(e) => Self::classify_outbox_error_for_event(e, event.conversation_id),
         }
     }
+
     /// 处理消息并返回 ProcessingOutcome（用于 outbox 系统）。
     ///
     /// 此方法是 `process()` 的包装，返回 `ProcessingOutcome` 而非 `Result`。
@@ -1080,6 +1085,14 @@ impl ReplyProcessor {
         error: RuntimeError,
         conversation_id: i64,
     ) -> ProcessingOutcome {
+        if matches!(
+            &error,
+            RuntimeError::Repository(crate::error::RepositoryError::OwnershipLost)
+        ) {
+            // 会话删除、角色切换或租约回收后的旧事件已经失效；继续重试只会
+            // 让已删除会话永久占用队列。将其确认完成即可安全清理 outbox。
+            return ProcessingOutcome::Success;
+        }
         let error_text = error.to_string();
         let is_permanent = match &error {
             RuntimeError::Repository(crate::error::RepositoryError::Database(message)) => {

@@ -493,7 +493,10 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         }),
         started_at: std::time::Instant::now(),
         blacklist_repo: repos.blacklist_repo.clone(),
-        session_service: SessionService::new(repos._pool.clone()),
+        session_service: SessionService::with_gate_registry(
+            repos._pool.clone(),
+            app.binding_manager.gate_registry(),
+        ),
         character_service: yomua_bot::application::character_service::CharacterService::new(
             repos._pool.clone(),
         ),
@@ -580,19 +583,23 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     let cleanup_timed_out = tokio::time::timeout_at(deadline, cleanup).await.is_err();
     let unfinished_tasks = if cleanup_timed_out {
         tracing::warn!("关停超过配置时限，取消剩余任务，未完成回复保留供重启核查");
-        let count = background_tasks
-            .handles
-            .iter()
-            .filter(|task| !task.is_finished())
-            .count()
-            + auxiliary_tasks
-                .handles
-                .iter()
-                .filter(|task| !task.is_finished())
-                .count();
+        let count = background_tasks.unfinished_count() + auxiliary_tasks.unfinished_count();
         background_tasks.abort();
         auxiliary_tasks.abort();
-        supervisor.force_shutdown().await;
+        adapter.force_stop().await;
+        // 这里已经越过整体期限，只给插件一个很短的强制清理窗口，
+        // 避免再次叠加完整 shutdown_timeout。
+        supervisor
+            .force_shutdown_with_timeout(Duration::from_millis(250))
+            .await;
+        // cleanup future 可能在 storage.close 前被取消；显式再关一次，
+        // 避免连接池在主流程退出后仍持有文件句柄。
+        if tokio::time::timeout(Duration::from_secs(1), storage.close())
+            .await
+            .is_err()
+        {
+            tracing::warn!("数据库连接池未能在强制关停窗口内关闭");
+        }
         Some(count)
     } else {
         Some(0)
@@ -611,7 +618,15 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     shutdown_complete.notify_waiters();
 
     // 主流程已经完成后再结束控制服务，给 shutdown 请求留下写完响应的机会。
-    let _ = tokio::time::timeout(Duration::from_secs(2), control_task).await;
+    let mut control_task = control_task;
+    if tokio::time::timeout(Duration::from_secs(2), &mut control_task)
+        .await
+        .is_err()
+    {
+        tracing::warn!("控制服务未能在关停窗口内退出，取消其任务");
+        control_task.abort();
+        let _ = control_task.await;
+    }
     start_result?;
 
     tracing::info!(target: "runtime", "yomua-bot 已退出。");
@@ -1091,10 +1106,12 @@ fn build_app_layer(
         bus.clone(),
     ));
 
-    let binding_manager = Arc::new(BindingManager::new(
+    let gate_registry = Arc::new(yomua_bot::application::binding::ConversationGateRegistry::new());
+    let binding_manager = Arc::new(BindingManager::new_with_gate_registry(
         repos.binding_repo.clone(),
         repos.character_repo.clone() as Arc<dyn CharacterRepository>,
         repos.conversation_repo.clone(),
+        gate_registry,
     ));
 
     let context_builder = Arc::new(ContextBuilder::new(
@@ -1337,6 +1354,13 @@ impl BackgroundTasks {
         for handle in &self.handles {
             handle.abort();
         }
+    }
+
+    fn unfinished_count(&self) -> usize {
+        self.handles
+            .iter()
+            .filter(|task| !task.is_finished())
+            .count()
     }
 }
 impl Drop for BackgroundTasks {

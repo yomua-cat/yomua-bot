@@ -184,6 +184,21 @@ impl OutboxProcessor {
             .and_then(|value| value.as_str())
             == Some("system_command")
         {
+            let Some(token) = event.lease_token.as_deref() else {
+                return ProcessingOutcome::PermanentFailure {
+                    error: "缺少任务租约".into(),
+                };
+            };
+            if let Err(error) = self
+                .reply_processor
+                .ensure_event_still_owned(&msg_received, Some(token))
+                .await
+            {
+                return ReplyProcessor::classify_outbox_error_for_event(
+                    error,
+                    msg_received.conversation_id,
+                );
+            }
             let Some(command_value) = payload.metadata.get("command") else {
                 return ProcessingOutcome::PermanentFailure {
                     error: "系统指令事件缺少 command 字段".into(),

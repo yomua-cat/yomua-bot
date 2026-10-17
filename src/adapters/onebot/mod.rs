@@ -281,14 +281,18 @@ impl OneBotAdapter for OneBotAdapterImpl {
         self.shared
             .set_state(OneBotConnectionState::Disconnected)
             .await;
-        let tasks = std::mem::take(&mut *self.tasks.lock().await);
+        // 保留句柄在 self.tasks 中直到每个任务完成。这样如果调用方的
+        // 整体关停超时取消了本方法，句柄不会被 drop 后脱离管理，强制
+        // 关停仍可以找到并 abort 它们。
+        let mut tasks = self.tasks.lock().await;
         let wait = Duration::from_secs(self.config.action_timeout_secs.max(1));
-        for mut task in tasks {
-            if tokio::time::timeout(wait, &mut task).await.is_err() {
+        for task in tasks.iter_mut() {
+            if tokio::time::timeout(wait, &mut *task).await.is_err() {
                 task.abort();
                 let _ = task.await;
             }
         }
+        tasks.clear();
         Ok(())
     }
 
@@ -316,6 +320,21 @@ impl OneBotAdapter for OneBotAdapterImpl {
 }
 
 impl OneBotAdapterImpl {
+    /// 立即取消适配器的所有常驻任务，用于整体关停超时后的兜底。
+    pub async fn force_stop(&self) {
+        let _ = self.shutdown_tx.send(true);
+        self.shared
+            .set_state(OneBotConnectionState::Disconnected)
+            .await;
+        let mut tasks = self.tasks.lock().await;
+        for task in tasks.iter() {
+            task.abort();
+        }
+        while let Some(mut task) = tasks.pop() {
+            let _ = (&mut task).await;
+        }
+    }
+
     /// 查询平台上的单条消息，用于核查发送结果未知的任务。
     pub async fn get_message(&self, message_id: i64) -> Result<ActionResponse, RuntimeError> {
         self.send_action(build_get_message_request(message_id))

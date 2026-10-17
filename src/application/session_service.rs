@@ -21,8 +21,12 @@
 //! - 任何步骤失败 → rollback
 //! - 成功 → commit
 
-use sqlx::SqlitePool;
+use std::sync::Arc;
 
+use sqlx::SqlitePool;
+use tokio::sync::OwnedMutexGuard;
+
+use crate::application::binding::ConversationGateRegistry;
 use crate::domain::character::ConversationState;
 use crate::domain::emotion::Mood;
 use crate::error::RuntimeError;
@@ -31,11 +35,22 @@ use crate::error::RuntimeError;
 #[derive(Clone)]
 pub struct SessionService {
     pool: SqlitePool,
+    conversation_gates: Arc<ConversationGateRegistry>,
 }
 
 impl SessionService {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self::with_gate_registry(pool, Arc::new(ConversationGateRegistry::new()))
+    }
+
+    pub fn with_gate_registry(
+        pool: SqlitePool,
+        conversation_gates: Arc<ConversationGateRegistry>,
+    ) -> Self {
+        Self {
+            pool,
+            conversation_gates,
+        }
     }
 
     /// 原子更新会话范围的角色状态。
@@ -108,6 +123,17 @@ impl SessionService {
         &self,
         character_id: i64,
     ) -> Result<usize, RuntimeError> {
+        // 先锁住目标会话，和发送前复核/角色切换使用同一把门闩。
+        // 已经领取的任务会在锁释放后再次看到源消息已删除或租约失效。
+        let conv_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT conversation_id FROM conversation_bindings WHERE character_id = ?",
+        )
+        .bind(character_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("查询会话: {e}")))?;
+        let _guards = self.lock_conversations(&conv_ids).await;
+
         let mut tx = self
             .pool
             .begin()
@@ -121,22 +147,12 @@ impl SessionService {
             .map_err(|e| RuntimeError::Internal(format!("PRAGMA: {}", e)))?;
 
         // 找到该角色的所有会话 ID
-        let conv_ids: Vec<(i64,)> = sqlx::query_as(
-            "SELECT conversation_id FROM conversation_bindings WHERE character_id = ?",
-        )
-        .bind(character_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("查询会话: {}", e)))?;
-
         if conv_ids.is_empty() {
             tx.rollback()
                 .await
                 .map_err(|e| RuntimeError::Internal(format!("回滚失败: {}", e)))?;
             return Ok(0);
         }
-
-        let conv_ids: Vec<i64> = conv_ids.into_iter().map(|(id,)| id).collect();
 
         // 会话删除必须同时终止尚未完成的持久事件，防止删除后仍触发模型、
         // 关系和记忆副作用。payload 中保存了 MessageAccepted 的会话 ID。
@@ -184,6 +200,11 @@ impl SessionService {
     ///
     /// 返回删除的会话数量。
     pub async fn delete_all_sessions(&self) -> Result<usize, RuntimeError> {
+        let conv_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM conversations ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("查询会话: {e}")))?;
+        let _guards = self.lock_conversations(&conv_ids).await;
         let mut tx = self
             .pool
             .begin()
@@ -220,6 +241,17 @@ impl SessionService {
             .map_err(|e| RuntimeError::Internal(format!("提交失败: {}", e)))?;
 
         Ok(before.0 as usize)
+    }
+
+    async fn lock_conversations(&self, ids: &[i64]) -> Vec<OwnedMutexGuard<()>> {
+        let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut guards = Vec::with_capacity(sorted.len());
+        for id in sorted {
+            guards.push(self.conversation_gates.gate_for(id).lock_owned().await);
+        }
+        guards
     }
 }
 
@@ -263,5 +295,40 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count.0, 0, "心情写入失败时会话状态也必须回滚");
+    }
+
+    #[tokio::test]
+    async fn session_delete_waits_for_conversation_fence() {
+        let storage = SqliteStorage::open_in_memory().await.unwrap();
+        storage.migrate().await.unwrap();
+        sqlx::query("INSERT INTO characters(name) VALUES ('测试角色')")
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        let conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type, external_id) VALUES ('group', 'fence-test') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_bindings(character_id, conversation_id) VALUES (1, ?)",
+        )
+        .bind(conversation_id)
+        .execute(storage.pool())
+        .await
+        .unwrap();
+
+        let gates = Arc::new(ConversationGateRegistry::new());
+        let held = gates.gate_for(conversation_id).lock_owned().await;
+        let service = SessionService::with_gate_registry(storage.pool().clone(), gates);
+        let task = tokio::spawn(async move { service.delete_character_sessions(1).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "删除必须等待正在处理该会话的任务释放门闩"
+        );
+        drop(held);
+        assert_eq!(task.await.unwrap().unwrap(), 1);
     }
 }
