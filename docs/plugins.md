@@ -41,17 +41,17 @@ cp target/debug/examples/echo_plugin /absolute/path/to/plugins/echo/echo_plugin
 
 ## IPC 协议
 
-每帧为 **4 字节大端长度 + MessagePack 对象**，最大帧体 16 MiB。对象含 `type`，可以是 `hello`、`hello_ack`、`request`、`response` 或 `notify`。实现见[协议模块](../src/infrastructure/plugin/protocol.rs)和[传输层](../src/infrastructure/plugin/transport.rs)。
+每帧为 **4 字节大端长度 + MessagePack 对象**，最大帧体 16 MiB。对象含 `protocol_version`、`kind` 和 `payload`；`kind` 可以是 `hello`、`hello_ack`、`request`、`response` 或 `event`。实现见[协议模块](../src/infrastructure/plugin/protocol.rs)和[传输层](../src/infrastructure/plugin/transport.rs)。
 
-下面展示解码后的对象形状，线上应编码为 MessagePack：
+下面展示解码后的对象形状，线上应编码为 MessagePack。协议版本为 `1`；未知字段必须忽略，未知 `kind` 或不支持的主版本必须拒绝：
 
 ```json
-{"type":"hello","name":"echo","version":"0.1.0","subscribe":["message.received","adapter.connected","adapter.disconnected"]}
+{"protocol_version":1,"kind":"hello","payload":{"name":"echo","version":"0.1.0","subscribe":["message.received","adapter.connected","adapter.disconnected"]}}
 ```
 
-RPC 请求使用 `id`、`method`、`params`，响应使用相同 `id`、`ok`、`result`、`error`。通知使用 `event` 与 `data`；收到 `shutdown` 通知后插件应自行退出。
+RPC 请求使用 `payload.request_id`、`method`、`params`，响应使用相同 `request_id`、`ok`、`result`、`error`。`error` 是 `{code, message}`，插件按 `code` 判断，`message` 仅供日志和用户显示。事件使用 `kind = "event"` 与 `event`、`data`；收到 `shutdown` 事件后插件应自行退出。
 
-事件名称与数据由[事件桥接](../src/infrastructure/plugin/event_bridge.rs)决定。消息广播不是持久订阅或可靠队列，不保证断线补发，也不能仅凭收到 `message.received` 推断回复处理已完成。
+事件 DTO 由[事件桥接](../src/infrastructure/plugin/event_bridge.rs)显式投影，插件不会收到 `CoreEvent` 枚举或数据库对象。消息广播不是持久订阅或可靠队列，不保证断线补发，也不能仅凭收到 `message.received` 推断回复处理已完成。
 
 ## API 与权限
 

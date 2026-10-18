@@ -3,7 +3,7 @@
 //! 它演示了插件与 Core 之间最常用的三类交互：
 //! 1. 握手：连接 Core 注入的 UDS socket，发送 `Hello{name, version, subscribe}`，
 //!    收到 `hello_ack{ok: true}` 后进入运行态；
-//! 2. 事件订阅：在 Hello 中订阅若干 dotted 事件名，收到 `notify` 帧时打印；
+//! 2. 事件订阅：在 Hello 中订阅若干 dotted 事件名，收到 `event` 帧时打印；
 //! 3. 插件数据（可选演示）：收到 `message.received` 事件时，调用
 //!    `plugin_data.set` / `plugin_data.get` 读写自己命名空间下的数据。
 //!

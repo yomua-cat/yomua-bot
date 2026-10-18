@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use crate::application::event_bus::EventSubscription;
-use crate::domain::event::{CoreEvent, MessageReceivedEvent};
+use crate::domain::event::{CoreEvent, ResponseSource};
 use crate::infrastructure::plugin::protocol::{EventType, WireMessage};
 use crate::infrastructure::plugin::registry::PluginRegistry;
 
@@ -27,36 +27,8 @@ impl EventBridge {
     /// 每收到一条事件：映射 → 序列化 → 逐个通知订阅插件。
     pub async fn run(&self, mut subscription: EventSubscription) {
         while let Some(event) = subscription.recv().await {
-            let Some(event_type) = EventType::from_core_event(&event) else {
-                // 不对插件暴露的事件（如系统指令）直接跳过。
+            let Some((event_type, data)) = plugin_event_dto(&event) else {
                 continue;
-            };
-            // MessageAccepted 是持久化入口；插件协议仍以 message.received
-            // 表达它，避免同一条消息同时从适配器和 outbox 发出两次通知。
-            let wire_event = match &event {
-                CoreEvent::MessageAccepted(accepted) => {
-                    CoreEvent::MessageReceived(MessageReceivedEvent {
-                        conversation_id: accepted.conversation_id,
-                        sender_id: accepted.sender_id,
-                        message_id: accepted.message_id,
-                        content: accepted.content.clone(),
-                        timestamp: accepted.timestamp,
-                        is_mentioned: accepted.is_mentioned,
-                        character_id: accepted.character_id,
-                        conversation_sequence: accepted.conversation_sequence,
-                        platform_message_id: accepted.platform_message_id,
-                        ingested_at: accepted.ingested_at,
-                        metadata: accepted.metadata.clone(),
-                    })
-                }
-                _ => event.clone(),
-            };
-            let data = match serde_json::to_value(&wire_event) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!("事件序列化失败（{}），跳过：{e}", event_type.name());
-                    continue;
-                }
             };
             self.dispatch_to_subscribers(event_type, data);
         }
@@ -94,6 +66,72 @@ impl EventBridge {
             }
         }
     }
+}
+
+/// 将宿主事件投影为版本稳定的插件 DTO；插件看不到 CoreEvent 的枚举标签。
+fn plugin_event_dto(event: &CoreEvent) -> Option<(EventType, serde_json::Value)> {
+    let (kind, data) = match event {
+        CoreEvent::MessageAccepted(e) => (
+            EventType::MessageReceived,
+            serde_json::json!({
+                "conversation_id":e.conversation_id,"sender_id":e.sender_id,"message_id":e.message_id,
+                "content":e.content,"timestamp":e.timestamp,"is_mentioned":e.is_mentioned,
+                "character_id":e.character_id,"conversation_sequence":e.conversation_sequence,
+                "platform_message_id":e.platform_message_id,"ingested_at":e.ingested_at,"metadata":e.metadata
+            }),
+        ),
+        CoreEvent::MessageReceived(e) => (
+            EventType::MessageReceived,
+            serde_json::json!({
+                "conversation_id":e.conversation_id,"sender_id":e.sender_id,"message_id":e.message_id,
+                "content":e.content,"timestamp":e.timestamp,"is_mentioned":e.is_mentioned,
+                "character_id":e.character_id,"conversation_sequence":e.conversation_sequence,
+                "platform_message_id":e.platform_message_id,"ingested_at":e.ingested_at,"metadata":e.metadata
+            }),
+        ),
+        CoreEvent::MessageSent(e) => (
+            EventType::MessageSent,
+            serde_json::json!({"conversation_id":e.conversation_id,"character_id":e.character_id,"message_id":e.message_id,"content":e.content,"timestamp":e.timestamp}),
+        ),
+        CoreEvent::CharacterStateChanged(e) => (
+            EventType::CharacterStateChanged,
+            serde_json::json!({"character_id":e.character_id,"timestamp":e.timestamp}),
+        ),
+        CoreEvent::EmotionChanged(e) => (
+            EventType::EmotionChanged,
+            serde_json::json!({"character_id":e.character_id,"conversation_id":e.conversation_id,"timestamp":e.timestamp}),
+        ),
+        CoreEvent::RelationshipChanged(e) => (
+            EventType::RelationshipChanged,
+            serde_json::json!({"character_id":e.character_id,"user_id":e.user_id,"timestamp":e.timestamp}),
+        ),
+        CoreEvent::MemoryCreated(e) => (
+            EventType::MemoryCreated,
+            serde_json::json!({"character_id":e.character_id,"memory_id":e.memory_id,"timestamp":e.timestamp}),
+        ),
+        CoreEvent::BehaviorDecided(e) => (
+            EventType::BehaviorDecided,
+            serde_json::json!({"character_id":e.character_id,"conversation_id":e.conversation_id,"action":e.action,"reason":e.reason,"timestamp":e.timestamp}),
+        ),
+        CoreEvent::ResponseGenerated(e) => (
+            EventType::ResponseGenerated,
+            serde_json::json!({"character_id":e.character_id,"conversation_id":e.conversation_id,"content":e.content,"source":match e.source {ResponseSource::Rule=>"rule",ResponseSource::Llm=>"llm",ResponseSource::Plugin=>"plugin"},"timestamp":e.timestamp}),
+        ),
+        CoreEvent::AdapterConnected(e) => (
+            EventType::AdapterConnected,
+            serde_json::json!({"adapter_name":e.adapter_name,"timestamp":e.timestamp}),
+        ),
+        CoreEvent::AdapterDisconnected(e) => (
+            EventType::AdapterDisconnected,
+            serde_json::json!({"adapter_name":e.adapter_name,"reason":e.reason,"timestamp":e.timestamp}),
+        ),
+        CoreEvent::ScheduledTaskTriggered(e) => (
+            EventType::ScheduledTaskTriggered,
+            serde_json::json!({"task_id":e.task_id,"task_type":e.task_type,"timestamp":e.timestamp}),
+        ),
+        CoreEvent::CommandReceived(_) => return None,
+    };
+    Some((kind, data))
 }
 
 #[cfg(test)]
@@ -234,8 +272,8 @@ mod tests {
         match h.alpha_rx.recv().await.expect("alpha 第 1 条") {
             WireMessage::Notify { event, data } => {
                 assert_eq!(event, "message.received");
-                assert_eq!(data["MessageReceived"]["content"], "你好");
-                assert_eq!(data["MessageReceived"]["conversation_id"], 1);
+                assert_eq!(data["content"], "你好");
+                assert_eq!(data["conversation_id"], 1);
             }
             other => panic!("期望 Notify，实际 {other:?}"),
         }
@@ -246,7 +284,7 @@ mod tests {
         match h.alpha_rx.recv().await.expect("alpha 第 3 条") {
             WireMessage::Notify { event, data } => {
                 assert_eq!(event, "message.received");
-                assert_eq!(data["MessageReceived"]["content"], "第二条");
+                assert_eq!(data["content"], "第二条");
             }
             other => panic!("期望 Notify，实际 {other:?}"),
         }
@@ -263,7 +301,7 @@ mod tests {
             match h.beta_rx.recv().await.expect("beta 应收事件") {
                 WireMessage::Notify { event, data } => {
                     assert_eq!(event, "message.received");
-                    assert_eq!(data["MessageReceived"]["content"], expected_content);
+                    assert_eq!(data["content"], expected_content);
                 }
                 other => panic!("期望 Notify，实际 {other:?}"),
             }
@@ -311,9 +349,9 @@ mod tests {
         match notification {
             WireMessage::Notify { event, data } => {
                 assert_eq!(event, "message.received");
-                assert_eq!(data["MessageReceived"]["message_id"], 9);
-                assert_eq!(data["MessageReceived"]["content"], "持久化消息");
-                assert_eq!(data["MessageReceived"]["metadata"]["author_kind"], "user");
+                assert_eq!(data["message_id"], 9);
+                assert_eq!(data["content"], "持久化消息");
+                assert_eq!(data["metadata"]["author_kind"], "user");
             }
             other => panic!("期望 Notify，实际 {other:?}"),
         }
@@ -341,8 +379,7 @@ mod tests {
             ingested_at: chrono::Utc::now(),
             metadata: serde_json::json!({}),
         });
-        let ty = EventType::from_core_event(&ev).expect("MessageReceived 应对插件可见");
-        let data = serde_json::to_value(&ev).unwrap();
+        let (ty, data) = plugin_event_dto(&ev).expect("MessageReceived 应对插件可见");
         h.bridge.dispatch_to_subscribers(ty, data);
 
         // gamma 无连接 → 不 panic；alpha/beta 仍收到。

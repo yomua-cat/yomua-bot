@@ -207,7 +207,8 @@ async fn send_handshake(
     let frame = encode_frame(&WireMessage::HelloAck {
         ok: reason.is_none(),
         reason,
-    })?;
+    })
+    .map_err(|error| RuntimeError::Plugin(error.to_string()))?;
     tokio::time::timeout(Duration::from_secs(5), write_half.write_all(&frame))
         .await
         .map_err(|_| RuntimeError::Plugin("握手应答超时".to_string()))?
@@ -235,11 +236,14 @@ async fn handle_conn(
         Ok(Ok(Some(WireMessage::Hello(hello)))) => hello,
         other => {
             tracing::warn!(plugin = %expected_name, result = ?other, "插件握手失败");
-            let _ = send_handshake(
-                &mut write_half,
-                Some("首帧必须在时限内发送合法 Hello".to_string()),
-            )
-            .await;
+            let reason = match other {
+                Ok(Ok(Some(_))) => "首帧必须是 hello".to_string(),
+                Ok(Ok(None)) => "握手前连接关闭".to_string(),
+                Ok(Err(error)) if error.contains("protocol_version") => error,
+                Ok(Err(_)) => "首帧不是合法协议消息".to_string(),
+                Err(_) => "握手超时".to_string(),
+            };
+            let _ = send_handshake(&mut write_half, Some(reason)).await;
             return;
         }
     };

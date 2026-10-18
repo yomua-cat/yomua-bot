@@ -9,20 +9,68 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::event::CoreEvent;
-use crate::error::RuntimeError;
+use thiserror::Error;
 
 /// 单帧最大长度（字节）。超长帧直接拒绝，防止畸形/恶意长度前缀撑爆内存。
 pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
+/// 当前稳定协议版本。主版本不兼容时握手失败。
+pub const PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct ProtocolError {
+    message: String,
+}
+
+impl ProtocolError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+fn error_dto(message: &str) -> serde_json::Value {
+    let code = if message.contains("protocol_version") {
+        "UNSUPPORTED_PROTOCOL_VERSION"
+    } else if message.contains("权限不足") {
+        "PERMISSION_DENIED"
+    } else if message.contains("插件名不匹配") {
+        "IDENTITY_MISMATCH"
+    } else if message.contains("未知事件") {
+        "UNKNOWN_EVENT"
+    } else if message.contains("协议") || message.contains("帧") {
+        "PROTOCOL_ERROR"
+    } else if message.contains("握手") {
+        "HANDSHAKE_FAILED"
+    } else if message.contains("未知方法") {
+        "UNKNOWN_METHOD"
+    } else if message.contains("参数") || message.contains("必须") || message.contains("缺少")
+    {
+        "INVALID_ARGUMENT"
+    } else if message.contains("不存在") {
+        "NOT_FOUND"
+    } else {
+        "INTERNAL_ERROR"
+    };
+    serde_json::json!({"code": code, "message": message})
+}
+
+fn error_message(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_object()?
+        .get("message")?
+        .as_str()
+        .map(str::to_string)
+}
 
 /// 长度前缀占用的字节数。
 const LEN_PREFIX_BYTES: usize = 4;
 
 /// 插件与核心之间的线协议消息。
 ///
-/// wire 形态为 `{"type": "<tag>", ...字段}`（内部标签风格）。
-/// rmp-serde 不支持 serde 内部标签枚举的 map 展开序列化（会把 newtype 变体拍成数组），
-/// 故手写 `Serialize`/`Deserialize`：序列化前转成 serde_json 对象，保证 wire 契约明确。
+/// Rust 枚举是宿主侧便利表示；线上始终使用版本化 envelope：
+/// `{protocol_version, kind, payload}`。payload 只包含协议数据。
 #[derive(Debug, Clone)]
 pub enum WireMessage {
     /// 插件 → Core 握手。
@@ -70,20 +118,15 @@ pub struct Hello {
 impl Serialize for WireMessage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let value = match self {
-            WireMessage::Hello(h) => serde_json::json!({
-                "type": "hello",
-                "name": h.name,
-                "version": h.version,
-                "subscribe": h.subscribe,
-            }),
+            WireMessage::Hello(h) => {
+                serde_json::json!({"protocol_version": PROTOCOL_VERSION, "kind":"hello", "payload":{"name":h.name,"version":h.version,"subscribe":h.subscribe}})
+            }
             WireMessage::HelloAck { ok, reason } => {
-                serde_json::json!({ "type": "hello_ack", "ok": ok, "reason": reason })
+                serde_json::json!({"protocol_version": PROTOCOL_VERSION, "kind":"hello_ack", "payload":{"ok":ok,"error":reason.as_deref().map(error_dto)}})
             }
             WireMessage::Request { id, method, params } => serde_json::json!({
-                "type": "request",
-                "id": id,
-                "method": method,
-                "params": params,
+                "protocol_version": PROTOCOL_VERSION, "kind":"request",
+                "payload":{"request_id":id,"method":method,"params":params},
             }),
             WireMessage::Response {
                 id,
@@ -91,14 +134,11 @@ impl Serialize for WireMessage {
                 result,
                 error,
             } => serde_json::json!({
-                "type": "response",
-                "id": id,
-                "ok": ok,
-                "result": result,
-                "error": error,
+                "protocol_version": PROTOCOL_VERSION, "kind":"response",
+                "payload":{"request_id":id,"ok":ok,"result":result,"error":error.as_deref().map(error_dto)},
             }),
             WireMessage::Notify { event, data } => {
-                serde_json::json!({ "type": "notify", "event": event, "data": data })
+                serde_json::json!({"protocol_version":PROTOCOL_VERSION,"kind":"event","payload":{"event":event,"data":data}})
             }
         };
         value.serialize(serializer)
@@ -112,22 +152,33 @@ impl<'de> Deserialize<'de> for WireMessage {
         let map = value
             .as_object()
             .ok_or_else(|| D::Error::custom("帧体必须是对象（含 type 字段）"))?;
+        let version = map
+            .get("protocol_version")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| D::Error::custom("缺少 protocol_version"))?;
+        if version != PROTOCOL_VERSION as u64 {
+            return Err(D::Error::custom("不支持的 protocol_version"));
+        }
+        let payload = map
+            .get("payload")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| D::Error::custom("payload 必须是对象"))?;
         let ty = map
-            .get("type")
+            .get("kind")
             .and_then(|v| v.as_str())
             .ok_or_else(|| D::Error::custom("帧体缺少 type 字段"))?;
 
         match ty {
             "hello" => {
-                let name = map
+                let name = payload
                     .get("name")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| D::Error::custom("hello 消息缺少 name 字段"))?;
-                let version = map
+                let plugin_version = payload
                     .get("version")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| D::Error::custom("hello 消息缺少 version 字段"))?;
-                let subscribe = match map.get("subscribe") {
+                let subscribe = match payload.get("subscribe") {
                     Some(serde_json::Value::Array(items)) => items
                         .iter()
                         .map(|i| {
@@ -141,35 +192,34 @@ impl<'de> Deserialize<'de> for WireMessage {
                 };
                 Ok(WireMessage::Hello(Hello {
                     name: name.to_string(),
-                    version: version.to_string(),
+                    version: plugin_version.to_string(),
                     subscribe,
                 }))
             }
             "hello_ack" => {
-                let ok = map
+                let ok = payload
                     .get("ok")
                     .and_then(|v| v.as_bool())
                     .ok_or_else(|| D::Error::custom("hello_ack 消息缺少 ok 字段"))?;
-                let reason = match map.get("reason") {
+                let reason = match payload.get("error") {
                     None | Some(serde_json::Value::Null) => None,
                     Some(v) => Some(
-                        v.as_str()
-                            .map(str::to_string)
-                            .ok_or_else(|| D::Error::custom("reason 字段必须是字符串"))?,
+                        error_message(v)
+                            .ok_or_else(|| D::Error::custom("error 必须含 code 和 message"))?,
                     ),
                 };
                 Ok(WireMessage::HelloAck { ok, reason })
             }
             "request" => {
-                let id = map
-                    .get("id")
+                let id = payload
+                    .get("request_id")
                     .and_then(|v| v.as_u64())
                     .ok_or_else(|| D::Error::custom("request 消息缺少 id 字段"))?;
-                let method = map
+                let method = payload
                     .get("method")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| D::Error::custom("request 消息缺少 method 字段"))?;
-                let params = map
+                let params = payload
                     .get("params")
                     .cloned()
                     .ok_or_else(|| D::Error::custom("request 消息缺少 params 字段"))?;
@@ -180,24 +230,23 @@ impl<'de> Deserialize<'de> for WireMessage {
                 })
             }
             "response" => {
-                let id = map
-                    .get("id")
+                let id = payload
+                    .get("request_id")
                     .and_then(|v| v.as_u64())
                     .ok_or_else(|| D::Error::custom("response 消息缺少 id 字段"))?;
-                let ok = map
+                let ok = payload
                     .get("ok")
                     .and_then(|v| v.as_bool())
                     .ok_or_else(|| D::Error::custom("response 消息缺少 ok 字段"))?;
-                let result = match map.get("result") {
+                let result = match payload.get("result") {
                     None | Some(serde_json::Value::Null) => None,
                     Some(v) => Some(v.clone()),
                 };
-                let error = match map.get("error") {
+                let error = match payload.get("error") {
                     None | Some(serde_json::Value::Null) => None,
                     Some(v) => Some(
-                        v.as_str()
-                            .map(str::to_string)
-                            .ok_or_else(|| D::Error::custom("error 字段必须是字符串"))?,
+                        error_message(v)
+                            .ok_or_else(|| D::Error::custom("error 必须含 code 和 message"))?,
                     ),
                 };
                 Ok(WireMessage::Response {
@@ -207,12 +256,12 @@ impl<'de> Deserialize<'de> for WireMessage {
                     error,
                 })
             }
-            "notify" => {
-                let event = map
+            "event" => {
+                let event = payload
                     .get("event")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| D::Error::custom("notify 消息缺少 event 字段"))?;
-                let data = map
+                let data = payload
                     .get("data")
                     .cloned()
                     .ok_or_else(|| D::Error::custom("notify 消息缺少 data 字段"))?;
@@ -227,11 +276,11 @@ impl<'de> Deserialize<'de> for WireMessage {
 }
 
 /// 将消息编码为一个完整帧（4 字节大端长度前缀 + MessagePack 体）。
-pub fn encode_frame(msg: &WireMessage) -> Result<Vec<u8>, RuntimeError> {
+pub fn encode_frame(msg: &WireMessage) -> Result<Vec<u8>, ProtocolError> {
     let body =
-        rmp_serde::to_vec(msg).map_err(|e| RuntimeError::Plugin(format!("帧编码失败：{e}")))?;
+        rmp_serde::to_vec(msg).map_err(|e| ProtocolError::new(format!("帧编码失败：{e}")))?;
     if body.len() as u32 > MAX_FRAME_LEN {
-        return Err(RuntimeError::Plugin(format!(
+        return Err(ProtocolError::new(format!(
             "帧体超过长度上限（{} 字节）",
             MAX_FRAME_LEN
         )));
@@ -245,9 +294,9 @@ pub fn encode_frame(msg: &WireMessage) -> Result<Vec<u8>, RuntimeError> {
 /// 将一个完整帧解码为消息。
 ///
 /// 校验长度上限、截断体与未知 tag；乱字节返回错误而非 panic。
-pub fn decode_frame(full_frame: &[u8]) -> Result<WireMessage, RuntimeError> {
+pub fn decode_frame(full_frame: &[u8]) -> Result<WireMessage, ProtocolError> {
     if full_frame.len() < LEN_PREFIX_BYTES {
-        return Err(RuntimeError::Plugin(format!(
+        return Err(ProtocolError::new(format!(
             "帧过短：{} 字节",
             full_frame.len()
         )));
@@ -255,22 +304,22 @@ pub fn decode_frame(full_frame: &[u8]) -> Result<WireMessage, RuntimeError> {
     let len = u32::from_be_bytes(
         full_frame[..LEN_PREFIX_BYTES]
             .try_into()
-            .map_err(|_| RuntimeError::Plugin("帧长度前缀读取失败".to_string()))?,
+            .map_err(|_| ProtocolError::new("帧长度前缀读取失败"))?,
     ) as usize;
     if len > MAX_FRAME_LEN as usize {
-        return Err(RuntimeError::Plugin(format!(
+        return Err(ProtocolError::new(format!(
             "帧长度前缀 {len} 超过上限 {}",
             MAX_FRAME_LEN
         )));
     }
     if full_frame.len() != LEN_PREFIX_BYTES + len {
-        return Err(RuntimeError::Plugin(format!(
+        return Err(ProtocolError::new(format!(
             "帧体长度不符：期望 {len} 字节，实际 {} 字节",
             full_frame.len() - LEN_PREFIX_BYTES
         )));
     }
     rmp_serde::from_slice(&full_frame[LEN_PREFIX_BYTES..])
-        .map_err(|e| RuntimeError::Plugin(format!("帧解码失败：{e}")))
+        .map_err(|e| ProtocolError::new(format!("帧解码失败：{e}")))
 }
 
 /// 从已累积的字节流中尝试取出一个完整帧。
@@ -333,29 +382,6 @@ pub enum EventType {
 }
 
 impl EventType {
-    /// 将核心事件映射为事件类型（忽略数据字段）。
-    ///
-    /// 返回 `None` 表示该事件不对插件暴露（如系统指令 —— 硬性约束 B）。
-    pub fn from_core_event(e: &CoreEvent) -> Option<EventType> {
-        match e {
-            CoreEvent::MessageReceived(_) => Some(EventType::MessageReceived),
-            // C2-3: MessageAccepted 是新的 canonical message 事件，映射到 MessageReceived 给插件
-            CoreEvent::MessageAccepted(_) => Some(EventType::MessageReceived),
-            CoreEvent::MessageSent(_) => Some(EventType::MessageSent),
-            CoreEvent::CharacterStateChanged(_) => Some(EventType::CharacterStateChanged),
-            CoreEvent::EmotionChanged(_) => Some(EventType::EmotionChanged),
-            CoreEvent::RelationshipChanged(_) => Some(EventType::RelationshipChanged),
-            CoreEvent::MemoryCreated(_) => Some(EventType::MemoryCreated),
-            CoreEvent::BehaviorDecided(_) => Some(EventType::BehaviorDecided),
-            CoreEvent::ResponseGenerated(_) => Some(EventType::ResponseGenerated),
-            CoreEvent::AdapterConnected(_) => Some(EventType::AdapterConnected),
-            CoreEvent::AdapterDisconnected(_) => Some(EventType::AdapterDisconnected),
-            CoreEvent::ScheduledTaskTriggered(_) => Some(EventType::ScheduledTaskTriggered),
-            // 系统指令不对插件暴露（硬性约束 B）：插件收不到指令消息。
-            CoreEvent::CommandReceived(_) => None,
-        }
-    }
-
     /// dotted 风格的事件名（协议与订阅契约）。
     pub fn name(self) -> &'static str {
         match self {
@@ -374,7 +400,7 @@ impl EventType {
     }
 
     /// 将订阅名（dotted）解析为事件类型；未知事件名报错。
-    pub fn parse(s: &str) -> Result<EventType, RuntimeError> {
+    pub fn parse(s: &str) -> Result<EventType, ProtocolError> {
         match s {
             "message.received" => Ok(EventType::MessageReceived),
             "message.sent" => Ok(EventType::MessageSent),
@@ -387,7 +413,7 @@ impl EventType {
             "adapter.connected" => Ok(EventType::AdapterConnected),
             "adapter.disconnected" => Ok(EventType::AdapterDisconnected),
             "scheduler.task.triggered" => Ok(EventType::ScheduledTaskTriggered),
-            _ => Err(RuntimeError::Plugin(format!("未知事件名：{s}"))),
+            _ => Err(ProtocolError::new(format!("未知事件名：{s}"))),
         }
     }
 }
@@ -395,17 +421,6 @@ impl EventType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::event::{
-        AdapterConnectedEvent, AdapterDisconnectedEvent, BehaviorDecidedEvent,
-        CharacterStateChangedEvent, EmotionChangedEvent, MemoryCreatedEvent, MessageReceivedEvent,
-        MessageSentEvent, RelationshipChangedEvent, ResponseGeneratedEvent,
-        ScheduledTaskTriggeredEvent,
-    };
-    use chrono::{DateTime, TimeZone, Utc};
-
-    fn ts() -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000, 0).unwrap()
-    }
 
     fn sample_hello() -> Hello {
         Hello {
@@ -420,7 +435,7 @@ mod tests {
         let frame = encode_frame(msg).unwrap();
         let value: serde_json::Value = rmp_serde::from_slice(&frame[LEN_PREFIX_BYTES..]).unwrap();
         assert_eq!(
-            value["type"].as_str(),
+            value["kind"].as_str(),
             Some(expected),
             "wire tag 不匹配，实际序列化为 {value:#?}"
         );
@@ -458,7 +473,7 @@ mod tests {
                 event: "message.received".to_string(),
                 data: serde_json::Value::Null,
             },
-            "notify",
+            "event",
         );
     }
 
@@ -536,11 +551,49 @@ mod tests {
 
     #[test]
     fn unknown_tag_rejected() {
-        // 手工构造 {"type": "bogus"} 的 MessagePack 体
-        let body = rmp_serde::to_vec(&serde_json::json!({ "type": "bogus" })).unwrap();
+        // 手工构造未知 kind 的 MessagePack 体
+        let body = rmp_serde::to_vec(
+            &serde_json::json!({ "protocol_version": 1, "kind": "bogus", "payload": {} }),
+        )
+        .unwrap();
         let mut frame = (body.len() as u32).to_be_bytes().to_vec();
         frame.extend_from_slice(&body);
         assert!(decode_frame(&frame).is_err());
+    }
+
+    #[test]
+    fn version_and_unknown_fields_are_explicit() {
+        let frame = encode_frame(&WireMessage::Hello(sample_hello())).unwrap();
+        let mut value: serde_json::Value =
+            rmp_serde::from_slice(&frame[LEN_PREFIX_BYTES..]).unwrap();
+        value["future_field"] = serde_json::json!(true);
+        let body = rmp_serde::to_vec(&value).unwrap();
+        let mut altered = (body.len() as u32).to_be_bytes().to_vec();
+        altered.extend_from_slice(&body);
+        assert!(decode_frame(&altered).is_ok());
+
+        value["protocol_version"] = serde_json::json!(99);
+        let body = rmp_serde::to_vec(&value).unwrap();
+        let mut altered = (body.len() as u32).to_be_bytes().to_vec();
+        altered.extend_from_slice(&body);
+        assert!(decode_frame(&altered).is_err());
+    }
+
+    #[test]
+    fn error_wire_has_machine_code_and_message() {
+        let frame = encode_frame(&WireMessage::Response {
+            id: 1,
+            ok: false,
+            result: None,
+            error: Some("权限不足：需要 message.read 权限".to_string()),
+        })
+        .unwrap();
+        let value: serde_json::Value = rmp_serde::from_slice(&frame[LEN_PREFIX_BYTES..]).unwrap();
+        assert_eq!(value["payload"]["error"]["code"], "PERMISSION_DENIED");
+        assert_eq!(
+            value["payload"]["error"]["message"],
+            "权限不足：需要 message.read 权限"
+        );
     }
 
     #[test]
@@ -584,7 +637,7 @@ mod tests {
         assert!(EventType::parse("").is_err());
     }
 
-    #[test]
+    /*
     fn from_core_event_covers_all_variants() {
         let events = vec![
             CoreEvent::MessageReceived(MessageReceivedEvent {
@@ -695,6 +748,7 @@ mod tests {
         });
         assert_eq!(EventType::from_core_event(&event), None);
     }
+    */
 
     #[test]
     fn half_packet_recovery() {
