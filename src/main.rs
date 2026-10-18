@@ -703,16 +703,12 @@ async fn run_import(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let pool = storage.pool().clone();
 
     // --- 装配仓储与导入服务 ---
-    let character_repo: Arc<dyn CharacterRepository> =
-        Arc::new(SqliteCharacterRepository::new(pool.clone()));
-    let state_repo: Arc<dyn CharacterStateRepository> =
-        Arc::new(SqliteCharacterStateRepository::new(pool.clone()));
-    let conversation_repo: Arc<dyn ConversationRepository> =
-        Arc::new(SqliteConversationRepository::new(pool.clone()));
-    let participant_repo: Arc<dyn ParticipantRepository> =
-        Arc::new(SqliteParticipantRepository::new(pool.clone()));
-    let binding_repo: Arc<dyn CharacterBindingRepository> =
-        Arc::new(SqliteCharacterBindingRepository::new(pool.clone()));
+    let repos = build_repos(pool);
+    let character_repo: Arc<dyn CharacterRepository> = repos.character_repo.clone();
+    let state_repo = repos.state_repo.clone();
+    let conversation_repo = repos.conversation_repo.clone();
+    let participant_repo = repos.participant_repo.clone();
+    let binding_repo = repos.binding_repo.clone();
 
     let conversation_manager = Arc::new(ConversationManager::new(
         conversation_repo.clone(),
@@ -769,16 +765,7 @@ async fn run_import(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 #[allow(clippy::type_complexity)]
 async fn open_cli_storage(
     config_dir: &Path,
-) -> Result<
-    (
-        SqliteStorage,
-        Arc<dyn CharacterRepository>,
-        Arc<dyn ConversationRepository>,
-        Arc<dyn ParticipantRepository>,
-        Arc<dyn CharacterBindingRepository>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(SqliteStorage, Repos), Box<dyn std::error::Error>> {
     let runtime_cfg = load_runtime(&config_dir.join(RUNTIME_CONFIG).display().to_string())?;
     std::fs::create_dir_all(&runtime_cfg.data_dir).map_err(|e| {
         RuntimeError::Config(format!("无法创建数据目录 {}: {e}", runtime_cfg.data_dir))
@@ -788,15 +775,7 @@ async fn open_cli_storage(
     storage.migrate().await?;
     let pool = storage.pool().clone();
 
-    Ok((
-        storage,
-        Arc::new(SqliteCharacterRepository::new(pool.clone())) as Arc<dyn CharacterRepository>,
-        Arc::new(SqliteConversationRepository::new(pool.clone()))
-            as Arc<dyn ConversationRepository>,
-        Arc::new(SqliteParticipantRepository::new(pool.clone())) as Arc<dyn ParticipantRepository>,
-        Arc::new(SqliteCharacterBindingRepository::new(pool.clone()))
-            as Arc<dyn CharacterBindingRepository>,
-    ))
+    Ok((storage, build_repos(pool)))
 }
 
 /// 解析 CLI 公共参数：`--config-dir <目录>`（默认 `./config`）。
@@ -819,7 +798,8 @@ fn parse_config_dir_arg(args: &[String]) -> Result<PathBuf, RuntimeError> {
 /// 用法：`cargo run -- list-characters [--config-dir <目录>]`
 async fn run_list_characters(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let config_dir = parse_config_dir_arg(args)?;
-    let (storage, character_repo, _, _, _) = open_cli_storage(&config_dir).await?;
+    let (storage, repos) = open_cli_storage(&config_dir).await?;
+    let character_repo: Arc<dyn CharacterRepository> = repos.character_repo.clone();
 
     let characters = character_repo.find_all().await?;
     if characters.is_empty() {
@@ -839,8 +819,10 @@ async fn run_list_characters(args: &[String]) -> Result<(), Box<dyn std::error::
 /// 用法：`cargo run -- list-bindings [--config-dir <目录>]`
 async fn run_list_bindings(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let config_dir = parse_config_dir_arg(args)?;
-    let (storage, character_repo, conversation_repo, _participant_repo, binding_repo) =
-        open_cli_storage(&config_dir).await?;
+    let (storage, repos) = open_cli_storage(&config_dir).await?;
+    let character_repo: Arc<dyn CharacterRepository> = repos.character_repo.clone();
+    let conversation_repo = repos.conversation_repo.clone();
+    let binding_repo = repos.binding_repo.clone();
 
     let bindings = binding_repo.find_all().await?;
     if bindings.is_empty() {
@@ -927,8 +909,10 @@ async fn run_switch_character(args: &[String]) -> Result<(), Box<dyn std::error:
     tracing::debug!(target: "cli", ?conversation_type, "准备切换会话角色");
 
     // 打开存储并装配局部仓储（只读查询，不创建会话）。
-    let (storage, character_repo, conversation_repo, _participant_repo, binding_repo) =
-        open_cli_storage(&config_dir).await?;
+    let (storage, repos) = open_cli_storage(&config_dir).await?;
+    let character_repo: Arc<dyn CharacterRepository> = repos.character_repo.clone();
+    let conversation_repo = repos.conversation_repo.clone();
+    let binding_repo = repos.binding_repo.clone();
 
     let target_conversation = conversation_repo
         .find_by_external_id_and_type(&external_id, conversation_type)
