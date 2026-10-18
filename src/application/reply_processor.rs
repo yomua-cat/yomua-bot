@@ -521,24 +521,86 @@ impl ReplyProcessor {
         }
         Ok(())
     }
-    async fn save_task_error(
+    /// 在 Outbox worker 持有租约时写入生成阶段状态。
+    ///
+    /// 发送阶段已有独立的 delivery fencing；这里覆盖生成失败、批次忽略、
+    /// 过期和绑定失效等更早的状态，避免旧 worker 在租约交接后无条件覆盖
+    /// 新 worker 的任务状态。
+    async fn save_task_owned(
         &self,
         event: &MessageReceivedEvent,
+        lease: Option<&str>,
+        status: ReplyTaskStatus,
+        content: Option<&str>,
+    ) -> Result<(), RuntimeError> {
+        let Some(repo) = &self.message_repo else {
+            return Ok(());
+        };
+        if event.message_id <= 0 {
+            return Ok(());
+        }
+        if let Some(token) = lease {
+            if !repo
+                .save_reply_task_state_owned(
+                    event.message_id,
+                    event.character_id,
+                    token,
+                    status,
+                    content,
+                    None,
+                )
+                .await?
+            {
+                return Err(RuntimeError::Repository(
+                    crate::error::RepositoryError::OwnershipLost,
+                ));
+            }
+        } else {
+            repo.save_reply_task(event.message_id, event.character_id, status, content)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn save_task_error_owned(
+        &self,
+        event: &MessageReceivedEvent,
+        lease: Option<&str>,
         status: ReplyTaskStatus,
         content: Option<&str>,
         error: &str,
     ) -> Result<(), RuntimeError> {
-        if let Some(repo) = &self.message_repo {
-            if event.message_id > 0 {
-                repo.save_reply_task_error(
+        let Some(repo) = &self.message_repo else {
+            return Ok(());
+        };
+        if event.message_id <= 0 {
+            return Ok(());
+        }
+        if let Some(token) = lease {
+            if !repo
+                .save_reply_task_state_owned(
                     event.message_id,
                     event.character_id,
+                    token,
                     status,
                     content,
                     Some(error),
                 )
-                .await?;
+                .await?
+            {
+                return Err(RuntimeError::Repository(
+                    crate::error::RepositoryError::OwnershipLost,
+                ));
             }
+        } else {
+            repo.save_reply_task_error(
+                event.message_id,
+                event.character_id,
+                status,
+                content,
+                Some(error),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -833,12 +895,12 @@ impl ReplyProcessor {
         }
 
         let Some(binding) = self.current_binding(event).await? else {
-            self.save_task(event, ReplyTaskStatus::Cancelled, None)
+            self.save_task_owned(event, lease, ReplyTaskStatus::Cancelled, None)
                 .await?;
             return Ok(());
         };
         if Self::event_expired(event) {
-            self.save_task(event, ReplyTaskStatus::Expired, None)
+            self.save_task_owned(event, lease, ReplyTaskStatus::Expired, None)
                 .await?;
             return Ok(());
         }
@@ -858,7 +920,7 @@ impl ReplyProcessor {
         }
         let character = self.runtime.refresh_character(event.character_id).await?;
         if !character.enabled {
-            self.save_task(event, ReplyTaskStatus::Cancelled, None)
+            self.save_task_owned(event, lease, ReplyTaskStatus::Cancelled, None)
                 .await?;
             return Ok(());
         }
@@ -1004,7 +1066,7 @@ impl ReplyProcessor {
                 timestamp: Utc::now(),
             }));
         if decision.action != BehaviorAction::Reply {
-            self.save_task(event, ReplyTaskStatus::Ignored, None)
+            self.save_task_owned(event, lease, ReplyTaskStatus::Ignored, None)
                 .await?;
             return Ok(());
         }
@@ -1019,7 +1081,7 @@ impl ReplyProcessor {
                 conversation_id = event.conversation_id,
                 "未配置对话模型，保留原始消息并跳过生成"
             );
-            self.save_task(event, ReplyTaskStatus::Ignored, None)
+            self.save_task_owned(event, lease, ReplyTaskStatus::Ignored, None)
                 .await?;
             return Ok(());
         }
@@ -1032,11 +1094,21 @@ impl ReplyProcessor {
             content
         } else {
             if let Some(repo) = &self.message_repo {
-                if !repo
-                    .claim_reply_task_for_generation(event.message_id, event.character_id)
+                let claimed = if let Some(token) = lease {
+                    repo.claim_reply_task_for_generation_owned(
+                        event.message_id,
+                        event.character_id,
+                        token,
+                    )
                     .await?
-                {
-                    return Ok(());
+                } else {
+                    repo.claim_reply_task_for_generation(event.message_id, event.character_id)
+                        .await?
+                };
+                if !claimed {
+                    return Err(RuntimeError::Repository(
+                        crate::error::RepositoryError::OwnershipLost,
+                    ));
                 }
             } else {
                 self.save_task(event, ReplyTaskStatus::Generating, None)
@@ -1057,18 +1129,24 @@ impl ReplyProcessor {
                 Err(error) => {
                     // 生成失败不能把任务永久留在 generating；恢复为 pending
                     // 后，Outbox 的重试才能再次取得生成权。
-                    self.save_task_error(event, ReplyTaskStatus::Pending, None, &error.to_string())
-                        .await?;
+                    self.save_task_error_owned(
+                        event,
+                        lease,
+                        ReplyTaskStatus::Pending,
+                        None,
+                        &error.to_string(),
+                    )
+                    .await?;
                     return Err(error);
                 }
             };
             self.ensure_event_still_owned(event, lease).await?;
             if Self::event_expired(event) {
-                self.save_task(event, ReplyTaskStatus::Expired, Some(&content))
+                self.save_task_owned(event, lease, ReplyTaskStatus::Expired, Some(&content))
                     .await?;
                 return Ok(());
             }
-            self.save_task(event, ReplyTaskStatus::Generated, Some(&content))
+            self.save_task_owned(event, lease, ReplyTaskStatus::Generated, Some(&content))
                 .await?;
             content
         };
@@ -1077,7 +1155,7 @@ impl ReplyProcessor {
             .await;
         // 绑定切换与发送前复核已经由整个处理期间持有的会话门闩串行化。
         if Self::event_expired(event) {
-            self.save_task(event, ReplyTaskStatus::Expired, Some(&content))
+            self.save_task_owned(event, lease, ReplyTaskStatus::Expired, Some(&content))
                 .await?;
             return Ok(());
         }
@@ -1089,7 +1167,7 @@ impl ReplyProcessor {
                 .await?
                 .enabled
         {
-            self.save_task(event, ReplyTaskStatus::Cancelled, None)
+            self.save_task_owned(event, lease, ReplyTaskStatus::Cancelled, None)
                 .await?;
             return Ok(());
         }
@@ -1166,7 +1244,8 @@ impl ReplyProcessor {
                     )
                     .await?;
                 } else {
-                    self.save_task(event, ReplyTaskStatus::Sent, None).await?;
+                    self.save_task_owned(event, lease, ReplyTaskStatus::Sent, None)
+                        .await?;
                 }
             }
             Ok(response) => {

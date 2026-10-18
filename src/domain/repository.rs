@@ -367,6 +367,28 @@ pub trait MessageRepository: Send + Sync {
         Err(RepositoryError::NotImplemented("回复任务存储".into()))
     }
 
+    /// 在当前 Outbox 租约仍归调用者所有时写入生成阶段状态。
+    ///
+    /// 生产实现必须把租约检查和写入放在同一条条件 SQL 中，避免 worker
+    /// 在检查后失去租约仍覆盖新 worker 的状态。默认实现供不带 Outbox
+    /// 的轻量测试仓储使用；SQLite 实现会覆盖它。
+    async fn save_reply_task_state_owned(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        lease_token: &str,
+        status: crate::domain::message::ReplyTaskStatus,
+        content: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<bool, RepositoryError> {
+        if !self.owns_outbox_lease(message_id, lease_token).await? {
+            return Ok(false);
+        }
+        self.save_reply_task_error(message_id, character_id, status, content, error)
+            .await
+            .map(|_| true)
+    }
+
     /// 只在任务尚未开始处理时将其标记为忽略。
     ///
     /// 连续消息聚合会并行看到后续消息；生产仓储必须使用条件更新，不能覆盖
@@ -406,6 +428,24 @@ pub trait MessageRepository: Send + Sync {
         )
         .await
         .map(|_| true)
+    }
+
+    /// 使用当前 Outbox 租约原子领取生成权。
+    ///
+    /// `generating` 可以由新租约重新领取：这表示上一 worker 的租约已过期，
+    /// 其后续状态写入会被 lease fencing 拒绝。调用方需在生成后再次用同一
+    /// 租约提交结果。
+    async fn claim_reply_task_for_generation_owned(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        lease_token: &str,
+    ) -> Result<bool, RepositoryError> {
+        if !self.owns_outbox_lease(message_id, lease_token).await? {
+            return Ok(false);
+        }
+        self.claim_reply_task_for_generation(message_id, character_id)
+            .await
     }
     async fn save_reply_task_error(
         &self,

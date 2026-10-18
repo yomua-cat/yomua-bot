@@ -15,7 +15,7 @@
 - `cargo check --locked --all-targets --offline`：通过。
 - `cargo test --locked --all-targets --no-run --offline`：通过编译检查。
 - `cargo fmt --all -- --check`：通过。
-- `cargo test --locked --all-targets --offline`：库 458 个、主程序 5 个、ctl 39 个、alpha 集成 8 个、控制集成 84 个通过；15 个插件 Unix socket 测试按 `#[ignore]` 标记跳过。
+- `cargo test --locked --all-targets`：库 461 个、主程序 5 个、ctl 39 个、alpha 集成 8 个、控制集成 84 个通过；15 个插件 Unix socket 测试按 `#[ignore]` 标记跳过。
 - `cargo test --locked --lib infrastructure::plugin::transport::tests --offline -- --ignored --test-threads=1`：15 个插件 Unix socket 测试全部通过。
 - 临时 Unix socket 模拟服务配合真实 `yomua-bot-ctl status --raw`：通过，确认发送的是版本化 `ControlEnvelope`，不含旧 `cmd` 字段。
 - CLI 解析测试：覆盖一段、二段、三段命令、短别名归一化和危险命令确认。
@@ -54,6 +54,7 @@
 
 - 消息接入与 OneBot 转换：`src/adapters/onebot/conversion.rs`、`src/adapters/onebot/mod.rs`。核对 CQ 文本、提及目标、引用、媒体摘要、平台消息 ID 和自身回声。
 - 入库与 Outbox：`src/application/message_acceptance.rs`、`src/infrastructure/storage/repository/message_repository.rs`、`src/infrastructure/storage/repository/outbox_repository.rs`。核对同事务写入、平台 ID 去重、会话序号、租约和失败后继续处理。
+- 回复任务租约：运行 `reply_delivery_result_cannot_be_overwritten_after_lease_changes`，确认旧 worker 的生成状态、失败回退和发送结果写入会被拒绝，新租约可以接管过期的 `generating` 任务。
 - 回复处理：`src/application/reply_processor.rs`。核对角色绑定/停用、连续消息批次、当前消息只出现一次、生成落库、发送前复核和 unknown 状态。
 - 上下文：`src/application/context_assembler.rs`、`src/application/character_history.rs`。核对硬约束、角色卡、动态状态、可见记忆、历史、当前批次和预算降级顺序。
 - 参与决策：`src/application/decision_orchestrator.rs`、`src/application/decision_pipeline.rs`、`src/application/behavior_engine.rs`。核对明确 @、普通群消息、静默和决策模型失败回退。

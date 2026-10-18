@@ -353,15 +353,65 @@ mod storage_tests {
         .await
         .expect("插入测试 outbox 事件失败");
 
+        repo.save_reply_task(message_id, character_id, ReplyTaskStatus::Pending, None)
+            .await
+            .expect("创建待处理回复任务失败");
         assert!(repo
-            .begin_reply_task_delivery(message_id, character_id, "lease-a")
+            .claim_reply_task_for_generation_owned(message_id, character_id, "lease-a")
+            .await
+            .expect("租约 A 领取生成权失败"));
+
+        // Outbox 重新领取后，旧 worker 的生成结果和失败回写都必须被拒绝；
+        // 新 worker 可以接管过期的 generating 状态，不能把任务静默完成。
+        sqlx::query(
+            "UPDATE outbox_events SET lease_token = ?, locked_until = ? WHERE entity_id = ?",
+        )
+        .bind("lease-b")
+        .bind((chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339())
+        .bind(message_id)
+        .execute(storage.pool())
+        .await
+        .expect("切换测试租约失败");
+        assert!(!repo
+            .save_reply_task_state_owned(
+                message_id,
+                character_id,
+                "lease-a",
+                ReplyTaskStatus::Pending,
+                None,
+                Some("旧 worker 失败"),
+            )
+            .await
+            .expect("旧租约状态写入检查失败"));
+        assert!(!repo
+            .claim_reply_task_for_generation_owned(message_id, character_id, "lease-a")
+            .await
+            .expect("旧租约生成领取检查失败"));
+        assert!(repo
+            .claim_reply_task_for_generation_owned(message_id, character_id, "lease-b")
+            .await
+            .expect("租约 B 接管过期生成任务失败"));
+        assert!(repo
+            .save_reply_task_state_owned(
+                message_id,
+                character_id,
+                "lease-b",
+                ReplyTaskStatus::Generated,
+                Some("第一条回复"),
+                None,
+            )
+            .await
+            .expect("租约 B 保存生成结果失败"));
+
+        assert!(repo
+            .begin_reply_task_delivery(message_id, character_id, "lease-b")
             .await
             .expect("取得发送栅栏失败"));
         assert!(repo
             .save_reply_task_delivery_owned(
                 message_id,
                 character_id,
-                "lease-a",
+                "lease-b",
                 ReplyTaskStatus::Sent,
                 Some("第一条回复"),
                 None,
@@ -373,7 +423,7 @@ mod storage_tests {
         sqlx::query(
             "UPDATE outbox_events SET lease_token = ?, locked_until = ? WHERE entity_id = ?",
         )
-        .bind("lease-b")
+        .bind("lease-c")
         .bind((chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339())
         .bind(message_id)
         .execute(storage.pool())
@@ -384,7 +434,7 @@ mod storage_tests {
             .save_reply_task_delivery_owned(
                 message_id,
                 character_id,
-                "lease-a",
+                "lease-b",
                 ReplyTaskStatus::Unknown,
                 Some("旧 worker 覆盖"),
                 Some("stale"),
@@ -392,6 +442,17 @@ mod storage_tests {
             )
             .await
             .expect("失效租约写入检查失败"));
+        assert!(!repo
+            .save_reply_task_state_owned(
+                message_id,
+                character_id,
+                "lease-b",
+                ReplyTaskStatus::Generated,
+                Some("旧 worker 覆盖"),
+                None,
+            )
+            .await
+            .expect("失效租约生成状态写入检查失败"));
         let task = repo
             .reply_task(message_id)
             .await

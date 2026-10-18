@@ -266,6 +266,65 @@ impl MessageRepository for SqliteMessageRepository {
         Ok(())
     }
 
+    async fn save_reply_task_state_owned(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        lease_token: &str,
+        status: crate::domain::message::ReplyTaskStatus,
+        content: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<bool, RepositoryError> {
+        // 生成阶段的状态写入也必须和 Outbox 租约绑定。旧 worker 即使在
+        // 发送前失去租约，也不能把新 worker 的 pending/generated 状态覆盖。
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            r#"INSERT INTO reply_tasks(
+                   message_id, character_id, status, content, error, updated_at
+               )
+               SELECT ?, ?, ?, ?, ?, ?
+               FROM outbox_events
+               WHERE entity_id = ?
+                 AND entity_type = 'messages'
+                 AND event_type = 'MessageAccepted'
+                 AND status = 'processing'
+                 AND lease_token = ?
+                 AND locked_until > ?
+               LIMIT 1
+               ON CONFLICT(message_id) DO UPDATE SET
+                   status = excluded.status,
+                   content = COALESCE(excluded.content, reply_tasks.content),
+                   error = excluded.error,
+                   updated_at = excluded.updated_at
+               WHERE reply_tasks.character_id = excluded.character_id
+                 AND reply_tasks.status IN ('pending', 'generating', 'generated', 'sending')
+                 AND EXISTS (
+                     SELECT 1 FROM outbox_events
+                      WHERE entity_id = ?
+                        AND entity_type = 'messages'
+                        AND event_type = 'MessageAccepted'
+                        AND status = 'processing'
+                        AND lease_token = ?
+                        AND locked_until > ?
+                 )"#,
+        )
+        .bind(message_id)
+        .bind(character_id)
+        .bind(status.to_string())
+        .bind(content)
+        .bind(error)
+        .bind(&now)
+        .bind(message_id)
+        .bind(lease_token)
+        .bind(&now)
+        .bind(message_id)
+        .bind(lease_token)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn mark_reply_task_ignored_if_pending(
         &self,
         message_id: i64,
@@ -311,6 +370,57 @@ impl MessageRepository for SqliteMessageRepository {
         .await?;
         Ok(result.rows_affected() == 1)
     }
+
+    async fn claim_reply_task_for_generation_owned(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        lease_token: &str,
+    ) -> Result<bool, RepositoryError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            r#"INSERT INTO reply_tasks(
+                   message_id, character_id, status, content, error, updated_at
+               )
+               SELECT ?, ?, 'generating', NULL, NULL, ?
+               FROM outbox_events
+               WHERE entity_id = ?
+                 AND entity_type = 'messages'
+                 AND event_type = 'MessageAccepted'
+                 AND status = 'processing'
+                 AND lease_token = ?
+                 AND locked_until > ?
+               LIMIT 1
+               ON CONFLICT(message_id) DO UPDATE SET
+                   status = 'generating',
+                   error = NULL,
+                   updated_at = excluded.updated_at
+               WHERE reply_tasks.character_id = excluded.character_id
+                 AND reply_tasks.status IN ('pending', 'generating')
+                 AND EXISTS (
+                     SELECT 1 FROM outbox_events
+                      WHERE entity_id = ?
+                        AND entity_type = 'messages'
+                        AND event_type = 'MessageAccepted'
+                        AND status = 'processing'
+                        AND lease_token = ?
+                        AND locked_until > ?
+                 )"#,
+        )
+        .bind(message_id)
+        .bind(character_id)
+        .bind(&now)
+        .bind(message_id)
+        .bind(lease_token)
+        .bind(&now)
+        .bind(message_id)
+        .bind(lease_token)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn save_reply_task_error(
         &self,
         message_id: i64,
