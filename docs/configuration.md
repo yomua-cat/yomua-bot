@@ -101,12 +101,16 @@ output_reservation = 1024
 provider_type = "openai-compatible"
 base_url = "https://llm.example.invalid/v1"
 api_key = "REPLACE_WITH_LLM_KEY"
+# 可选；配置后认知任务才会尝试生成向量
+embedding_model = "REPLACE_WITH_EMBEDDING_MODEL"
 timeout_secs = 60
 
 [providers.backup]
 provider_type = "openai-compatible"
 base_url = "https://backup.example.invalid/v1"
 api_key = "REPLACE_WITH_BACKUP_KEY"
+# 可选；备用 Provider 也可以单独配置向量模型
+embedding_model = "REPLACE_WITH_BACKUP_EMBEDDING_MODEL"
 timeout_secs = 60
 
 [model_instances.dialogue]
@@ -131,7 +135,7 @@ budget_tokens = 4096
 model_instance = "dialogue"
 ```
 
-Provider 只登记连接地址、密钥和超时；同一个 Provider 可以被多个 model instance 复用。model instance 只填写模型名和能力，URL 不重复写。对话和插件聊天使用 `conversation`；后台认知使用 `cognition`。
+Provider 登记连接地址、密钥、超时和可选的 `embedding_model`；同一个 Provider 可以被多个 model instance 复用。model instance 只填写模型名和能力，URL 不重复写。对话和插件聊天使用 `conversation`；后台认知使用 `cognition`。未配置 `embedding_model` 时，向量增强会跳过，文本生成不受影响。
 
 `fallback_model_instances` 按顺序尝试，`max_attempts` 限制本次请求最多尝试的模型数，`budget_tokens` 是主模型与备用模型共享的本次请求输出 token 上限。调度器会在每次尝试前保守预留本次允许的最大输出；网络失败且没有可用用量数据时，已预留额度不会回收，以避免备用链超过上限。只有网络错误、超时、HTTP 429 或 5xx 会切换备用模型；认证失败、参数错误和响应格式错误会立即返回。每次请求只生成一次，备用模型只在尚未得到有效响应时使用。
 

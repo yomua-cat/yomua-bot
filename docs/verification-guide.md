@@ -62,6 +62,7 @@
 - 控制协议与 ctl：`src/application/control_schema.rs`、`src/application/control.rs`、`src/bin/yomua-bot-ctl.rs`。核对一段、二段、三段命令，帮助文本，中文错误，危险命令确认和 unknown 查询/重试。
 - 插件：`src/infrastructure/plugin/manifest.rs`、`registry.rs`、`transport.rs`、`supervisor.rs`。核对握手归属、订阅权限、失败隔离、任务退出和核心状态写保护。
 - 生命周期与配置：`src/main.rs`、`src/application/config.rs`、`src/application/runtime.rs`。核对初始化、迁移、热重载、关停超时和 socket 清理。
+- 向量配置：在隔离配置中为 `[providers.<name>]` 设置 `embedding_model`，确认配置解析保留模型名；未设置时确认认知任务仍能保存普通记忆而不调用向量接口。
 - 语音接入（尚未实现）：当前文本链路不能直接承载实时音频；后续应新增独立 VoiceGateway，把最终转写写入本地 Conversation/Participant/Message，再复用记忆和上下文。外部 voice session/call_id 只作为关联键，QQ/NapCat 音频发送需单独验证。
 
 每项记录“已由自动化验证”“仅静态确认”或“尚未验证”，不要把单元测试通过直接等同于真实 QQ 体验通过。

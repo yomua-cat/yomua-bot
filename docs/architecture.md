@@ -76,7 +76,7 @@ flowchart TD
 
 [认知层](../src/application/cognition.rs)通过[调度器](../src/application/llm_scheduler.rs)发起请求，HTTP 实现在[OpenAI-compatible Provider](../src/infrastructure/llm/openai_compatible.rs)。Provider 连接与对话模型来自 `llm.toml`，独立决策模型来自 `decision.toml`，同一 Provider 可复用多个模型。LLM 关闭时保留消息并跳过生成，不发送伪造回复；启用后模型或上下文错误会按 Outbox 失败路径处理。
 
-主程序没有给 ContextBuilder 注入 embedding scheduler，因此当前对话上下文使用关键词 Lorebook 与记忆检索。向量检索接口若被调用，必须带当前会话和稳定用户身份，由 SQL 先限制可见范围后再排序；存在语义存储或混合检索接口不代表对话已经使用 RAG。
+主程序没有给 ContextBuilder 注入 embedding scheduler，因此当前对话上下文使用关键词 Lorebook 与记忆检索。认知后台使用统一的 embedding scheduler；Provider 可在 `llm.toml` 中配置可选 `embedding_model`，未配置时只跳过向量增强。向量检索接口若被调用，必须带当前会话和稳定用户身份，由 SQL 先限制可见范围后再排序；存在语义存储或混合检索接口不代表对话已经使用 RAG。
 
 ## 后台任务与持久化
 

@@ -67,6 +67,10 @@ pub struct LlmProviderConfig {
     /// 可选的 API Key。
     pub api_key: Option<String>,
 
+    /// 可选的向量模型；未配置时仅跳过向量增强，不影响文本生成。
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+
     /// 超时时间（秒）。
     pub timeout_secs: Option<u64>,
 }
@@ -272,6 +276,11 @@ impl LlmConfig {
                         .get("api_key")
                         .and_then(|v| v.as_str())
                         .map(str::to_owned),
+                    embedding_model: self
+                        .options
+                        .get("embedding_model")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
                     timeout_secs: self.options.get("timeout_secs").and_then(|v| v.as_u64()),
                 },
             );
@@ -396,6 +405,15 @@ impl LlmConfig {
             if provider.timeout_secs == Some(0) {
                 return Err(RuntimeError::Config(format!(
                     "Provider {name} 超时必须大于 0"
+                )));
+            }
+            if provider
+                .embedding_model
+                .as_deref()
+                .is_some_and(|model| model.trim().is_empty())
+            {
+                return Err(RuntimeError::Config(format!(
+                    "Provider {name} 的 embedding_model 不能为空"
                 )));
             }
         }
@@ -610,6 +628,7 @@ enabled = false
 # model = "REPLACE_WITH_MODEL_NAME"
 # base_url = "https://api.example.invalid/v1"
 # api_key = "REPLACE_WITH_LLM_API_KEY"
+# embedding_model = "REPLACE_WITH_EMBEDDING_MODEL" # 可选；不配置则不使用向量增强
 # timeout_secs = 60
 # context_window = 8192
 # max_output_tokens = 1024
@@ -621,12 +640,14 @@ enabled = false
 # provider_type = "openai-compatible"
 # base_url = "https://api.example.invalid/v1"
 # api_key = "REPLACE_WITH_PRIMARY_KEY"
+# embedding_model = "REPLACE_WITH_EMBEDDING_MODEL" # 可选
 # timeout_secs = 60
 #
 # [providers.backup]
 # provider_type = "openai-compatible"
 # base_url = "https://api.backup.example.invalid/v1"
 # api_key = "REPLACE_WITH_BACKUP_KEY"
+# embedding_model = "REPLACE_WITH_BACKUP_EMBEDDING_MODEL" # 可选
 # timeout_secs = 60
 #
 # [model_instances.conversation]
@@ -979,6 +1000,62 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.provider.as_deref(), Some("ollama"));
         assert_eq!(cfg.options["model"], "qwen2.5");
+    }
+
+    #[test]
+    fn llm_provider_embedding_model_is_preserved_in_resolved_config() {
+        let cfg: LlmConfig = toml::from_str(
+            r#"
+enabled = true
+
+[options]
+
+[providers.local]
+provider_type = "openai-compatible"
+base_url = "http://127.0.0.1:11434/v1"
+embedding_model = "nomic-embed-text"
+
+[model_instances.conversation]
+provider = "local"
+model = "qwen"
+context_window = 8192
+max_output_tokens = 512
+
+[roles.conversation]
+model_instance = "conversation"
+"#,
+        )
+        .unwrap();
+        let resolved = cfg.resolve().unwrap().expect("配置应启用");
+        assert_eq!(
+            resolved
+                .providers
+                .get("local")
+                .and_then(|provider| provider.embedding_model.as_deref()),
+            Some("nomic-embed-text")
+        );
+    }
+
+    #[test]
+    fn legacy_options_embedding_model_is_preserved() {
+        let cfg: LlmConfig = toml::from_str(
+            r#"
+enabled = true
+provider = "ollama"
+[options]
+model = "qwen2.5"
+embedding_model = "nomic-embed-text"
+"#,
+        )
+        .unwrap();
+        let resolved = cfg.resolve().unwrap().expect("配置应启用");
+        assert_eq!(
+            resolved
+                .providers
+                .get("default")
+                .and_then(|provider| provider.embedding_model.as_deref()),
+            Some("nomic-embed-text")
+        );
     }
 
     #[test]

@@ -152,7 +152,7 @@ fn build_provider_from_config(
         base_url: pc.base_url.clone(),
         api_key: pc.api_key.clone(),
         model: String::new(), // 模型名由 LlmScheduler 根据 role 路由时动态指定
-        embedding_model: None,
+        embedding_model: pc.embedding_model.clone(),
         timeout: Duration::from_secs(pc.timeout_secs.unwrap_or(60)),
     }))
 }
