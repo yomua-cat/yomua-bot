@@ -237,18 +237,42 @@ async fn handle_conn(
         other => {
             tracing::warn!(plugin = %expected_name, result = ?other, "插件握手失败");
             let reason = match other {
-                Ok(Ok(Some(_))) => "首帧必须是 hello".to_string(),
-                Ok(Ok(None)) => "握手前连接关闭".to_string(),
-                Ok(Err(error)) if error.contains("protocol_version") => error,
-                Ok(Err(_)) => "首帧不是合法协议消息".to_string(),
-                Err(_) => "握手超时".to_string(),
+                Ok(Ok(Some(_))) => crate::infrastructure::plugin::protocol::mark_error(
+                    "HANDSHAKE_FAILED",
+                    "首帧必须是 hello",
+                ),
+                Ok(Ok(None)) => crate::infrastructure::plugin::protocol::mark_error(
+                    "HANDSHAKE_FAILED",
+                    "握手前连接关闭",
+                ),
+                Ok(Err(error)) if error.contains("protocol_version") => {
+                    crate::infrastructure::plugin::protocol::mark_error(
+                        "UNSUPPORTED_PROTOCOL_VERSION",
+                        &error,
+                    )
+                }
+                Ok(Err(_)) => crate::infrastructure::plugin::protocol::mark_error(
+                    "PROTOCOL_ERROR",
+                    "首帧不是合法协议消息",
+                ),
+                Err(_) => crate::infrastructure::plugin::protocol::mark_error(
+                    "HANDSHAKE_FAILED",
+                    "握手超时",
+                ),
             };
             let _ = send_handshake(&mut write_half, Some(reason)).await;
             return;
         }
     };
     if hello.name != expected_name {
-        let _ = send_handshake(&mut write_half, Some("插件名不匹配".to_string())).await;
+        let _ = send_handshake(
+            &mut write_half,
+            Some(crate::infrastructure::plugin::protocol::mark_error(
+                "IDENTITY_MISMATCH",
+                "插件名不匹配",
+            )),
+        )
+        .await;
         return;
     }
     let granted = registry.permissions_for(&expected_name).unwrap_or_default();
@@ -257,16 +281,28 @@ async fn handle_conn(
         let event = match EventType::parse(name) {
             Ok(event) => event,
             Err(_) => {
-                let _ = send_handshake(&mut write_half, Some(format!("订阅了未知事件名：{name}")))
-                    .await;
+                let _ = send_handshake(
+                    &mut write_half,
+                    Some(crate::infrastructure::plugin::protocol::mark_error(
+                        "UNKNOWN_EVENT",
+                        &format!("订阅了未知事件名：{name}"),
+                    )),
+                )
+                .await;
                 return;
             }
         };
         if crate::infrastructure::plugin::permissions::permission_for_event(event)
             .is_some_and(|required| !granted.contains(&required))
         {
-            let _ =
-                send_handshake(&mut write_half, Some(format!("权限不足：不能订阅 {name}"))).await;
+            let _ = send_handshake(
+                &mut write_half,
+                Some(crate::infrastructure::plugin::protocol::mark_error(
+                    "PERMISSION_DENIED",
+                    &format!("权限不足：不能订阅 {name}"),
+                )),
+            )
+            .await;
             return;
         }
         if !subscriptions.contains(&event) {
@@ -275,7 +311,14 @@ async fn handle_conn(
     }
     let (tx, rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
     if let Err(error) = registry.attach_conn(&expected_name, tx.clone()) {
-        let _ = send_handshake(&mut write_half, Some(error.to_string())).await;
+        let _ = send_handshake(
+            &mut write_half,
+            Some(crate::infrastructure::plugin::protocol::mark_error(
+                "INTERNAL_ERROR",
+                &error.to_string(),
+            )),
+        )
+        .await;
         return;
     }
     let _cleanup_guard = ConnCleanupGuard {

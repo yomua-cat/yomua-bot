@@ -51,7 +51,7 @@ cp target/debug/examples/echo_plugin /absolute/path/to/plugins/echo/echo_plugin
 
 RPC 请求使用 `payload.request_id`、`method`、`params`，响应使用相同 `request_id`、`ok`、`result`、`error`。`error` 是 `{code, message}`，插件按 `code` 判断，`message` 仅供日志和用户显示。事件使用 `kind = "event"` 与 `event`、`data`；收到 `shutdown` 事件后插件应自行退出。
 
-错误码为稳定 ASCII 标识：`PERMISSION_DENIED`、`UNKNOWN_METHOD`、`INVALID_ARGUMENT`、`NOT_FOUND`、`FORBIDDEN`、`PROTOCOL_ERROR` 和 `INTERNAL_ERROR`。错误码由 API 错误类型产生，不从中文 message 推断；未单独分类的宿主执行错误归为 `INTERNAL_ERROR`。
+错误码为稳定 ASCII 标识：`PERMISSION_DENIED`、`UNKNOWN_METHOD`、`INVALID_ARGUMENT`、`NOT_FOUND`、`FORBIDDEN`、`PROTOCOL_ERROR`、`UNSUPPORTED_PROTOCOL_VERSION`、`HANDSHAKE_FAILED`、`IDENTITY_MISMATCH`、`UNKNOWN_EVENT` 和 `INTERNAL_ERROR`。错误码由 API 或握手错误类型产生，不从中文 message 推断；未单独分类的宿主执行错误归为 `INTERNAL_ERROR`。
 
 事件 DTO 由[事件桥接](../src/infrastructure/plugin/event_bridge.rs)显式投影，插件不会收到 `CoreEvent` 枚举或数据库对象。消息广播不是持久订阅或可靠队列，不保证断线补发，也不能仅凭收到 `message.received` 推断回复处理已完成。
 
