@@ -51,7 +51,7 @@ cargo build --release --locked --bin yomua-bot --bin yomua-bot-ctl
 └── plugin-sockets/      插件启用时按需创建
 ```
 
-日志默认输出到终端，由部署环境负责收集与轮转。`RUST_LOG` 优先于 `log_level`，例如 `RUST_LOG=debug`。日志可能包含会话内容及服务错误响应，按运行数据保护。
+日志默认输出到标准错误，由部署环境负责收集与轮转。`RUST_LOG` 优先于 `runtime.toml` 的 `log_level`，例如 `RUST_LOG=info,outbox=debug,llm=debug,adapter=debug` 可在真实收发测试时保留总体状态并提高关键链路细节。可查看[日志过滤与 target 说明](configuration.md#日志过滤)。事件会记录内部会话/消息 ID、平台消息 ID、事件 UUID、Outbox attempt/租约状态及 LLM role/provider/model；聊天正文、API key 和模型服务错误响应正文不写入日志。仍应按运行数据权限保护日志文件。
 
 控制 socket 没有应用层身份认证，能够访问它的进程可以执行管理和删除命令。运行在专用用户下，限制配置、数据和 socket 所在目录的访问权限；不要把控制 socket 暴露给其他用户或网络代理。
 

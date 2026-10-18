@@ -28,6 +28,8 @@ admin_users = ["REPLACE_WITH_ADMIN_ID"]
 # 可选设置。
 # broadcast_capacity = 256
 # plugins_dir = "/absolute/path/to/plugins"
+# 主动行为和静默时段使用的 UTC 偏移，默认北京时间。
+timezone = "+8"
 ```
 
 | 字段 | 实际行为 |
@@ -39,6 +41,13 @@ admin_users = ["REPLACE_WITH_ADMIN_ID"]
 | `plugins_dir` | 省略时不启动插件；不存在或无效清单会记录日志 |
 | `broadcast_capacity` | 可选正数；默认 256；广播消费滞后可能丢事件 |
 | `default_character_id` | 可解析，但主程序没有接入自动绑定逻辑；使用显式导入绑定 |
+| `timezone` | 主动行为、静默时段和每日主动额度使用的 UTC 小时偏移；格式为 `+?` 或 `-?`，默认 `+8` |
+
+### 日志过滤
+
+默认按 `runtime.log_level` 过滤，日志输出到标准错误。启动时若 `RUST_LOG` 是有效的 EnvFilter，则整条过滤规则优先于 `log_level`；配置热重载只更新 `log_level` 级别过滤器，不会覆盖启动时的 `RUST_LOG` 规则。可用 target 包括 `runtime`、`adapter`、`message`、`outbox`、`llm`、`decision`、`control` 和 `cli`；未显式设置 target 的 tracing 事件仍使用 Rust 模块路径。
+
+真实 QQ 测试建议先用 `RUST_LOG=info` 保留状态迁移与失败摘要；定位单条链路时用 `RUST_LOG=info,outbox=debug,llm=debug,adapter=debug`。`trace` 和全局 `debug` 会增加存储、插件及请求级日志量，建议仅短时启用。日志字段包含内部会话/消息 ID、平台消息 ID、事件 UUID、角色和模型路由信息，应按运行数据权限保护；不记录聊天正文、API key 或模型服务错误响应正文。
 
 ## onebot.toml
 
@@ -135,7 +144,7 @@ budget_tokens = 4096
 model_instance = "dialogue"
 ```
 
-Provider 登记连接地址、密钥、超时和可选的 `embedding_model`；同一个 Provider 可以被多个 model instance 复用。普通聊天使用 `provider_type = "openai-compatible"`；Jev 使用 `provider_type = "typesafe"`，请求会发送到 TypeSafe System One 的 `/v1/systemone`，不会走 `/chat/completions`。model instance 只填写模型名和能力，URL 不重复写。对话和插件聊天使用 `conversation`；后台认知使用 `cognition`。未配置 `embedding_model` 时，向量增强会跳过，文本生成不受影响。
+Provider 登记连接地址、密钥、超时和可选的 `embedding_model`；同一个普通对话 Provider 可以被多个 model instance 复用。普通聊天使用 `provider_type = "openai-compatible"`，Jev 决策 Provider 则单独登记在 `decision.toml`，使用 `provider_type = "typesafe"`；Jev 请求会发送到 TypeSafe System One 的 `/v1/systemone`，不会走 `/chat/completions`。model instance 只填写模型名和能力，URL 不重复写。对话和插件聊天使用 `conversation`；后台认知使用 `cognition`。未配置 `embedding_model` 时，向量增强会跳过，文本生成不受影响。
 
 `fallback_model_instances` 按顺序尝试，`max_attempts` 限制本次请求最多尝试的模型数，`budget_tokens` 是主模型与备用模型共享的本次请求输出 token 上限。调度器会在每次尝试前保守预留本次允许的最大输出；网络失败且没有可用用量数据时，已预留额度不会回收，以避免备用链超过上限。只有网络错误、超时、HTTP 429 或 5xx 会切换备用模型；认证失败、参数错误和响应格式错误会立即返回。每次请求只生成一次，备用模型只在尚未得到有效响应时使用。
 
@@ -145,31 +154,36 @@ model instance 中的能力字段用于该任务的上下文和输出限制；�
 
 ## decision.toml：独立决策模型
 
-决策模型不与对话模型混在同一个任务表中。Provider 名称必须已经在 `llm.toml` 的 `[providers.*]` 注册；本文件只选择决策模型和备用模型。
+决策模型不与对话模型混在同一个任务表中。决策 Provider、地址和密钥直接登记在本文件的 `[providers.*]`；普通对话和认知 Provider 仍登记在 `llm.toml`。
 
 ```toml
 enabled = true
+max_attempts = 2
+budget_tokens = 1024
+
+[providers.jev]
+provider_type = "typesafe"
+base_url = "https://api.typesafe.ai/v1/systemone"
+api_key = "REPLACE_WITH_JEV_API_KEY"
+timeout_secs = 60
 
 [primary]
-provider = "primary"
-model = "REPLACE_WITH_DECISION_MODEL"
+provider = "jev"
+model = "jev-latest"
 context_window = 8192
 max_output_tokens = 256
 
 [[fallbacks]]
-provider = "backup"
+provider = "jev_backup"
 model = "REPLACE_WITH_DECISION_BACKUP_MODEL"
 context_window = 8192
 max_output_tokens = 256
-
-max_attempts = 2
-budget_tokens = 1024
 ```
 
 `decision.toml` 的备用链同样共享本次请求的输出 token 上限，并只在网络错误、超时、HTTP 429、529 或 5xx 时切换。Jev 决策使用一个 `choice` 问题返回 `keep`、`suggest_reply` 或 `suggest_ignore`，程序把答案映射为现有 `DecisionResult`；主动情境只发送 `keep` 和 `suggest_ignore`。规则引擎和程序校验仍拥有最终裁决权。
 
 ## 修改与重载
 
-`reload-config` 会读取并校验 `runtime.toml`、`onebot.toml`、`llm.toml` 和 `decision.toml` 四份配置。只有运行时可热更新字段会整体替换当前运行设置，并同步更新日志过滤器；数据目录、插件目录、OneBot 连接、LLM Provider/模型、决策模型和 `shutdown_timeout_secs` 等启动装配项会返回 `restart_required`，当前配置保持不变，需要受控关停后重启。关停超时值在启动时被插件监督器等组件读取，不能只更新配置快照。
+`reload-config` 会读取并校验 `runtime.toml`、`onebot.toml`、`llm.toml` 和 `decision.toml` 四份配置。运行时设置会整体替换当前快照，并同步更新日志过滤器；其中 `timezone` 会被后续行为决策和主动额度检查立即读取。数据目录、插件目录、OneBot 连接、LLM Provider/模型、决策模型和 `shutdown_timeout_secs` 等启动装配项会返回 `restart_required`，当前配置保持不变，需要受控关停后重启。关停超时值在启动时被插件监督器等组件读取，不能只更新配置快照。
 
 配置文件可能包含令牌和密钥，全部 TOML 默认忽略，只有根 `Cargo.toml` 入库。提交问题时使用占位值，不粘贴真实配置。

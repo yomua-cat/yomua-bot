@@ -10,6 +10,14 @@
 4. 使用模拟 OneBot 和本地模型验证消息去重、回复任务状态和失败重试。
 5. 最后再使用真实 QQ 或外部模型做人工体验验收。
 
+## 真实收发日志
+
+真实 QQ/NapCat 测试时，启动前设置 `RUST_LOG=info,outbox=debug,llm=debug,adapter=debug`，保留基础运行状态并展开消息接入、Outbox、模型路由和 OneBot 适配器细节。日志输出到标准错误，部署环境需同时收集标准错误并设置轮转。
+
+从 Outbox 的 `event_uuid` 开始关联同一任务；处理器结束日志提供 `conversation_id`、`message_id`、`attempt` 和 `final_state`。这些字段用于区分已接受但未处理、处理失败和已完成。租约 claim、续期、丢失和过期恢复主要由 `outbox` target 的调度器日志观察。日志不应加入消息正文、完整 payload 或凭据；会话、消息和平台消息标识仍属于需限制访问的运行数据。
+
+处理器会把 Outbox 顶层的 `event_uuid` 写入 `MessageReceivedEvent.metadata`，因此回复生成和 LLM 调度日志可以沿同一 UUID 关联；同时保留 `conversation_id`、`message_id` 和时间作为交叉核对字段。真实网络、外部服务和 QQ 送达结果仍须人工验收，日志本身不能证明用户端已收到消息。
+
 ## 已有证据
 
 - `cargo check --locked --all-targets --offline`：通过。

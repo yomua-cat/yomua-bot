@@ -2,7 +2,11 @@
 //!
 //! 事件类型使用平台无关的 [`crate::domain::event::CoreEvent`]。
 //! 生产者（例如 OneBot 适配器）通过 [`EventBus::publish`] 发布事件；
-//! 消费者（例如消息持久化、日志、未来的人设运行时）通过 [`EventBus::subscribe`] 订阅。
+//! 消费者（例如日志、插件桥接和其他观察者）通过 [`EventBus::subscribe`] 订阅。
+//!
+//! 这是尽力而为的内存广播，不是持久化队列：没有订阅者时事件会被丢弃，
+//! 订阅者处理滞后时超出容量的旧事件也会被丢弃。需要可靠处理的业务事件
+//! 必须先写入 SQLite/Outbox，再由对应的持久化处理链路消费。
 
 use std::sync::Arc;
 
@@ -12,8 +16,8 @@ use crate::domain::event::CoreEvent;
 
 /// 默认的广播通道容量。
 ///
-/// 当没有消费者时，生产者写入的最近事件会被丢弃（broadcast 语义），
-/// 这用于防止慢消费者造成内存无限增长。
+/// 当没有消费者时，事件会被丢弃（broadcast 语义）；订阅者处理滞后时，
+/// 超出容量的旧事件也会被丢弃。这用于防止慢消费者造成内存无限增长。
 const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 
 /// 事件总线。
@@ -40,7 +44,8 @@ impl EventBus {
 
     /// 发布一个核心事件。返回已接收该事件的订阅者数量。
     ///
-    /// 订阅者数量为零时并不表示失败 —— 事件仍会被暂存（或按容量丢弃）。
+    /// 返回值为零表示当前没有订阅者，事件已经被丢弃；事件不会在总线中暂存。
+    /// 即使有订阅者，慢订阅者超出通道容量时也可能丢失旧事件。
     pub fn publish(&self, event: &CoreEvent) -> usize {
         self.sender.send(event.clone()).unwrap_or(0)
     }
@@ -76,27 +81,44 @@ pub struct EventSubscription {
 impl EventSubscription {
     /// 等待并接收下一条核心事件。
     ///
-    /// 当所有发送端都已关闭时返回 `None`。
+    /// 当所有发送端都已关闭时返回 `None`。如果订阅者滞后，广播通道会丢弃
+    /// 已无法保留的旧事件；方法会记录跳过数量并继续等待下一条仍可用的事件。
     pub async fn recv(&mut self) -> Option<CoreEvent> {
         loop {
             match self.receiver.recv().await {
                 Ok(event) => return Some(event),
                 Err(broadcast::error::RecvError::Closed) => return None,
-                // 滞后（Lagged）时跳过被丢弃的事件，继续等待。
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        target = "event_bus",
+                        skipped,
+                        "事件订阅处理滞后，已跳过无法保留的旧事件"
+                    );
+                }
             }
         }
     }
 
     /// 尝试立即接收一条事件（非阻塞）。
     ///
-    /// 返回 `None` 表示当前没有可用事件。
+    /// 返回 `None` 表示当前没有可用事件或总线已关闭。
+    ///
+    /// 如果订阅者滞后，广播通道会先返回 `Lagged`；本方法会记录跳过数量，
+    /// 然后继续读取仍保留在缓冲区中的最早事件，而不是把滞后误当成空队列。
     pub fn try_recv(&mut self) -> Option<CoreEvent> {
-        match self.receiver.try_recv() {
-            Ok(event) => Some(event),
-            Err(broadcast::error::TryRecvError::Empty) => None,
-            Err(broadcast::error::TryRecvError::Closed) => None,
-            Err(broadcast::error::TryRecvError::Lagged(_)) => None,
+        loop {
+            match self.receiver.try_recv() {
+                Ok(event) => return Some(event),
+                Err(broadcast::error::TryRecvError::Empty) => return None,
+                Err(broadcast::error::TryRecvError::Closed) => return None,
+                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        target = "event_bus",
+                        skipped,
+                        "事件订阅处理滞后，已跳过无法保留的旧事件"
+                    );
+                }
+            }
         }
     }
 }
@@ -107,11 +129,15 @@ mod tests {
     use crate::domain::event::{AdapterConnectedEvent, CoreEvent, MessageReceivedEvent};
 
     fn sample_event() -> CoreEvent {
+        sample_event_with_content("你好")
+    }
+
+    fn sample_event_with_content(content: &str) -> CoreEvent {
         CoreEvent::MessageReceived(MessageReceivedEvent {
             conversation_id: 1,
             sender_id: 2,
             message_id: 3,
-            content: "你好".to_string(),
+            content: content.to_string(),
             timestamp: chrono::Utc::now(),
             is_mentioned: false,
             character_id: 1,
@@ -145,9 +171,12 @@ mod tests {
     #[tokio::test]
     async fn publish_without_receiver_does_not_fail() {
         let bus = EventBus::new();
-        // 没有订阅者时发送不应导致错误。
+        // 没有订阅者时发送不应导致错误，也不会为之后的新订阅者暂存事件。
         let n = bus.publish(&sample_event());
         assert_eq!(n, 0);
+
+        let mut late_subscriber = bus.subscribe();
+        assert!(late_subscriber.try_recv().is_none());
     }
 
     #[tokio::test]
@@ -155,6 +184,22 @@ mod tests {
         let bus = EventBus::new();
         let mut sub = bus.subscribe();
         assert!(sub.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn try_recv_skips_lagged_events_and_returns_oldest_retained_event() {
+        let bus = EventBus::with_capacity(2);
+        let mut sub = bus.subscribe();
+
+        bus.publish(&sample_event_with_content("第一条"));
+        bus.publish(&sample_event_with_content("第二条"));
+        bus.publish(&sample_event_with_content("第三条"));
+
+        let event = sub.try_recv().expect("应返回仍保留的最早事件");
+        match event {
+            CoreEvent::MessageReceived(message) => assert_eq!(message.content, "第二条"),
+            _ => panic!("期望 MessageReceived 事件"),
+        }
     }
 
     #[tokio::test]

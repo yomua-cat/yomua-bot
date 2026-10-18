@@ -7,6 +7,7 @@
 //!
 //! 支持首次启动自动生成模板文件、配置校验与热重载。
 
+use chrono::FixedOffset;
 use serde::{Deserialize, Serialize};
 
 use crate::adapters::onebot::OneBotConfig;
@@ -39,6 +40,9 @@ pub struct RuntimeConfig {
     /// 默认角色 ID（当新会话没有既有 Binding 时，自动绑定到该角色）。
     /// 为 None 时，新会话不会自动绑定，需要管理员显式配置。
     pub default_character_id: Option<i64>,
+
+    /// 主动行为和静默时段使用的 UTC 偏移，例如 "+8" 或 "-5"。
+    pub timezone: String,
 }
 
 impl Default for RuntimeConfig {
@@ -51,12 +55,33 @@ impl Default for RuntimeConfig {
             admin_users: None,
             broadcast_capacity: None,
             default_character_id: None,
+            timezone: "+8".to_string(),
         }
     }
 }
 
+/// 解析运行时配置中的 UTC 小时偏移。
+pub fn parse_timezone_offset(value: &str) -> Result<FixedOffset, String> {
+    let value = value.trim();
+    let (sign, digits) = match value.as_bytes().first() {
+        Some(b'+') => (1_i32, &value[1..]),
+        Some(b'-') => (-1_i32, &value[1..]),
+        _ => return Err("timezone 必须使用 +? 或 -? 格式".to_string()),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err("timezone 必须使用 +? 或 -? 格式".to_string());
+    }
+    let hours = digits
+        .parse::<i32>()
+        .map_err(|_| "timezone 小时偏移无效".to_string())?;
+    if hours > 23 {
+        return Err("timezone 小时偏移必须在 -23 到 +23 之间".to_string());
+    }
+    FixedOffset::east_opt(sign * hours * 3600).ok_or_else(|| "timezone 小时偏移无效".to_string())
+}
+
 /// 单个 LLM Provider 的配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LlmProviderConfig {
     /// Provider 类型："openai-compatible" 或 TypeSafe 的 "typesafe"。
     pub provider_type: String,
@@ -136,7 +161,7 @@ pub struct LlmRoleConfig {
     pub budget_tokens: Option<u32>,
 }
 
-/// 决策任务使用的模型引用。Provider 连接参数统一来自 llm.toml。
+/// 决策任务使用的模型引用。Provider 连接参数来自 decision.toml 的 providers。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DecisionModelConfig {
     pub provider: String,
@@ -150,6 +175,9 @@ pub struct DecisionModelConfig {
 #[serde(default)]
 pub struct DecisionConfig {
     pub enabled: bool,
+    /// 决策专用 Provider 注册表，不与普通对话 Provider 混用。
+    #[serde(default)]
+    pub providers: std::collections::HashMap<String, LlmProviderConfig>,
     pub primary: Option<DecisionModelConfig>,
     pub fallbacks: Vec<DecisionModelConfig>,
     pub max_attempts: Option<usize>,
@@ -502,6 +530,43 @@ impl LlmConfig {
         if !decision.enabled {
             return Ok(());
         }
+        for (name, provider) in &decision.providers {
+            if !["openai-compatible", "openai", "ollama", "typesafe"]
+                .contains(&provider.provider_type.as_str())
+            {
+                return Err(RuntimeError::Config(format!(
+                    "decision.toml 的 Provider {name} 类型不支持：{}",
+                    provider.provider_type
+                )));
+            }
+            let url = reqwest::Url::parse(&provider.base_url).map_err(|_| {
+                RuntimeError::Config(format!("decision.toml 的 Provider {name} 地址无效"))
+            })?;
+            if !["http", "https"].contains(&url.scheme())
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+            {
+                return Err(RuntimeError::Config(format!(
+                    "decision.toml 的 Provider {name} 地址必须为无内嵌凭据的 HTTP(S) URL"
+                )));
+            }
+            if provider.timeout_secs == Some(0) {
+                return Err(RuntimeError::Config(format!(
+                    "decision.toml 的 Provider {name} 超时必须大于 0"
+                )));
+            }
+        }
+        // 决策 Provider 独立存放在 decision.toml，但运行时仍由同一个
+        // Scheduler 管理。合并前拒绝重名，避免决策配置意外覆盖普通 Provider。
+        for (name, provider) in &decision.providers {
+            if resolved.providers.contains_key(name) {
+                return Err(RuntimeError::Config(format!(
+                    "decision.toml 的 Provider 与 llm.toml 重名：{name}"
+                )));
+            }
+            resolved.providers.insert(name.clone(), provider.clone());
+        }
         let primary = decision
             .primary
             .clone()
@@ -533,9 +598,9 @@ impl LlmConfig {
                     model.provider, model.model
                 )));
             }
-            if !resolved.providers.contains_key(&model.provider) {
+            if !decision.providers.contains_key(&model.provider) {
                 return Err(RuntimeError::Config(format!(
-                    "decision.toml 引用的 Provider 未注册：{}",
+                    "decision.toml 引用的 Provider 未注册：{}（请在 decision.toml 的 [providers.*] 中配置）",
                     model.provider
                 )));
             }
@@ -600,6 +665,9 @@ admin_users = []
 
 # 默认角色 ID。当前推荐通过 import-card 或 ctl 显式绑定，避免误绑定。
 # default_character_id = 1
+
+# 主动行为和静默时段使用的 UTC 偏移，例如 "+8"（北京时间）或 "-5"。
+timezone = "+8"
 "#;
 
 /// onebot.toml 模板。
@@ -691,29 +759,37 @@ enabled = false
 /// decision.toml 模板。
 pub const DECISION_TEMPLATE: &str = r#"# yomua-bot 决策模型配置
 # 标准位置：项目/服务根目录下的 config/decision.toml
-# Provider 的 URL、密钥和名称在 llm.toml 的 [providers.*] 中统一维护。
-# 本文件只选择决策任务使用的模型，以及可选备用模型。
+# 决策 Provider、URL 和密钥全部在本文件维护，避免与普通对话 Provider 混淆。
+# 本文件只服务于 decision 路由；普通对话和认知 Provider 仍配置在 llm.toml。
 
 enabled = false
 
+# 一次决策最多尝试几个模型。只有配置备用模型时才需要大于 1。
+# max_attempts = 2
+# 主模型和备用模型共享本次请求的 token 上限。
+# budget_tokens = 1024
+
+# Jev 决策 Provider。
+# provider_type = "typesafe" 表示使用 TypeSafe System One，而不是聊天补全接口。
+# [providers.jev]
+# provider_type = "typesafe"
+# base_url = "https://api.typesafe.ai/v1/systemone"
+# api_key = "REPLACE_WITH_JEV_API_KEY"
+# timeout_secs = 60
+
 # 启用后填写主模型。
 # [primary]
-# provider = "primary"
-# model = "REPLACE_WITH_DECISION_MODEL"
+# provider = "jev"
+# model = "jev-latest"
 # context_window = 8192
 # max_output_tokens = 256
 
 # 只有网络错误、超时、429 或 5xx 才会按顺序切换备用模型。
 # [[fallbacks]]
-# provider = "backup"
+# provider = "jev_backup"
 # model = "REPLACE_WITH_DECISION_BACKUP_MODEL"
 # context_window = 8192
 # max_output_tokens = 256
-
-# 省略时尝试主模型加全部备用模型。
-# max_attempts = 2
-# 主模型和备用模型共享本次请求的 token 上限。
-# budget_tokens = 1024
 "#;
 
 /// 将模板内容写入 path（如果文件不存在）。
@@ -761,6 +837,10 @@ pub fn validate_runtime(cfg: &RuntimeConfig) -> Vec<String> {
         if cap == 0 {
             errors.push("broadcast_capacity 必须大于 0".to_string());
         }
+    }
+
+    if let Err(error) = parse_timezone_offset(&cfg.timezone) {
+        errors.push(error);
     }
 
     errors
@@ -913,6 +993,7 @@ mod tests {
         let cfg = load_runtime(path.to_str().unwrap()).unwrap();
         assert_eq!(cfg.data_dir, "data");
         assert_eq!(cfg.log_level, "info");
+        assert_eq!(cfg.timezone, "+8");
     }
 
     #[test]
@@ -950,6 +1031,37 @@ mod tests {
         .unwrap();
         let cfg = load_runtime(path.to_str().unwrap()).unwrap();
         assert_eq!(cfg.plugins_dir.as_deref(), Some("plugins"));
+    }
+
+    #[test]
+    fn timezone_offset_accepts_signed_hours_and_rejects_invalid_values() {
+        assert_eq!(
+            parse_timezone_offset("+8").unwrap().local_minus_utc(),
+            8 * 3600
+        );
+        assert_eq!(
+            parse_timezone_offset("-5").unwrap().local_minus_utc(),
+            -5 * 3600
+        );
+        assert!(parse_timezone_offset("8").is_err());
+        assert!(parse_timezone_offset("+24").is_err());
+        assert!(parse_timezone_offset("+8:30").is_err());
+    }
+
+    #[test]
+    fn timezone_change_is_hot_reloadable() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("runtime.toml"),
+            "admin_users = [\"test-admin\"]\ntimezone = \"+8\"\n",
+        )
+        .unwrap();
+        let current = ConfigurationBundle::load(dir.path()).unwrap();
+        let mut next = current.clone();
+        next.runtime.timezone = "-5".to_string();
+        assert!(!current
+            .restart_required(&next)
+            .contains(&"runtime.timezone"));
     }
 
     #[test]
@@ -1101,6 +1213,57 @@ max_output_tokens = 256
         assert_eq!(cfg.primary.as_ref().unwrap().provider, "xai");
         assert_eq!(cfg.fallbacks.len(), 1);
         assert_eq!(cfg.max_attempts, Some(2));
+    }
+
+    #[test]
+    fn decision_config_parses_own_provider_and_applies_route() {
+        let decision: DecisionConfig = toml::from_str(
+            r#"
+enabled = true
+max_attempts = 1
+budget_tokens = 256
+
+[providers.jev]
+provider_type = "typesafe"
+base_url = "https://api.typesafe.ai/v1/systemone"
+api_key = "redacted"
+timeout_secs = 60
+
+[primary]
+provider = "jev"
+model = "jev-latest"
+context_window = 8192
+max_output_tokens = 256
+"#,
+        )
+        .unwrap();
+        assert!(decision.providers.contains_key("jev"));
+
+        let llm: LlmConfig = toml::from_str(
+            r#"
+enabled = true
+
+[options]
+
+[providers.chat]
+provider_type = "openai-compatible"
+base_url = "https://chat.example.invalid/v1"
+
+[model_instances.conversation]
+provider = "chat"
+model = "chat-model"
+context_window = 8192
+max_output_tokens = 1024
+
+[roles.conversation]
+model_instance = "conversation"
+"#,
+        )
+        .unwrap();
+        let mut resolved = llm.resolve().unwrap().unwrap();
+        LlmConfig::apply_decision_config(&mut resolved, &decision).unwrap();
+        assert!(resolved.providers.contains_key("jev"));
+        assert_eq!(resolved.routes["decision"].models[0].provider, "jev");
     }
 
     #[test]

@@ -293,6 +293,12 @@ impl DefaultLlmScheduler {
             .get("llm_role")
             .and_then(|value| value.as_str())
             .unwrap_or("");
+        let conversation_id = request
+            .metadata
+            .get("conversation_id")
+            .and_then(|v| v.as_i64());
+        let message_id = request.metadata.get("message_id").and_then(|v| v.as_i64());
+        let event_uuid = request.metadata.get("event_uuid").and_then(|v| v.as_str());
         let route = self.route_requests(&request)?;
         let mut last_error = None;
         // 预算是整条备用链共享的输出 token 预算。每次发起请求前先预留
@@ -300,7 +306,8 @@ impl DefaultLlmScheduler {
         // 这样网络失败后切换备用模型也不会重新获得完整预算。
         let mut remaining_budget = route.budget_tokens;
         let attempt_limit = route.max_attempts.min(route.models.len());
-        for model in route.models.iter().take(attempt_limit) {
+        for (index, model) in route.models.iter().take(attempt_limit).enumerate() {
+            let attempt_number = index + 1;
             let provider = providers.get(&model.provider).ok_or_else(|| {
                 RuntimeError::Config(format!("Provider '{}' 未注册", model.provider))
             })?;
@@ -322,16 +329,20 @@ impl DefaultLlmScheduler {
                 attempt.max_tokens = Some(reserved);
                 remaining_budget = Some(remaining - reserved);
             }
-            tracing::debug!(target = "llm", role, provider = %model.provider, model = %model.model, "尝试 LLM 路由");
+            tracing::debug!(target = "llm", role, provider = %model.provider, model = %model.model, attempt = attempt_number, conversation_id, message_id, event_uuid, "尝试 LLM 路由");
             match provider.generate(attempt).await {
                 Ok(response) => {
+                    tracing::info!(target = "llm", role, provider = %model.provider, model = %model.model, attempt = attempt_number, conversation_id, message_id, event_uuid, state = "succeeded", "LLM 请求完成");
                     return Ok(response);
                 }
                 Err(error) if is_retryable_provider_error(&error) => {
-                    tracing::warn!(target = "llm", role, provider = %model.provider, error = %error, "Provider 可重试失败，切换备用模型");
+                    tracing::warn!(target = "llm", role, provider = %model.provider, model = %model.model, attempt = attempt_number, conversation_id, message_id, event_uuid, error = %error, state = "retryable_failure", "Provider 可重试失败，切换备用模型");
                     last_error = Some(error);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    tracing::error!(target = "llm", role, provider = %model.provider, model = %model.model, attempt = attempt_number, conversation_id, message_id, event_uuid, error = %error, state = "failed", "LLM 请求失败");
+                    return Err(error);
+                }
             }
         }
         Err(last_error.unwrap_or_else(|| RuntimeError::Llm("所有 LLM Provider 均失败".into())))

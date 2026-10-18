@@ -200,6 +200,16 @@ impl OutboxDispatcher {
         let event_uuid = event.event_uuid.clone();
         let ordering_key = event.ordering_key.clone();
         let ordering_seq = event.ordering_seq;
+        let attempts = event.attempts;
+        let payload_ids = serde_json::from_str::<serde_json::Value>(&event.payload).ok();
+        let conversation_id = payload_ids
+            .as_ref()
+            .and_then(|payload| payload.get("conversation_id"))
+            .and_then(|value| value.as_i64());
+        let message_id = payload_ids
+            .as_ref()
+            .and_then(|payload| payload.get("message_id"))
+            .and_then(|value| value.as_i64());
         // P0: 提取并保留 lease_token，用于后续的 ownership 验证
         let Some(lease_token) = event.lease_token.clone() else {
             // 仓储契约要求 claim 返回 lease_token，但这里不能因为数据库中
@@ -219,6 +229,10 @@ impl OutboxDispatcher {
             event_uuid = %event_uuid,
             ordering_key = %ordering_key,
             ordering_seq,
+            conversation_id,
+            message_id,
+            attempts,
+            lease_state = "processing",
             "已 claim 事件，准备发送"
         );
 
@@ -286,8 +300,8 @@ impl OutboxDispatcher {
                 _=renew.tick()=>{
                     match self.repo.renew_lease(&event_uuid,&lease_token,self.config.lease_duration_secs).await {
                         Ok(true)=>{},
-                        Ok(false)=>{warn!(event_uuid,"租约已失效，停止等待");break Err(())},
-                        Err(e)=>{warn!(event_uuid,error=%e,"租约续期失败");break Err(())}
+                        Ok(false)=>{warn!(target: "outbox", event_uuid, conversation_id, message_id, attempts, lease_state = "lost", "租约已失效，停止等待");break Err(())},
+                        Err(e)=>{warn!(target: "outbox", event_uuid, conversation_id, message_id, attempts, error=%e, lease_state = "renew_failed", "租约续期失败");break Err(())}
                     }
                 }
             }
@@ -307,7 +321,7 @@ impl OutboxDispatcher {
             }
             Ok(Err(_)) => {
                 // oneshot 发送方已 dropped（通常意味着 OutboxProcessor 已停止）
-                warn!(target: "outbox", event_uuid = %event_uuid, "ACK 通道已关闭");
+                warn!(target: "outbox", event_uuid = %event_uuid, conversation_id, message_id, attempts, "ACK 通道已关闭");
                 // 将事件标记为可重新 claim
                 self.reschedule_transport_failure(&event, &lease_token, "ACK channel closed")
                     .await;
@@ -319,6 +333,9 @@ impl OutboxDispatcher {
                 warn!(
                     target: "outbox",
                     event_uuid = %event_uuid,
+                    conversation_id,
+                    message_id,
+                    attempts,
                     lease_duration_secs = self.config.lease_duration_secs,
                     "ACK 超时，停止续租并等待 lease 恢复"
                 );

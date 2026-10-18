@@ -4284,6 +4284,20 @@ mod storage_tests {
             )
             .await
             .unwrap());
+
+        // 调用方传入的本地日期决定每日额度边界，不能固定使用 UTC 日期。
+        let local_next_day = reserve_now.date_naive() + chrono::Duration::days(1);
+        assert!(bs_repo
+            .try_reserve_proactive_at_date(
+                char_id,
+                conv_id,
+                reserve_now + chrono::Duration::minutes(11),
+                local_next_day,
+                chrono::Duration::minutes(10),
+                10,
+            )
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

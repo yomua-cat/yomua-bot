@@ -1411,6 +1411,12 @@ impl ReplyProcessor {
                 .generate(crate::application::cognition::ConversationGeneration {
                     character: character.clone(),
                     conversation_id: event.conversation_id,
+                    message_id: event.message_id,
+                    event_uuid: event
+                        .metadata
+                        .get("event_uuid")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
                     participant_id,
                     user_id,
                     user_message: content.to_string(),

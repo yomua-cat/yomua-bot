@@ -99,11 +99,34 @@ pub trait BehaviorStateRepository: Send + Sync {
         cooldown: chrono::Duration,
         daily_limit: u32,
     ) -> Result<bool, RepositoryError> {
+        self.try_reserve_proactive_at_date(
+            character_id,
+            conversation_id,
+            now,
+            now.date_naive(),
+            cooldown,
+            daily_limit,
+        )
+        .await
+    }
+
+    /// 原子预留一次主动发言额度，并使用调用方提供的本地日期计算每日上限。
+    ///
+    /// 日期由应用层根据运行时配置的时区计算；默认实现保留内存仓储的既有行为。
+    async fn try_reserve_proactive_at_date(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        now: chrono::DateTime<chrono::Utc>,
+        local_date: chrono::NaiveDate,
+        cooldown: chrono::Duration,
+        daily_limit: u32,
+    ) -> Result<bool, RepositoryError> {
         let mut state = self
             .find_by_character_and_conversation(character_id, conversation_id)
             .await?
             .unwrap_or_default();
-        let today = now.date_naive();
+        let today = local_date;
         if state.proactive_count_date != Some(today) {
             state.proactive_count_date = Some(today);
             state.proactive_count = 0;

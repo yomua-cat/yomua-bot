@@ -228,8 +228,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            let message = format!("OpenAI-compatible 服务返回错误 {status}: {text}");
+            let message = format!("OpenAI-compatible 服务返回错误 {status}");
             if status.is_server_error() || status.as_u16() == 429 {
                 return Err(RuntimeError::HttpError(message));
             }
@@ -288,9 +287,8 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
             return Err(RuntimeError::Llm(format!(
-                "Embeddings API 返回错误 {status}: {text}"
+                "Embeddings API 返回错误 {status}"
             )));
         }
 

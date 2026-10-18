@@ -153,6 +153,16 @@ impl MessageAcceptanceService {
             })
             .await?;
         if result.created {
+            tracing::info!(
+                target: "message",
+                event_uuid = %event_uuid,
+                conversation_id,
+                message_id = result.message_id,
+                platform_message_id = ?platform_message_id,
+                conversation_sequence = result.conversation_sequence,
+                state = "accepted",
+                "入站消息已持久化"
+            );
             self.event_bus
                 .publish(&crate::domain::event::CoreEvent::MessageAccepted(
                     MessageAcceptedEvent {

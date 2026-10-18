@@ -338,7 +338,14 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     };
 
     // 6. 装配应用层编排依赖。
-    let app = build_app_layer(&runtime_cfg, &llm_cfg, &decision_cfg, &repos, bus.clone())?;
+    let app = build_app_layer(
+        &runtime_cfg,
+        &llm_cfg,
+        &decision_cfg,
+        &repos,
+        bus.clone(),
+        settings_rx.clone(),
+    )?;
 
     // 7. 建立会话管理器、动作执行器、OneBot 适配器。
     let conversation_manager = ConversationManager::new(
@@ -414,7 +421,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
             reply_processor.clone(),
             runtime_cfg.admin_users.clone(),
         )
-        .with_live_settings(settings_rx),
+        .with_live_settings(settings_rx.clone()),
     );
 
     // 8. 启动订阅者和后台任务（在 shutdown_rx 创建后）。
@@ -469,6 +476,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         command_handler,
         &app,
         shutdown_rx.clone(),
+        settings_rx,
     );
 
     let shutdown_complete = Arc::new(Notify::new());
@@ -1103,6 +1111,7 @@ fn build_app_layer(
     decision_cfg: &DecisionConfig,
     repos: &Repos,
     bus: EventBus,
+    settings: watch::Receiver<yomua_bot::application::config::RuntimeConfig>,
 ) -> Result<AppLayer, RuntimeError> {
     let runtime = Arc::new(CharacterRuntime::with_event_bus(
         repos.character_repo.clone() as Arc<dyn CharacterRepository>,
@@ -1140,15 +1149,18 @@ fn build_app_layer(
         bus.clone(),
     ));
 
-    let behavior_engine = Arc::new(RuleBehaviorEngine::new(
-        repos.binding_repo.clone(),
-        repos.mood_repo.clone(),
-        repos.relationship_repo.clone(),
-        repos.state_repo.clone(),
-        repos.conversation_state_repo.clone(),
-        repos.behavior_state_repo.clone(),
-        yomua_bot::application::clock::system_clock(),
-    ));
+    let behavior_engine = Arc::new(
+        RuleBehaviorEngine::new(
+            repos.binding_repo.clone(),
+            repos.mood_repo.clone(),
+            repos.relationship_repo.clone(),
+            repos.state_repo.clone(),
+            repos.conversation_state_repo.clone(),
+            repos.behavior_state_repo.clone(),
+            yomua_bot::application::clock::system_clock(),
+        )
+        .with_live_settings(settings),
+    );
 
     let llm_scheduler = build_model_scheduler(llm_cfg, decision_cfg)?;
     let scheduler: Option<Arc<dyn LlmScheduler>> = llm_scheduler
@@ -1236,6 +1248,7 @@ fn spawn_background_tasks(
     command_handler: Arc<CommandHandler>,
     app: &AppLayer,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    settings: tokio::sync::watch::Receiver<yomua_bot::application::config::RuntimeConfig>,
 ) -> BackgroundTasks {
     let mut tasks = BackgroundTasks::default();
     let reply_processor_for_outbox = reply_processor.clone();
@@ -1302,7 +1315,8 @@ fn spawn_background_tasks(
         bus.clone(),
         yomua_bot::application::clock::system_clock(),
     )
-    .with_reply_scheduler(proactive_scheduler);
+    .with_reply_scheduler(proactive_scheduler)
+    .with_live_settings(settings);
     let proactive_shutdown = shutdown_rx.clone();
     tasks
         .handles

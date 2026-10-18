@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
+use chrono::FixedOffset;
+
 use crate::application::clock::Clock;
+use crate::application::config::{parse_timezone_offset, RuntimeConfig};
 use crate::domain::behavior::{BehaviorAction, BehaviorDecision, BehaviorEngine};
 use crate::domain::character::ReplyMode;
 use crate::domain::decision::{DecisionEvaluator, RuleBehaviorEngineOutput, RuleDecisionInput};
@@ -34,6 +37,7 @@ pub struct RuleBehaviorEngine {
     relationship_repo: Arc<dyn RelationshipRepository>,
     state_repo: Arc<dyn CharacterStateRepository>,
     clock: Arc<dyn Clock>,
+    live_settings: Option<tokio::sync::watch::Receiver<RuntimeConfig>>,
 }
 
 impl RuleBehaviorEngine {
@@ -55,7 +59,24 @@ impl RuleBehaviorEngine {
             conversation_state_repo,
             behavior_state_repo,
             clock,
+            live_settings: None,
         }
+    }
+
+    /// 接入运行时配置，使后续决策读取最新时区设置。
+    pub fn with_live_settings(
+        mut self,
+        settings: tokio::sync::watch::Receiver<RuntimeConfig>,
+    ) -> Self {
+        self.live_settings = Some(settings);
+        self
+    }
+
+    fn timezone_offset(&self) -> FixedOffset {
+        self.live_settings
+            .as_ref()
+            .and_then(|settings| parse_timezone_offset(&settings.borrow().timezone).ok())
+            .unwrap_or_else(|| FixedOffset::east_opt(0).expect("UTC 偏移有效"))
     }
 
     /// 构造决策输入快照（Frozen Evaluation Input）。
@@ -119,11 +140,13 @@ impl RuleBehaviorEngine {
             .await
             .map_err(repo_err)?;
 
+        let evaluated_at = self.clock.now();
+        let timezone = self.timezone_offset();
         let in_mute_window = binding
             .as_ref()
             .and_then(|value| value.mute_schedule.as_deref())
             .and_then(|schedule| parse_mute_schedule(schedule).ok().flatten())
-            .map(|window| is_within_window(&window, &time_of_day(self.clock.now())))
+            .map(|window| is_within_window(&window, &time_of_day(evaluated_at, timezone)))
             .unwrap_or(false);
 
         Ok(RuleDecisionInput {
@@ -140,7 +163,7 @@ impl RuleBehaviorEngine {
             is_mentioned,
             participant_id,
             in_mute_window,
-            evaluated_at: self.clock.now(),
+            evaluated_at,
         })
     }
 
@@ -270,7 +293,7 @@ impl RuleBehaviorEngine {
             .mute_schedule
             .as_deref()
             .and_then(|s| parse_mute_schedule(s).ok().flatten())
-            .map(|w| is_within_window(&w, &time_of_day(decided_at)))
+            .map(|w| is_within_window(&w, &time_of_day(decided_at, self.timezone_offset())))
             .unwrap_or(false);
 
         let withholds = annoyed || low_energy || stressed;
@@ -354,7 +377,7 @@ impl RuleBehaviorEngine {
             .mute_schedule
             .as_deref()
             .and_then(|s| parse_mute_schedule(s).ok().flatten())
-            .map(|w| is_within_window(&w, &time_of_day(decided_at)))
+            .map(|w| is_within_window(&w, &time_of_day(decided_at, self.timezone_offset())))
             .unwrap_or(false);
         if in_mute {
             return Ok(ignore_decision("处于静默时段，主动行为被覆盖", decided_at));
@@ -601,13 +624,13 @@ fn build_reply_reason(f: &ReplyReasonFlags) -> String {
     format!("回复：{}", parts.join("；"))
 }
 
-/// 从 UTC 时间提取一天中的时刻（本地时区语义在此阶段不引入，
-/// 静默判断基于 UTC 小时/分钟）。
-pub(crate) fn time_of_day(t: chrono::DateTime<chrono::Utc>) -> TimeOfDay {
+/// 按配置的 UTC 偏移提取一天中的时刻，用于静默时段判断。
+pub(crate) fn time_of_day(t: chrono::DateTime<chrono::Utc>, offset: FixedOffset) -> TimeOfDay {
     use chrono::Timelike;
+    let local = t.with_timezone(&offset);
     TimeOfDay {
-        hour: t.hour(),
-        minute: t.minute(),
+        hour: local.hour(),
+        minute: local.minute(),
     }
 }
 
@@ -1161,6 +1184,38 @@ mod tests {
             let r = deterministic_roll(s);
             assert!((0.0..1.0).contains(&r), "roll 应在 [0,1)，got {r}");
         }
+    }
+
+    #[test]
+    fn time_of_day_uses_configured_offset() {
+        let utc = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(16, 30, 0)
+            .unwrap()
+            .and_utc();
+        let offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let local = time_of_day(utc, offset);
+        assert_eq!((local.hour, local.minute), (0, 30));
+    }
+
+    #[test]
+    fn live_timezone_setting_is_read_for_each_decision() {
+        let (binding_repo, mood_repo, rel_repo, state_repo, conv_state_repo, behavior_state_repo) =
+            build_repos(vec![], None, None, None);
+        let (settings_tx, settings_rx) = tokio::sync::watch::channel(RuntimeConfig::default());
+        let engine = RuleBehaviorEngine::new(
+            binding_repo,
+            mood_repo,
+            rel_repo,
+            state_repo,
+            conv_state_repo,
+            behavior_state_repo,
+            Arc::new(FakeClock::new()),
+        )
+        .with_live_settings(settings_rx);
+        assert_eq!(engine.timezone_offset().local_minus_utc(), 8 * 3600);
+        settings_tx.send_modify(|settings| settings.timezone = "-5".to_string());
+        assert_eq!(engine.timezone_offset().local_minus_utc(), -5 * 3600);
     }
 
     fn clock_at(hour: u32, minute: u32) -> Arc<dyn Clock> {

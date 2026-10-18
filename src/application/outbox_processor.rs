@@ -78,11 +78,33 @@ impl OutboxProcessor {
                 item=event_rx.recv(),if work.len()<16=>{
                     let Some((event,response_tx))=item else{break};
                     work.push(async move {
+                        let payload_ids = serde_json::from_str::<serde_json::Value>(&event.payload).ok();
+                        let conversation_id = payload_ids.as_ref()
+                            .and_then(|payload| payload.get("conversation_id"))
+                            .and_then(serde_json::Value::as_i64);
+                        let message_id = payload_ids.as_ref()
+                            .and_then(|payload| payload.get("message_id"))
+                            .and_then(serde_json::Value::as_i64);
                         let outcome = process_with_deadline(
                             self.process_event(&event),
                             std::time::Duration::from_secs(DEFAULT_EVENT_PROCESSING_TIMEOUT_SECS),
                         )
                         .await;
+                        let final_state = match &outcome {
+                            ProcessingOutcome::Success => "success",
+                            ProcessingOutcome::RetryableFailure { .. } => "retryable_failure",
+                            ProcessingOutcome::PermanentFailure { .. } => "permanent_failure",
+                        };
+                        info!(
+                            target: "outbox",
+                            event_uuid = %event.event_uuid,
+                            conversation_id,
+                            message_id,
+                            attempt = event.attempts,
+                            lease_state = "processing",
+                            final_state,
+                            "Outbox 事件处理结束"
+                        );
                         if response_tx.send(outcome).is_err(){warn!(event_uuid=%event.event_uuid,"ACK 发送失败");}
                     });
                 }
@@ -163,7 +185,13 @@ impl OutboxProcessor {
         );
 
         // 转换为 MessageReceivedEvent（复用 ReplyProcessor 的处理逻辑）
-        let metadata = payload.metadata.clone();
+        let mut metadata = payload.metadata.clone();
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert(
+                "event_uuid".to_string(),
+                serde_json::Value::String(event_uuid.to_string()),
+            );
+        }
         let msg_received = crate::domain::event::MessageReceivedEvent {
             conversation_id: payload.conversation_id,
             sender_id: payload.sender_id,

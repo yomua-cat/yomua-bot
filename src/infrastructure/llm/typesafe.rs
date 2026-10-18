@@ -94,7 +94,7 @@ impl LlmProvider for TypeSafeProvider {
             .await
             .map_err(|error| RuntimeError::HttpError(format!("读取 TypeSafe 响应失败: {error}")))?;
         if !status.is_success() {
-            let message = format!("TypeSafe 服务返回错误 {status}: {raw}");
+            let message = format!("TypeSafe 服务返回错误 {status}");
             return if status.is_server_error() || status.as_u16() == 429 || status.as_u16() == 529 {
                 Err(RuntimeError::HttpError(message))
             } else {

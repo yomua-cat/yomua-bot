@@ -93,6 +93,26 @@ impl BehaviorStateRepository for SqliteBehaviorStateRepository {
         cooldown: chrono::Duration,
         daily_limit: u32,
     ) -> Result<bool, RepositoryError> {
+        self.try_reserve_proactive_at_date(
+            character_id,
+            conversation_id,
+            now,
+            now.date_naive(),
+            cooldown,
+            daily_limit,
+        )
+        .await
+    }
+
+    async fn try_reserve_proactive_at_date(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        now: chrono::DateTime<chrono::Utc>,
+        local_date: chrono::NaiveDate,
+        cooldown: chrono::Duration,
+        daily_limit: u32,
+    ) -> Result<bool, RepositoryError> {
         let mut tx = self.pool.begin().await?;
         let row: Option<(Option<String>, Option<String>, i64)> = sqlx::query_as(
             r#"SELECT last_proactive_at, proactive_count_date, proactive_count
@@ -104,7 +124,7 @@ impl BehaviorStateRepository for SqliteBehaviorStateRepository {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let today = now.date_naive();
+        let today = local_date;
         let (last, date, count) = match row {
             Some((last, date, count)) => {
                 let last = last

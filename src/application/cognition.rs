@@ -31,6 +31,8 @@ pub struct CognitionLayer {
 pub struct ConversationGeneration {
     pub character: Character,
     pub conversation_id: i64,
+    pub message_id: i64,
+    pub event_uuid: Option<String>,
     /// 本会话内的消息作者身份，用于消息归属与当前轮标注。
     pub participant_id: i64,
     /// 跨会话稳定的用户身份，用于关系和共享记忆读取。
@@ -125,6 +127,8 @@ impl CognitionLayer {
         let metadata = serde_json::json!({
             "character_id": request.character.id,
             "conversation_id": request.conversation_id,
+            "message_id": request.message_id,
+            "event_uuid": request.event_uuid,
             "participant_id": request.participant_id,
             "llm_role": "conversation",
         });

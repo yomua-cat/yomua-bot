@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::application::behavior_engine::time_of_day;
 use crate::application::clock::Clock;
+use crate::application::config::{parse_timezone_offset, RuntimeConfig};
 use crate::application::decision_orchestrator::DecisionOrchestrator;
 use crate::application::event_bus::EventBus;
 use crate::domain::behavior::BehaviorAction;
@@ -51,6 +52,7 @@ pub struct ProactiveDriver {
     cooldown: Duration,
     reply_scheduler: Option<Arc<dyn ProactiveReplyScheduler>>,
     daily_limit: u32,
+    live_settings: Option<tokio::sync::watch::Receiver<RuntimeConfig>>,
 }
 
 impl ProactiveDriver {
@@ -75,6 +77,7 @@ impl ProactiveDriver {
             cooldown: PROACTIVE_COOLDOWN,
             reply_scheduler: None,
             daily_limit: 10,
+            live_settings: None,
         }
     }
 
@@ -82,6 +85,22 @@ impl ProactiveDriver {
     pub fn with_reply_scheduler(mut self, scheduler: Arc<dyn ProactiveReplyScheduler>) -> Self {
         self.reply_scheduler = Some(scheduler);
         self
+    }
+
+    /// 接入运行时配置，使后续主动评估读取最新时区设置。
+    pub fn with_live_settings(
+        mut self,
+        settings: tokio::sync::watch::Receiver<RuntimeConfig>,
+    ) -> Self {
+        self.live_settings = Some(settings);
+        self
+    }
+
+    fn timezone_offset(&self) -> chrono::FixedOffset {
+        self.live_settings
+            .as_ref()
+            .and_then(|settings| parse_timezone_offset(&settings.borrow().timezone).ok())
+            .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("UTC 偏移有效"))
     }
 
     /// 以固定间隔循环运行（常驻后台任务）。
@@ -141,13 +160,14 @@ impl ProactiveDriver {
             return Ok(());
         }
         let now = self.clock.now();
+        let timezone = self.timezone_offset();
 
         // 静默时段跳过主动。
         let in_mute = binding
             .mute_schedule
             .as_deref()
             .and_then(|s| parse_mute_schedule(s).ok().flatten())
-            .map(|w| is_within_window(&w, &time_of_day(now)))
+            .map(|w| is_within_window(&w, &time_of_day(now, timezone)))
             .unwrap_or(false);
         if in_mute {
             return Ok(());
@@ -183,10 +203,11 @@ impl ProactiveDriver {
                 .map_err(|e| DomainError::Internal(format!("冷却时长无效: {e}")))?;
             let reserved = self
                 .behavior_state_repo
-                .try_reserve_proactive(
+                .try_reserve_proactive_at_date(
                     binding.character_id,
                     binding.conversation_id,
                     now,
+                    now.with_timezone(&timezone).date_naive(),
                     cooldown,
                     self.daily_limit,
                 )
