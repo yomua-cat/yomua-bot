@@ -57,7 +57,6 @@ use yomua_bot::application::relationship_service::RelationshipService;
 use yomua_bot::application::reply_processor::{DelayExecutor, ReplyProcessor, TokioDelayExecutor};
 use yomua_bot::application::runtime::CharacterRuntime;
 use yomua_bot::application::session_service::SessionService;
-use yomua_bot::domain::behavior::BehaviorEngine;
 use yomua_bot::domain::character::ReplyMode;
 use yomua_bot::domain::conversation::ConversationType;
 use yomua_bot::domain::decision::{
@@ -1079,7 +1078,6 @@ async fn check_binding_dirtiness(
 struct AppLayer {
     runtime: Arc<CharacterRuntime>,
     binding_manager: Arc<BindingManager>,
-    behavior_engine: Arc<RuleBehaviorEngine>,
     decision_orchestrator: DecisionOrchestrator,
     cognition: Arc<CognitionLayer>,
     relationship_service: Arc<RelationshipService>,
@@ -1211,7 +1209,6 @@ fn build_app_layer(
     Ok(AppLayer {
         runtime,
         binding_manager,
-        behavior_engine,
         decision_orchestrator,
         cognition,
         relationship_service,
@@ -1291,7 +1288,7 @@ fn spawn_background_tasks(
         repos.binding_repo.clone(),
         repos.state_repo.clone(),
         repos.behavior_state_repo.clone(),
-        app.behavior_engine.clone() as Arc<dyn BehaviorEngine>,
+        app.decision_orchestrator.clone(),
         bus.clone(),
         yomua_bot::application::clock::system_clock(),
     )

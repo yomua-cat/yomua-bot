@@ -130,6 +130,39 @@ impl DecisionOrchestrator {
         }
     }
 
+    /// 评估主动行为决策。
+    ///
+    /// 规则引擎先完成主动开关、静默、冷却和意愿判断；只有规则结果为
+    /// `InitiateProactive` 的候选才会进入这里。模型只能保留或取消本次主动行为。
+    pub async fn evaluate_proactive(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+    ) -> Result<BehaviorDecision, DomainError> {
+        let output = self
+            .evaluator
+            .evaluate_proactive(character_id, conversation_id)
+            .await?;
+        let built_in = BuiltInDecision::from_behavior(output.decision.clone());
+        let ctx = DecisionContext::from_input(&output.input, DecisionSituation::Proactive);
+
+        match self.trigger.evaluate(&ctx, &built_in) {
+            LlmAssistance::NotRequired => Ok(built_in.behavior),
+            LlmAssistance::Required { .. } => {
+                let Some(pipeline) = &self.pipeline else {
+                    return Ok(built_in.behavior);
+                };
+                match pipeline.execute(&ctx, &built_in).await {
+                    Ok(result) => Ok(self.apply_override(result, built_in, &ctx)),
+                    Err(_) => {
+                        tracing::warn!(target = "decision", "主动决策模型失败，使用规则结果");
+                        Ok(built_in.behavior)
+                    }
+                }
+            }
+        }
+    }
+
     /// 将 DecisionResult override 应用到 BuiltInDecision.behavior。
     fn apply_override(
         &self,
@@ -147,10 +180,11 @@ impl DecisionOrchestrator {
             SuggestReply => {
                 let hard_reply_blocked = match context.situation {
                     DecisionSituation::Response { is_mentioned, .. } => {
-                        !is_mentioned
-                            && (context.behavior_config.reply_mode
-                                == crate::domain::character::ReplyMode::MentionOnly
-                                || context.behavior_config.in_mute_window)
+                        !context.behavior_config.has_binding
+                            || (!is_mentioned
+                                && (context.behavior_config.reply_mode
+                                    == crate::domain::character::ReplyMode::MentionOnly
+                                    || context.behavior_config.in_mute_window))
                     }
                     DecisionSituation::Proactive => true,
                 };
@@ -171,8 +205,10 @@ impl DecisionOrchestrator {
                 }
             }
             AdjustDelay { delta_ms } => {
-                let new_delay = (behavior.delay_ms as i64 + delta_ms).max(0) as u64;
-                behavior.delay_ms = new_delay;
+                if !matches!(context.situation, DecisionSituation::Proactive) {
+                    let new_delay = (behavior.delay_ms as i64 + delta_ms).max(0) as u64;
+                    behavior.delay_ms = new_delay;
+                }
             }
         }
 
@@ -198,6 +234,7 @@ mod tests {
     use super::*;
     use crate::domain::behavior::{BehaviorAction, CognitionLevel, Priority};
     use crate::domain::character::{CharacterBinding, ReplyMode};
+    use crate::domain::decision::HeuristicTrigger;
     use crate::domain::relationship::Relationship;
     use async_trait::async_trait;
     use chrono::Utc;
@@ -471,6 +508,196 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.action, BehaviorAction::Ignore);
+    }
+
+    #[tokio::test]
+    async fn suggest_reply_cannot_bypass_missing_binding() {
+        let mut output = sample_output();
+        output.input.binding = None;
+        output.decision = BehaviorDecision {
+            action: BehaviorAction::Ignore,
+            priority: Priority::Normal,
+            cognition_level: CognitionLevel::None,
+            delay_ms: 0,
+            reason: "该会话没有为本角色配置绑定，忽略".to_string(),
+            decided_at: Utc::now(),
+        };
+        let evaluator = Arc::new(MockDecisionEvaluator { output });
+        let trigger = Arc::new(AlwaysRequiredTrigger);
+        let pipeline = Arc::new(
+            DecisionLlmPipeline::new(
+                Arc::new(FailingDecisionLlmService),
+                None,
+                DecisionResultValidator::new(2_000, 60_000),
+                Arc::new(crate::domain::decision::DefaultOverridePolicy),
+            )
+            .with_override_result(DecisionResult {
+                action: DecisionAction::SuggestReply,
+                reasoning: None,
+                confidence: None,
+            }),
+        );
+        let orchestrator = DecisionOrchestrator::new(evaluator, trigger, Some(pipeline));
+
+        let result = orchestrator
+            .evaluate_response(1, 10, "普通群消息", false, Some(1))
+            .await
+            .unwrap();
+
+        assert_eq!(result.action, BehaviorAction::Ignore);
+        assert_eq!(result.reason, "该会话没有为本角色配置绑定，忽略");
+    }
+
+    fn sample_proactive_output() -> RuleBehaviorEngineOutput {
+        let mut output = sample_output();
+        output.decision = BehaviorDecision {
+            action: BehaviorAction::InitiateProactive,
+            priority: Priority::Background,
+            cognition_level: CognitionLevel::None,
+            delay_ms: 0,
+            reason: "主动条件通过".to_string(),
+            decided_at: Utc::now(),
+        };
+        output.input.binding.as_mut().unwrap().proactive_enabled = true;
+        output
+    }
+
+    #[test]
+    fn proactive_trigger_skips_model_when_rules_reject_candidate() {
+        let mut output = sample_proactive_output();
+        output.decision.action = BehaviorAction::Ignore;
+        let context = DecisionContext::from_input(&output.input, DecisionSituation::Proactive);
+        let built_in = BuiltInDecision::from_behavior(output.decision);
+
+        assert!(matches!(
+            HeuristicTrigger.evaluate(&context, &built_in),
+            LlmAssistance::NotRequired
+        ));
+    }
+
+    #[tokio::test]
+    async fn proactive_keep_preserves_rule_initiation() {
+        let evaluator = Arc::new(MockDecisionEvaluator {
+            output: sample_proactive_output(),
+        });
+        let pipeline = Arc::new(
+            DecisionLlmPipeline::new(
+                Arc::new(FailingDecisionLlmService),
+                None,
+                DecisionResultValidator::new(2_000, 60_000),
+                Arc::new(crate::domain::decision::DefaultOverridePolicy),
+            )
+            .with_override_result(DecisionResult::keep()),
+        );
+        let orchestrator =
+            DecisionOrchestrator::new(evaluator, Arc::new(AlwaysRequiredTrigger), Some(pipeline));
+
+        let result = orchestrator.evaluate_proactive(1, 10).await.unwrap();
+
+        assert_eq!(result.action, BehaviorAction::InitiateProactive);
+    }
+
+    #[tokio::test]
+    async fn proactive_suggest_ignore_cancels_rule_initiation() {
+        let evaluator = Arc::new(MockDecisionEvaluator {
+            output: sample_proactive_output(),
+        });
+        let pipeline = Arc::new(
+            DecisionLlmPipeline::new(
+                Arc::new(FailingDecisionLlmService),
+                None,
+                DecisionResultValidator::new(2_000, 60_000),
+                Arc::new(crate::domain::decision::DefaultOverridePolicy),
+            )
+            .with_override_result(DecisionResult {
+                action: DecisionAction::SuggestIgnore,
+                reasoning: Some("本轮先不主动发言".to_string()),
+                confidence: Some(0.9),
+            }),
+        );
+        let orchestrator =
+            DecisionOrchestrator::new(evaluator, Arc::new(AlwaysRequiredTrigger), Some(pipeline));
+
+        let result = orchestrator.evaluate_proactive(1, 10).await.unwrap();
+
+        assert_eq!(result.action, BehaviorAction::Ignore);
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_minimum_delay_delta_without_panicking() {
+        struct MinimumDelayService;
+        #[async_trait]
+        impl DecisionLlmService for MinimumDelayService {
+            async fn call(
+                &self,
+                _: &DecisionContext,
+                _: &BuiltInDecision,
+            ) -> Result<DecisionResult, DecisionFailure> {
+                Ok(DecisionResult {
+                    action: DecisionAction::AdjustDelay { delta_ms: i64::MIN },
+                    reasoning: None,
+                    confidence: None,
+                })
+            }
+
+            fn name(&self) -> &str {
+                "minimum_delay"
+            }
+        }
+
+        let output = sample_output();
+        let context = DecisionContext::from_input(
+            &output.input,
+            DecisionSituation::Response {
+                message_content: "hello".into(),
+                is_mentioned: true,
+                participant_id: Some(1),
+            },
+        );
+        let built_in = BuiltInDecision::from_behavior(output.decision);
+        let pipeline = DecisionLlmPipeline::new(
+            Arc::new(MinimumDelayService),
+            None,
+            DecisionResultValidator::new(2_000, 60_000),
+            Arc::new(crate::domain::decision::DefaultOverridePolicy),
+        );
+
+        assert!(pipeline.execute(&context, &built_in).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_delay_adjustment_for_proactive() {
+        struct DelayService;
+        #[async_trait]
+        impl DecisionLlmService for DelayService {
+            async fn call(
+                &self,
+                _: &DecisionContext,
+                _: &BuiltInDecision,
+            ) -> Result<DecisionResult, DecisionFailure> {
+                Ok(DecisionResult {
+                    action: DecisionAction::AdjustDelay { delta_ms: 500 },
+                    reasoning: None,
+                    confidence: None,
+                })
+            }
+
+            fn name(&self) -> &str {
+                "delay"
+            }
+        }
+
+        let output = sample_proactive_output();
+        let context = DecisionContext::from_input(&output.input, DecisionSituation::Proactive);
+        let built_in = BuiltInDecision::from_behavior(output.decision);
+        let pipeline = DecisionLlmPipeline::new(
+            Arc::new(DelayService),
+            None,
+            DecisionResultValidator::new(2_000, 60_000),
+            Arc::new(crate::domain::decision::DefaultOverridePolicy),
+        );
+
+        assert!(pipeline.execute(&context, &built_in).await.is_err());
     }
 
     // -------------------------------------------------------------------------

@@ -161,6 +161,8 @@ impl BuiltInDecision {
 /// BehaviorBinding 中与决策直接相关的配置子集。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BehaviorConfig {
+    /// 当前会话是否已绑定该角色。
+    pub has_binding: bool,
     pub reply_mode: crate::domain::character::ReplyMode,
     pub proactive_enabled: bool,
     /// 是否处于静默时段。
@@ -269,6 +271,7 @@ impl DecisionContext {
             character_id: input.character_id,
             conversation_id: input.conversation_id,
             behavior_config: BehaviorConfig {
+                has_binding: input.binding.is_some(),
                 reply_mode,
                 proactive_enabled: input
                     .binding
@@ -378,6 +381,7 @@ impl LlmAssistanceTrigger for HeuristicTrigger {
             DecisionSituation::Response {
                 is_mentioned: true, ..
             } => LlmAssistance::NotRequired,
+            _ if !context.behavior_config.has_binding => LlmAssistance::NotRequired,
             DecisionSituation::Response { .. } => {
                 let borderline = built_in.behavior.action == BehaviorAction::Ignore
                     || context.relationship_state.is_distant
@@ -391,9 +395,14 @@ impl LlmAssistanceTrigger for HeuristicTrigger {
                     LlmAssistance::NotRequired
                 }
             }
-            DecisionSituation::Proactive => LlmAssistance::Required {
-                reason: "主动行为需要单独的决策模型判断".to_string(),
-            },
+            DecisionSituation::Proactive
+                if built_in.behavior.action == BehaviorAction::InitiateProactive =>
+            {
+                LlmAssistance::Required {
+                    reason: "规则引擎允许主动行为，需要决策模型复核".to_string(),
+                }
+            }
+            DecisionSituation::Proactive => LlmAssistance::NotRequired,
         }
     }
 }
@@ -536,15 +545,15 @@ impl DecisionResultValidator {
 
         // 1. delay_delta 范围
         if let DecisionAction::AdjustDelay { delta_ms } = &result.action {
-            if delta_ms.abs() > self.max_delay_delta {
+            if delta_ms.unsigned_abs() > self.max_delay_delta.max(0) as u64 {
                 errors.push(ValidationError {
                     field: "delta_ms".to_string(),
                     expected: format!("|delta| ≤ {}", self.max_delay_delta),
                     actual: delta_ms.to_string(),
                 });
             }
-            let final_delay = original.behavior.delay_ms as i64 + delta_ms;
-            if final_delay < 0 || final_delay as u64 > self.max_delay {
+            let final_delay = original.behavior.delay_ms as i128 + *delta_ms as i128;
+            if final_delay < 0 || final_delay > self.max_delay as i128 {
                 errors.push(ValidationError {
                     field: "final_delay".to_string(),
                     expected: format!("0 ≤ final ≤ {}", self.max_delay),
@@ -561,6 +570,15 @@ impl DecisionResultValidator {
                 field: "action".to_string(),
                 expected: "Proactive 情境不允许 SuggestReply".to_string(),
                 actual: "SuggestReply".to_string(),
+            });
+        }
+        if let (DecisionAction::AdjustDelay { .. }, DecisionSituation::Proactive) =
+            (&result.action, &context.situation)
+        {
+            errors.push(ValidationError {
+                field: "action".to_string(),
+                expected: "Proactive 情境只允许 Keep 或 SuggestIgnore".to_string(),
+                actual: "AdjustDelay".to_string(),
             });
         }
 
@@ -666,17 +684,14 @@ You analyze the current situation and provide an ADVISORY decision override to t
 - "adjust_delay": Adjust the built-in's delay by adding delta_ms (can be negative to reduce delay).
 
 ## Output Format (JSON)
-You must respond with ONLY a valid JSON object:
-{
-  "action": "keep" | "suggest_reply" | "suggest_ignore" | "adjust_delay",
-  "delay_delta_ms": null | <integer>,
-  "reasoning": "<your reasoning>"
-}
+Respond with ONLY a valid JSON object. `action` must be one of `keep`, `suggest_reply`, `suggest_ignore`, or `adjust_delay`. For `adjust_delay`, provide integer `delay_delta_ms`; for other actions it may be omitted. Example:
+{"action":"adjust_delay","delay_delta_ms":500,"reasoning":"A short pause is appropriate.","confidence":0.8}
 
 ## Decision Rules
 - "keep" should be used when the built-in decision is already optimal.
 - "suggest_reply" / "suggest_ignore" should be used sparingly and with strong justification.
-- "adjust_delay" delta_ms must be between -5000 and +5000 milliseconds.
+- "adjust_delay" delay_delta_ms must be between -5000 and +5000 milliseconds.
+- When the situation is "Proactive", only "keep" and "suggest_ignore" are allowed. Do not suggest a reply or delay change.
 - "reasoning" should briefly explain your override rationale (1-3 sentences).
 - NEVER suggest actions that would violate hard constraints (no binding, muted context, etc.).
 

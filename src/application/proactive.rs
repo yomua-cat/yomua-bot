@@ -1,7 +1,7 @@
 //! 主动行为驱动 —— 后台循环评估角色是否有主动意愿并落库。
 //!
-//! 每个 tick 枚举所有绑定上的角色，仅在满足以下全部条件时询问行为引擎
-//! `decide_proactive`：启用主动、与上次主动间隔超过冷却、不处于静默时段。
+//! 每个 tick 枚举所有绑定上的角色，仅在主动开关、冷却和静默检查通过后询问
+//! 决策编排器。规则判定有主动意愿后，决策模型可保留或取消；通过后才预留额度并入队。
 //! 通过统一回复任务发送消息；状态只记录冷却和每日额度，内容仍由回复链生成。
 
 use std::sync::Arc;
@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use crate::application::behavior_engine::time_of_day;
 use crate::application::clock::Clock;
+use crate::application::decision_orchestrator::DecisionOrchestrator;
 use crate::application::event_bus::EventBus;
-use crate::domain::behavior::{BehaviorAction, BehaviorEngine};
+use crate::domain::behavior::BehaviorAction;
 use crate::domain::character::CharacterBinding;
 use crate::domain::event::{BehaviorDecidedEvent, CoreEvent};
 use crate::domain::mute::{is_within_window, parse_mute_schedule};
@@ -43,7 +44,7 @@ pub struct ProactiveDriver {
     binding_repo: Arc<dyn CharacterBindingRepository>,
     state_repo: Arc<dyn CharacterStateRepository>,
     behavior_state_repo: Arc<dyn BehaviorStateRepository>,
-    behavior_engine: Arc<dyn BehaviorEngine>,
+    decision_orchestrator: DecisionOrchestrator,
     event_bus: EventBus,
     clock: Arc<dyn Clock>,
     tick_interval: Duration,
@@ -59,7 +60,7 @@ impl ProactiveDriver {
         binding_repo: Arc<dyn CharacterBindingRepository>,
         state_repo: Arc<dyn CharacterStateRepository>,
         behavior_state_repo: Arc<dyn BehaviorStateRepository>,
-        behavior_engine: Arc<dyn BehaviorEngine>,
+        decision_orchestrator: DecisionOrchestrator,
         event_bus: EventBus,
         clock: Arc<dyn Clock>,
     ) -> Self {
@@ -67,7 +68,7 @@ impl ProactiveDriver {
             binding_repo,
             state_repo,
             behavior_state_repo,
-            behavior_engine,
+            decision_orchestrator,
             event_bus,
             clock,
             tick_interval: PROACTIVE_TICK_INTERVAL,
@@ -170,8 +171,8 @@ impl ProactiveDriver {
 
         // 行为引擎决策。
         let decision = self
-            .behavior_engine
-            .decide_proactive(binding.character_id, binding.conversation_id)
+            .decision_orchestrator
+            .evaluate_proactive(binding.character_id, binding.conversation_id)
             .await?;
 
         if decision.action != BehaviorAction::InitiateProactive {
@@ -243,7 +244,15 @@ impl ProactiveDriver {
 mod tests {
     use super::*;
     use crate::application::behavior_engine::RuleBehaviorEngine;
+    use crate::application::decision_orchestrator::{
+        DecisionEvaluator, DecisionLlmPipeline, DecisionLlmService, LlmAssistance,
+        LlmAssistanceTrigger, NoOpTrigger,
+    };
     use crate::domain::character::{BehaviorState, CharacterBinding, ConversationState, ReplyMode};
+    use crate::domain::decision::{
+        BuiltInDecision, DecisionAction, DecisionContext, DecisionFailure, DecisionResult,
+        DecisionResultValidator,
+    };
     use crate::domain::emotion::Mood;
     use crate::domain::relationship::Relationship;
     use crate::domain::repository::{
@@ -254,6 +263,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     /// 可推进的假时钟。
@@ -283,6 +293,48 @@ mod tests {
     impl Clock for FakeClock {
         fn now(&self) -> DateTime<Utc> {
             *self.time.lock().unwrap()
+        }
+    }
+
+    struct AlwaysRequiredTrigger;
+    impl LlmAssistanceTrigger for AlwaysRequiredTrigger {
+        fn evaluate(&self, _: &DecisionContext, _: &BuiltInDecision) -> LlmAssistance {
+            LlmAssistance::Required {
+                reason: "test".to_string(),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingReplyScheduler(AtomicUsize);
+
+    #[async_trait]
+    impl ProactiveReplyScheduler for CountingReplyScheduler {
+        async fn enqueue_proactive(
+            &self,
+            _: i64,
+            _: i64,
+            _: &str,
+        ) -> Result<(), crate::error::RuntimeError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct StubDecisionLlmService;
+
+    #[async_trait]
+    impl DecisionLlmService for StubDecisionLlmService {
+        async fn call(
+            &self,
+            _: &DecisionContext,
+            _: &BuiltInDecision,
+        ) -> Result<DecisionResult, DecisionFailure> {
+            Err(DecisionFailure::Transport("test".to_string()))
+        }
+
+        fn name(&self) -> &str {
+            "stub"
         }
     }
 
@@ -552,7 +604,9 @@ mod tests {
 
     struct Harness {
         driver: ProactiveDriver,
+        behavior_engine: Arc<RuleBehaviorEngine>,
         state_repo: Arc<MemStateRepo>,
+        conversation_state_repo: Arc<MemConversationStateRepo>,
         behavior_state_repo: Arc<MemBehaviorStateRepo>,
         binding_repo: Arc<MemBindingRepo>,
         clock: FakeClock,
@@ -589,22 +643,27 @@ mod tests {
             mood_repo,
             rel_repo,
             state_repo.clone(),
-            conversation_state_repo,
+            conversation_state_repo.clone(),
             behavior_state_repo.clone(),
             Arc::new(clock.clone()),
         ));
+        let evaluator: Arc<dyn DecisionEvaluator> = behavior_engine.clone();
+        let decision_orchestrator =
+            DecisionOrchestrator::new(evaluator, Arc::new(NoOpTrigger), None);
 
         let driver = ProactiveDriver::new(
             binding_repo.clone(),
             state_repo.clone(),
             behavior_state_repo.clone(),
-            behavior_engine,
+            decision_orchestrator,
             EventBus::new(),
             Arc::new(clock.clone()),
         );
         Harness {
             driver,
+            behavior_engine,
             state_repo,
+            conversation_state_repo,
             behavior_state_repo,
             binding_repo,
             clock,
@@ -663,5 +722,71 @@ mod tests {
             h.behavior_state_repo.states.lock().unwrap().is_empty(),
             "静默时段应跳过主动，不落库行为状态"
         );
+    }
+
+    fn replace_decision_result(harness: &mut Harness, result: DecisionResult) {
+        let pipeline = Arc::new(
+            DecisionLlmPipeline::new(
+                Arc::new(StubDecisionLlmService),
+                None,
+                DecisionResultValidator::new(2_000, 60_000),
+                Arc::new(crate::domain::decision::DefaultOverridePolicy),
+            )
+            .with_override_result(result),
+        );
+        let evaluator: Arc<dyn DecisionEvaluator> = harness.behavior_engine.clone();
+        harness.driver.decision_orchestrator =
+            DecisionOrchestrator::new(evaluator, Arc::new(AlwaysRequiredTrigger), Some(pipeline));
+    }
+
+    #[tokio::test]
+    async fn model_veto_prevents_proactive_quota_and_enqueue() {
+        let mut h = harness(true, None, true);
+        h.state_repo
+            .states
+            .lock()
+            .unwrap()
+            .insert(2, crate::domain::character::CharacterState::default());
+        h.conversation_state_repo.states.lock().unwrap().insert(
+            (2, 20),
+            crate::domain::character::ConversationState::default(),
+        );
+        let scheduler = Arc::new(CountingReplyScheduler::default());
+        h.driver = h.driver.with_reply_scheduler(scheduler.clone());
+        replace_decision_result(
+            &mut h,
+            DecisionResult {
+                action: DecisionAction::SuggestIgnore,
+                reasoning: Some("本轮先不主动发言".to_string()),
+                confidence: Some(0.9),
+            },
+        );
+
+        h.driver.tick().await;
+
+        assert_eq!(scheduler.0.load(Ordering::SeqCst), 0);
+        assert!(h.behavior_state_repo.states.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_keep_reserves_proactive_quota_and_enqueues() {
+        let mut h = harness(true, None, true);
+        h.state_repo
+            .states
+            .lock()
+            .unwrap()
+            .insert(2, crate::domain::character::CharacterState::default());
+        h.conversation_state_repo.states.lock().unwrap().insert(
+            (2, 20),
+            crate::domain::character::ConversationState::default(),
+        );
+        let scheduler = Arc::new(CountingReplyScheduler::default());
+        h.driver = h.driver.with_reply_scheduler(scheduler.clone());
+        replace_decision_result(&mut h, DecisionResult::keep());
+
+        h.driver.tick().await;
+
+        assert_eq!(scheduler.0.load(Ordering::SeqCst), 1);
+        assert_eq!(h.behavior_state_repo.states.lock().unwrap().len(), 1);
     }
 }
