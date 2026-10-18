@@ -66,6 +66,7 @@ use crate::domain::repository::ParticipantRepository;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CommandDesc {
     pub name: &'static str,
+    pub aliases: &'static [&'static str],
     pub usage: &'static str,
     pub group: &'static str,
     pub description: &'static str,
@@ -123,6 +124,7 @@ impl CommandRegistry {
                 handler,
                 CommandDesc {
                     name: spec.name,
+                    aliases: control_schema::aliases(spec.name),
                     usage: spec.usage,
                     group: spec.group,
                     description: spec.description,

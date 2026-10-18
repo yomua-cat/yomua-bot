@@ -717,22 +717,35 @@ impl OutputFormatter {
         // 命令列表（帮助信息）
         if let Some(arr) = obj.get("commands").and_then(|v| v.as_array()) {
             println!("可用命令：");
-            let mut cmd_items: Vec<(&str, &str, &str, bool)> = Vec::new();
+            let mut cmd_items: Vec<(&str, &str, &str, bool, String)> = Vec::new();
             for cmd in arr {
                 if let Some(o) = cmd.as_object() {
                     let name = o.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                     let usage = o.get("usage").and_then(|v| v.as_str()).unwrap_or(name);
                     let desc = o.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                    let aliases = o
+                        .get("aliases")
+                        .and_then(|v| v.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .filter(|value| !value.is_empty())
+                        .map(|value| format!("；别名：{value}"))
+                        .unwrap_or_default();
                     let confirm = o
                         .get("requires_confirmation")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    cmd_items.push((usage, name, desc, confirm));
+                    cmd_items.push((usage, name, desc, confirm, aliases));
                 }
             }
-            for (usage, _name, desc, confirm) in cmd_items {
+            for (usage, _name, desc, confirm, aliases) in cmd_items {
                 let suffix = if confirm { " [需要 --confirm]" } else { "" };
-                println!("  {:76} — {}{}", usage, desc, suffix);
+                println!("  {:76} — {}{}{}", usage, desc, suffix, aliases);
             }
             return;
         }

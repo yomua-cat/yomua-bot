@@ -61,6 +61,7 @@
 - LLM 备用链：运行 `capabilities_for_uses_smallest_model_in_fallback_chain` 与 `capabilities_for_ignores_fallbacks_beyond_attempt_limit`，确认上下文能力只覆盖本次可能尝试的模型。
 - 记忆与关系：`src/application/memory_service.rs`、`src/application/cognition_driver.rs`、`src/infrastructure/storage/repository/memory_repository.rs`、`relationship_repository.rs`。核对候选/正式记忆、会话可见范围、稳定用户身份和幂等交互。
 - 控制协议与 ctl：`src/application/control_schema.rs`、`src/application/control.rs`、`src/bin/yomua-bot-ctl.rs`。核对一段、二段、三段命令，帮助文本，中文错误，危险命令确认和 unknown 查询/重试。
+- 控制帮助别名：运行 `test_help_lists_all_builtin_commands`，确认服务端 `help` 响应包含 `status` 的 `s` 和 `character list` 的 `c list` / `char list`，且与 ctl 本地帮助一致。
 - 插件：`src/infrastructure/plugin/manifest.rs`、`registry.rs`、`transport.rs`、`supervisor.rs`。核对握手归属、订阅权限、失败隔离、任务退出和核心状态写保护。
 - 生命周期与配置：`src/main.rs`、`src/application/config.rs`、`src/application/runtime.rs`。核对初始化、迁移、热重载、关停超时和 socket 清理。
 - 向量配置：在隔离配置中为 `[providers.<name>]` 设置 `embedding_model`，确认配置解析保留模型名；未设置时确认认知任务仍能保存普通记忆而不调用向量接口。

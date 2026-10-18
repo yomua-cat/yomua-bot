@@ -572,6 +572,19 @@ async fn test_help_lists_all_builtin_commands() {
             "help 应包含 {expected}，实际：{names:?}"
         );
     }
+    let status = commands
+        .iter()
+        .find(|command| command["name"] == "status")
+        .expect("help 应包含 status 描述");
+    assert_eq!(status["aliases"], serde_json::json!(["s"]));
+    let character_list = commands
+        .iter()
+        .find(|command| command["name"] == "character list")
+        .expect("help 应包含 character list 描述");
+    assert_eq!(
+        character_list["aliases"],
+        serde_json::json!(["c list", "char list"])
+    );
 }
 
 #[tokio::test]
