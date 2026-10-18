@@ -51,6 +51,8 @@ cp target/debug/examples/echo_plugin /absolute/path/to/plugins/echo/echo_plugin
 
 RPC 请求使用 `payload.request_id`、`method`、`params`，响应使用相同 `request_id`、`ok`、`result`、`error`。`error` 是 `{code, message}`，插件按 `code` 判断，`message` 仅供日志和用户显示。事件使用 `kind = "event"` 与 `event`、`data`；收到 `shutdown` 事件后插件应自行退出。
 
+错误码为稳定 ASCII 标识：`PERMISSION_DENIED`、`UNKNOWN_METHOD`、`INVALID_ARGUMENT`、`NOT_FOUND`、`FORBIDDEN`、`PROTOCOL_ERROR` 和 `INTERNAL_ERROR`。错误码由 API 错误类型产生，不从中文 message 推断；未单独分类的宿主执行错误归为 `INTERNAL_ERROR`。
+
 事件 DTO 由[事件桥接](../src/infrastructure/plugin/event_bridge.rs)显式投影，插件不会收到 `CoreEvent` 枚举或数据库对象。消息广播不是持久订阅或可靠队列，不保证断线补发，也不能仅凭收到 `message.received` 推断回复处理已完成。
 
 ## API 与权限
@@ -72,6 +74,8 @@ RPC 请求使用 `payload.request_id`、`method`、`params`，响应使用相同
 | `scheduler.create` | 当前拒绝，即使声明权限 |
 
 例如 `permissions = ["message.read", "character.read"]`。权限名必须使用清单支持的 dotted 名称。读取接口必须带明确范围：`message.read` 使用 `conversation_id`，`character.read` 使用 `character_id`，`binding.read` 使用 `conversation_id`，`relationship.read` 使用 `character_id` 和全域 `user_id`。插件不能通过省略范围参数读取全局数据。参数、返回值和作用域应按[PluginApi](../src/application/plugin_api.rs)核对，授权规则见[权限模块](../src/infrastructure/plugin/permissions.rs)。
+
+读取 API 返回显式版本 1 DTO，而非 Domain 序列化：`character.read` 仅返回 `id/name/description/enabled/created_at/updated_at`；消息内容和附件使用带 `kind` 的稳定对象，附件不暴露本机路径；绑定仅包含基本路由和生命周期字段，不包含宿主策略 JSON；关系字段显式列出。`memory.read` 的默认结果是脱敏摘要，`raw: true` 会返回显式字段白名单中的记忆内容与用户提供 metadata，不包含 embedding 或仓储内部字段。新增 DTO 字段只会在明确扩展协议时加入。
 
 当前角色状态 API 面向全局精力、压力和活动；不能据此假定具备全部会话状态管理。插件 LLM 请求仍受 LLM 开关与 `conversation` 路由约束。`memory.read` 必须提供当前 `conversation_id`，核心先按会话可见范围排除候选和其他会话记忆；默认返回脱敏摘要，只有显式 `raw: true` 才返回原文。
 

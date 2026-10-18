@@ -303,7 +303,7 @@ async fn handle_conn(
             Ok(Some(WireMessage::Request { id, method, params })) => {
                 let result = tokio::time::timeout(
                     Duration::from_secs(120),
-                    api.dispatch(&expected_name, &method, params),
+                    api.dispatch_typed(&expected_name, &method, params),
                 )
                 .await;
                 let response = match result {
@@ -317,13 +317,16 @@ async fn handle_conn(
                         id,
                         ok: false,
                         result: None,
-                        error: Some(error),
+                        error: Some(error.wire_message()),
                     },
                     Err(_) => WireMessage::Response {
                         id,
                         ok: false,
                         result: None,
-                        error: Some("插件请求处理超时".to_string()),
+                        error: Some(crate::infrastructure::plugin::protocol::mark_error(
+                            "INTERNAL_ERROR",
+                            "插件请求处理超时",
+                        )),
                     },
                 };
                 if !matches!(

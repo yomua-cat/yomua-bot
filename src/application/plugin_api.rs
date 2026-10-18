@@ -10,14 +10,57 @@ use crate::adapters::onebot::ActionResponse;
 use crate::application::action::ActionDispatcher;
 use crate::application::cognition::CognitionLayer;
 use crate::domain::behavior::Action;
+use crate::domain::character::{Character, CharacterBinding, CharacterState, ReplyMode};
 use crate::domain::memory::{Memory, MemoryType};
+use crate::domain::message::{Attachment, Message, MessageContent, MixedContentSegment};
+use crate::domain::relationship::Relationship;
 use crate::domain::repository::{
     CharacterBindingRepository, CharacterRepository, CharacterStateRepository, MemoryRepository,
     MessageRepository, PluginDataRepository, RelationshipRepository,
 };
 use crate::infrastructure::llm::{LlmMessage, LlmRole};
 use crate::infrastructure::plugin::permissions::check_permission;
+use crate::infrastructure::plugin::permissions::permission_for_method;
+use crate::infrastructure::plugin::protocol::mark_error;
 use crate::infrastructure::plugin::registry::PluginRegistry;
+
+const ERROR_PREFIX: &str = "\u{1}plugin-error:";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PluginApiError {
+    code: &'static str,
+    message: String,
+}
+
+impl PluginApiError {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self::new("INTERNAL_ERROR", message)
+    }
+    pub(crate) fn wire_message(&self) -> String {
+        mark_error(self.code, &self.message)
+    }
+    fn from_wire_message(value: &str) -> Option<Self> {
+        let rest = value.strip_prefix(ERROR_PREFIX)?;
+        let (code, message) = rest.split_once(':')?;
+        let code = match code {
+            "PERMISSION_DENIED" => "PERMISSION_DENIED",
+            "UNKNOWN_METHOD" => "UNKNOWN_METHOD",
+            "INVALID_ARGUMENT" => "INVALID_ARGUMENT",
+            "NOT_FOUND" => "NOT_FOUND",
+            "PROTOCOL_ERROR" => "PROTOCOL_ERROR",
+            "INTERNAL_ERROR" => "INTERNAL_ERROR",
+            "FORBIDDEN" => "FORBIDDEN",
+            _ => return None,
+        };
+        Some(Self::new(code, message))
+    }
+}
 
 /// Plugin API 分发器。
 pub struct PluginApi {
@@ -84,44 +127,100 @@ impl PluginApi {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        self.dispatch_typed(plugin_name, method, params)
+            .await
+            .map_err(|error| error.message)
+    }
+
+    /// 分发并保留机器可判断的稳定错误码，供 IPC transport 使用。
+    pub(crate) async fn dispatch_typed(
+        &self,
+        plugin_name: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, PluginApiError> {
         // 1. 插件必须已注册（注册表提供其被授予的权限）。
         let granted = self
             .registry
             .permissions_for(plugin_name)
-            .ok_or_else(|| "插件未注册".to_string())?;
+            .ok_or_else(|| PluginApiError::new("NOT_FOUND", "插件未注册"))?;
 
         // 2. `plugin_data.*` 免权限（数据自作用域），其余方法走权限判定。
         if !method.starts_with("plugin_data.") {
-            check_permission(method, &granted)?;
+            if let Err(message) = check_permission(method, &granted) {
+                let code = if permission_for_method(method).is_some() {
+                    if method == "scheduler.create" {
+                        "FORBIDDEN"
+                    } else {
+                        "PERMISSION_DENIED"
+                    }
+                } else {
+                    "UNKNOWN_METHOD"
+                };
+                return Err(PluginApiError::new(code, message));
+            }
         }
 
         if matches!(
             method,
             "message.send" | "character.state.write" | "memory.write" | "relationship.write"
         ) {
-            return Err(format!("插件方法 {method} 当前禁止直接修改核心运行状态"));
+            return Err(PluginApiError::new(
+                "FORBIDDEN",
+                format!("插件方法 {method} 当前禁止直接修改核心运行状态"),
+            ));
         }
 
         // 3. 方法分发。
         match method {
-            "message.send" => self.api_message_send(params).await,
-            "message.read" => self.api_message_read(params).await,
-            "character.read" => self.api_character_read(params).await,
-            "character.state.read" => self.api_character_state_read(params).await,
-            "character.state.write" => self.api_character_state_write(params).await,
-            "binding.read" => self.api_binding_read(params).await,
-            "memory.read" => self.api_memory_read(params).await,
-            "memory.write" => self.api_memory_write(params).await,
-            "relationship.read" => self.api_relationship_read(params).await,
-            "relationship.write" => self.api_relationship_write(params).await,
-            "plugin_data.get" => self.api_plugin_data_get(plugin_name, params).await,
-            "plugin_data.set" => self.api_plugin_data_set(plugin_name, params).await,
-            "plugin_data.delete" => self.api_plugin_data_delete(plugin_name, params).await,
-            "plugin_data.list" => self.api_plugin_data_list(plugin_name, params).await,
-            "llm.call" => self.api_llm_call(params).await,
+            "message.send" => self.api_message_send(params).await.map_err(handler_error),
+            "message.read" => self.api_message_read(params).await.map_err(handler_error),
+            "character.read" => self.api_character_read(params).await.map_err(handler_error),
+            "character.state.read" => self
+                .api_character_state_read(params)
+                .await
+                .map_err(handler_error),
+            "character.state.write" => self
+                .api_character_state_write(params)
+                .await
+                .map_err(handler_error),
+            "binding.read" => self.api_binding_read(params).await.map_err(handler_error),
+            "memory.read" => self.api_memory_read(params).await.map_err(handler_error),
+            "memory.write" => self.api_memory_write(params).await.map_err(handler_error),
+            "relationship.read" => self
+                .api_relationship_read(params)
+                .await
+                .map_err(handler_error),
+            "relationship.write" => self
+                .api_relationship_write(params)
+                .await
+                .map_err(handler_error),
+            "plugin_data.get" => self
+                .api_plugin_data_get(plugin_name, params)
+                .await
+                .map_err(handler_error),
+            "plugin_data.set" => self
+                .api_plugin_data_set(plugin_name, params)
+                .await
+                .map_err(handler_error),
+            "plugin_data.delete" => self
+                .api_plugin_data_delete(plugin_name, params)
+                .await
+                .map_err(handler_error),
+            "plugin_data.list" => self
+                .api_plugin_data_list(plugin_name, params)
+                .await
+                .map_err(handler_error),
+            "llm.call" => self.api_llm_call(params).await.map_err(handler_error),
             // 权限层已拦；此处兜底，防止绕过权限判定直入分发。
-            "scheduler.create" => Err("scheduler.create 本期不开放".to_string()),
-            other => Err(format!("未知方法：{other}")),
+            "scheduler.create" => Err(PluginApiError::new(
+                "FORBIDDEN",
+                "scheduler.create 本期不开放",
+            )),
+            other => Err(PluginApiError::new(
+                "UNKNOWN_METHOD",
+                format!("未知方法：{other}"),
+            )),
         }
     }
 
@@ -160,7 +259,9 @@ impl PluginApi {
             .find_recent(conversation_id, limit)
             .await
             .map_err(|e| e.to_string())?;
-        to_json(&messages)
+        Ok(serde_json::Value::Array(
+            messages.iter().map(message_dto).collect(),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -178,7 +279,7 @@ impl PluginApi {
             .await
             .map_err(|e| e.to_string())?;
         match character {
-            Some(c) => to_json(&c),
+            Some(c) => Ok(character_dto(&c)),
             None => Ok(serde_json::Value::Null),
         }
     }
@@ -198,7 +299,7 @@ impl PluginApi {
             .await
             .map_err(|e| e.to_string())?;
         match state {
-            Some(s) => to_json(&s),
+            Some(s) => Ok(character_state_dto(&s)),
             None => Ok(serde_json::Value::Null),
         }
     }
@@ -215,13 +316,15 @@ impl PluginApi {
             .await
             .map_err(|e| e.to_string())?;
         if character.is_none() {
-            return Err("角色不存在".to_string());
+            return Err(marked_error("NOT_FOUND", "角色不存在"));
         }
 
         let patch = params
             .get("state")
             .and_then(|v| v.as_object())
-            .ok_or_else(|| "缺少参数：state（或 state 必须是对象）".to_string())?;
+            .ok_or_else(|| {
+                marked_error("INVALID_ARGUMENT", "缺少参数：state（或 state 必须是对象）")
+            })?;
 
         for (key, value) in patch {
             let valid = match key.as_str() {
@@ -230,16 +333,19 @@ impl PluginApi {
                 _ => false,
             };
             if !valid {
-                return Err(format!("非法状态字段或类型：{key}"));
+                return Err(marked_error(
+                    "INVALID_ARGUMENT",
+                    format!("非法状态字段或类型：{key}"),
+                ));
             }
         }
         if let Some(runtime) = &self.runtime {
-            return to_json(
+            return Ok(character_state_dto(
                 &runtime
                     .apply_state_patch(character_id, &serde_json::Value::Object(patch.clone()))
                     .await
                     .map_err(|error| error.to_string())?,
-            );
+            ));
         }
         // 读现有状态；无则用默认状态，再逐字段覆盖。
         let mut state = self
@@ -252,17 +358,19 @@ impl PluginApi {
         if let Some(v) = patch.get("energy") {
             state.energy = v
                 .as_f64()
-                .ok_or_else(|| "参数 energy 必须是数字".to_string())?;
+                .ok_or_else(|| marked_error("INVALID_ARGUMENT", "参数 energy 必须是数字"))?;
         }
         if let Some(v) = patch.get("stress") {
             state.stress = v
                 .as_f64()
-                .ok_or_else(|| "参数 stress 必须是数字".to_string())?;
+                .ok_or_else(|| marked_error("INVALID_ARGUMENT", "参数 stress 必须是数字"))?;
         }
         if let Some(v) = patch.get("current_activity") {
             state.current_activity = Some(
                 v.as_str()
-                    .ok_or_else(|| "参数 current_activity 必须是字符串".to_string())?
+                    .ok_or_else(|| {
+                        marked_error("INVALID_ARGUMENT", "参数 current_activity 必须是字符串")
+                    })?
                     .to_string(),
             );
         }
@@ -274,7 +382,7 @@ impl PluginApi {
             .upsert(character_id, &state)
             .await
             .map_err(|e| e.to_string())?;
-        to_json(&state)
+        Ok(character_state_dto(&state))
     }
 
     // -----------------------------------------------------------------------
@@ -291,7 +399,9 @@ impl PluginApi {
             .find_by_conversation_id(conversation_id)
             .await
             .map_err(|e| e.to_string())?;
-        to_json(&bindings)
+        Ok(serde_json::Value::Array(
+            bindings.iter().map(binding_dto).collect(),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -316,9 +426,9 @@ impl PluginApi {
         let memory_type = match params.get("memory_type") {
             None | Some(serde_json::Value::Null) => None,
             Some(v) => {
-                let s = v
-                    .as_str()
-                    .ok_or_else(|| "参数 memory_type 必须是字符串".to_string())?;
+                let s = v.as_str().ok_or_else(|| {
+                    marked_error("INVALID_ARGUMENT", "参数 memory_type 必须是字符串")
+                })?;
                 Some(parse_memory_type(s)?)
             }
         };
@@ -327,14 +437,16 @@ impl PluginApi {
         let keywords = match params.get("keywords") {
             None | Some(serde_json::Value::Null) => None,
             Some(v) => {
-                let arr = v
-                    .as_array()
-                    .ok_or_else(|| "参数 keywords 必须是字符串数组".to_string())?;
+                let arr = v.as_array().ok_or_else(|| {
+                    marked_error("INVALID_ARGUMENT", "参数 keywords 必须是字符串数组")
+                })?;
                 let mut kws = Vec::with_capacity(arr.len());
                 for item in arr {
                     kws.push(
                         item.as_str()
-                            .ok_or_else(|| "参数 keywords 的元素必须是字符串".to_string())?
+                            .ok_or_else(|| {
+                                marked_error("INVALID_ARGUMENT", "参数 keywords 的元素必须是字符串")
+                            })?
                             .to_string(),
                     );
                 }
@@ -365,7 +477,9 @@ impl PluginApi {
         }
         memories.truncate(limit as usize);
         if raw {
-            return to_json(&memories);
+            return Ok(serde_json::Value::Array(
+                memories.iter().map(memory_raw_dto).collect(),
+            ));
         }
         let redacted = memories
             .into_iter()
@@ -380,7 +494,7 @@ impl PluginApi {
                     "id": memory.id,
                     "character_id": memory.character_id,
                     "conversation_id": memory.conversation_id,
-                    "memory_type": memory.memory_type,
+                    "memory_type": memory_type_name(memory.memory_type),
                     "importance": memory.importance,
                     "metadata": memory.metadata,
                     "content_available": false,
@@ -400,9 +514,9 @@ impl PluginApi {
         let memory_type = match params.get("memory_type") {
             None | Some(serde_json::Value::Null) => MemoryType::Episodic,
             Some(v) => {
-                let s = v
-                    .as_str()
-                    .ok_or_else(|| "参数 memory_type 必须是字符串".to_string())?;
+                let s = v.as_str().ok_or_else(|| {
+                    marked_error("INVALID_ARGUMENT", "参数 memory_type 必须是字符串")
+                })?;
                 parse_memory_type(s)?
             }
         };
@@ -442,7 +556,7 @@ impl PluginApi {
             .await
             .map_err(|e| e.to_string())?;
         match relationship {
-            Some(r) => to_json(&r),
+            Some(r) => Ok(relationship_dto(&r)),
             None => Ok(serde_json::Value::Null),
         }
     }
@@ -490,7 +604,7 @@ impl PluginApi {
             .upsert(&relationship)
             .await
             .map_err(|e| e.to_string())?;
-        to_json(&relationship)
+        Ok(relationship_dto(&relationship))
     }
 
     // -----------------------------------------------------------------------
@@ -519,7 +633,7 @@ impl PluginApi {
         let key = require_str(&params, "key")?;
         let value = params
             .get("value")
-            .ok_or_else(|| "缺少参数：value".to_string())?
+            .ok_or_else(|| marked_error("INVALID_ARGUMENT", "缺少参数：value"))?
             .clone();
         self.plugin_data_repo
             .set(plugin_name, &key, &value)
@@ -559,7 +673,9 @@ impl PluginApi {
             .list_keys(plugin_name)
             .await
             .map_err(|e| e.to_string())?;
-        to_json(&keys)
+        Ok(serde_json::Value::Array(
+            keys.into_iter().map(serde_json::Value::String).collect(),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -571,12 +687,12 @@ impl PluginApi {
 
         let messages_value = params
             .get("messages")
-            .ok_or_else(|| "缺少参数：messages".to_string())?;
+            .ok_or_else(|| marked_error("INVALID_ARGUMENT", "缺少参数：messages"))?;
         let messages_array = messages_value
             .as_array()
-            .ok_or_else(|| "参数 messages 必须是数组".to_string())?;
+            .ok_or_else(|| marked_error("INVALID_ARGUMENT", "参数 messages 必须是数组"))?;
         if messages_array.is_empty() {
-            return Err("messages 不能为空".to_string());
+            return Err(marked_error("INVALID_ARGUMENT", "messages 不能为空"));
         }
 
         let mut messages = Vec::with_capacity(messages_array.len());
@@ -584,12 +700,12 @@ impl PluginApi {
             let role = parse_llm_role(
                 item.get("role")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| "消息缺少 role 字段".to_string())?,
+                    .ok_or_else(|| marked_error("INVALID_ARGUMENT", "消息缺少 role 字段"))?,
             )?;
             let content = item
                 .get("content")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| "消息缺少 content 字段".to_string())?
+                .ok_or_else(|| marked_error("INVALID_ARGUMENT", "消息缺少 content 字段"))?
                 .to_string();
             messages.push(LlmMessage { role, content });
         }
@@ -601,8 +717,17 @@ impl PluginApi {
             .await
             .map_err(|e| e.to_string())?
         {
-            Some(response) => to_json(&response),
-            None => Err("LLM 未启用".to_string()),
+            Some(response) => Ok(serde_json::json!({
+                "content": response.content,
+                "model": response.model,
+                "usage": {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens
+                },
+                "truncated": response.truncated
+            })),
+            None => Err(marked_error("FORBIDDEN", "LLM 未启用")),
         }
     }
 }
@@ -618,8 +743,103 @@ fn optional_i64(params: &serde_json::Value, key: &str) -> Result<Option<i64>, St
         Some(v) => v
             .as_i64()
             .map(Some)
-            .ok_or_else(|| format!("参数 {key} 必须是整数")),
+            .ok_or_else(|| marked_error("INVALID_ARGUMENT", format!("参数 {key} 必须是整数"))),
     }
+}
+
+fn marked_error(code: &'static str, message: impl Into<String>) -> String {
+    PluginApiError::new(code, message).wire_message()
+}
+
+fn handler_error(value: String) -> PluginApiError {
+    PluginApiError::from_wire_message(&value).unwrap_or_else(|| PluginApiError::internal(value))
+}
+
+fn message_content_dto(content: &MessageContent) -> serde_json::Value {
+    match content {
+        MessageContent::Text(value) => serde_json::json!({"kind":"text","text":value}),
+        MessageContent::Image {
+            url, description, ..
+        } => serde_json::json!({"kind":"image","url":url,"description":description}),
+        MessageContent::File { url, filename, .. } => {
+            serde_json::json!({"kind":"file","url":url,"filename":filename})
+        }
+        MessageContent::Mixed(items) => {
+            serde_json::json!({"kind":"mixed","items":items.iter().map(mixed_content_dto).collect::<Vec<_>>() })
+        }
+        MessageContent::Other(value) => serde_json::json!({"kind":"other","value":value}),
+    }
+}
+
+fn mixed_content_dto(item: &MixedContentSegment) -> serde_json::Value {
+    match item {
+        MixedContentSegment::Text(value) => serde_json::json!({"kind":"text","text":value}),
+        MixedContentSegment::Image { url, .. } => serde_json::json!({"kind":"image","url":url}),
+        MixedContentSegment::Mention {
+            participant_id,
+            display_name,
+        } => {
+            serde_json::json!({"kind":"mention","participant_id":participant_id,"display_name":display_name})
+        }
+    }
+}
+
+fn attachment_dto(item: &Attachment) -> serde_json::Value {
+    serde_json::json!({"filename":item.filename,"url":item.url,"mime_type":item.mime_type,"size":item.size})
+}
+
+fn message_dto(item: &Message) -> serde_json::Value {
+    serde_json::json!({
+        "id":item.id,"conversation_id":item.conversation_id,"sender_id":item.sender_id,
+        "content":message_content_dto(&item.content),"timestamp":item.timestamp,
+        "reply_to":item.reply_to,"mentions":item.mentions,
+        "attachments":item.attachments.iter().map(attachment_dto).collect::<Vec<_>>(),
+        "platform_message_id":item.platform_message_id,"conversation_sequence":item.conversation_sequence,
+        "occurred_at":item.occurred_at,"ingested_at":item.ingested_at
+    })
+}
+
+fn character_dto(item: &Character) -> serde_json::Value {
+    serde_json::json!({
+        "id":item.id,"name":item.definition.name,"description":item.definition.description,
+        "enabled":item.enabled,"created_at":item.created_at,"updated_at":item.updated_at
+    })
+}
+
+fn character_state_dto(item: &CharacterState) -> serde_json::Value {
+    serde_json::json!({"energy":item.energy,"stress":item.stress,"current_activity":item.current_activity,"last_updated":item.last_updated})
+}
+
+fn binding_dto(item: &CharacterBinding) -> serde_json::Value {
+    let reply_mode = match item.reply_mode {
+        ReplyMode::MentionOnly => "mention_only",
+        ReplyMode::Occasionally => "occasionally",
+        ReplyMode::Natural => "natural",
+    };
+    serde_json::json!({"id":item.id,"character_id":item.character_id,"conversation_id":item.conversation_id,"reply_mode":reply_mode,"proactive_enabled":item.proactive_enabled,"mute_schedule":item.mute_schedule,"switched_at":item.switched_at,"cross_reply_enabled":item.cross_reply_enabled,"created_at":item.created_at})
+}
+
+fn memory_raw_dto(item: &Memory) -> serde_json::Value {
+    let memory_type = match item.memory_type {
+        MemoryType::Episodic => "episodic",
+        MemoryType::Semantic => "semantic",
+        MemoryType::Relationship => "relationship",
+        MemoryType::System => "system",
+    };
+    serde_json::json!({"id":item.id,"character_id":item.character_id,"user_id":item.user_id,"conversation_id":item.conversation_id,"memory_type":memory_type,"content":item.content,"importance":item.importance,"created_at":item.created_at,"last_accessed":item.last_accessed,"metadata":item.metadata})
+}
+
+fn memory_type_name(value: MemoryType) -> &'static str {
+    match value {
+        MemoryType::Episodic => "episodic",
+        MemoryType::Semantic => "semantic",
+        MemoryType::Relationship => "relationship",
+        MemoryType::System => "system",
+    }
+}
+
+fn relationship_dto(item: &Relationship) -> serde_json::Value {
+    serde_json::json!({"character_id":item.character_id,"user_id":item.user_id,"familiarity":item.familiarity,"affection":item.affection,"trust":item.trust,"respect":item.respect,"annoyance":item.annoyance,"intimacy":item.intimacy,"interaction_count":item.interaction_count,"last_interaction":item.last_interaction,"created_at":item.created_at,"updated_at":item.updated_at})
 }
 
 /// 读取可选的 f64 字段。
@@ -629,7 +849,7 @@ fn optional_f64(params: &serde_json::Value, key: &str) -> Result<Option<f64>, St
         Some(v) => v
             .as_f64()
             .map(Some)
-            .ok_or_else(|| format!("参数 {key} 必须是数字")),
+            .ok_or_else(|| marked_error("INVALID_ARGUMENT", format!("参数 {key} 必须是数字"))),
     }
 }
 
@@ -641,7 +861,12 @@ fn optional_u8(params: &serde_json::Value, key: &str) -> Result<Option<u8>, Stri
             .as_u64()
             .and_then(|n| u8::try_from(n).ok())
             .map(Some)
-            .ok_or_else(|| format!("参数 {key} 必须是 0..=255 的整数")),
+            .ok_or_else(|| {
+                marked_error(
+                    "INVALID_ARGUMENT",
+                    format!("参数 {key} 必须是 0..=255 的整数"),
+                )
+            }),
     }
 }
 
@@ -652,23 +877,20 @@ fn optional_str(params: &serde_json::Value, key: &str) -> Result<Option<String>,
         Some(v) => v
             .as_str()
             .map(|s| Some(s.to_string()))
-            .ok_or_else(|| format!("参数 {key} 必须是字符串")),
+            .ok_or_else(|| marked_error("INVALID_ARGUMENT", format!("参数 {key} 必须是字符串"))),
     }
 }
 
 /// 读取必填的 i64 字段。
 fn require_i64(params: &serde_json::Value, key: &str) -> Result<i64, String> {
-    optional_i64(params, key)?.ok_or_else(|| format!("缺少参数：{key}"))
+    optional_i64(params, key)?
+        .ok_or_else(|| marked_error("INVALID_ARGUMENT", format!("缺少参数：{key}")))
 }
 
 /// 读取必填的字符串字段。
 fn require_str(params: &serde_json::Value, key: &str) -> Result<String, String> {
-    optional_str(params, key)?.ok_or_else(|| format!("缺少参数：{key}"))
-}
-
-/// 把可序列化对象转为 JSON 值；序列化失败转中文错误。
-fn to_json<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, String> {
-    serde_json::to_value(value).map_err(|e| format!("序列化失败：{e}"))
+    optional_str(params, key)?
+        .ok_or_else(|| marked_error("INVALID_ARGUMENT", format!("缺少参数：{key}")))
 }
 
 /// 解析记忆类型（episodic / semantic / relationship / system，大小写不敏感）。
@@ -678,7 +900,10 @@ fn parse_memory_type(s: &str) -> Result<MemoryType, String> {
         "semantic" => Ok(MemoryType::Semantic),
         "relationship" => Ok(MemoryType::Relationship),
         "system" => Ok(MemoryType::System),
-        other => Err(format!("未知记忆类型：{other}")),
+        other => Err(marked_error(
+            "INVALID_ARGUMENT",
+            format!("未知记忆类型：{other}"),
+        )),
     }
 }
 
@@ -688,7 +913,10 @@ fn parse_llm_role(s: &str) -> Result<LlmRole, String> {
         "user" => Ok(LlmRole::User),
         "assistant" => Ok(LlmRole::Assistant),
         "system" => Ok(LlmRole::System),
-        other => Err(format!("未知消息角色：{other}")),
+        other => Err(marked_error(
+            "INVALID_ARGUMENT",
+            format!("未知消息角色：{other}"),
+        )),
     }
 }
 
@@ -1458,6 +1686,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_typed_errors_have_stable_codes() {
+        let h = build_harness(true).await;
+        let cases = [
+            (
+                "beta",
+                "message.read",
+                serde_json::json!({}),
+                "PERMISSION_DENIED",
+            ),
+            (
+                "alpha",
+                "unknown.method",
+                serde_json::json!({}),
+                "UNKNOWN_METHOD",
+            ),
+            (
+                "alpha",
+                "character.read",
+                serde_json::json!({}),
+                "INVALID_ARGUMENT",
+            ),
+            (
+                "stranger",
+                "character.read",
+                serde_json::json!({}),
+                "NOT_FOUND",
+            ),
+        ];
+        for (plugin, method, params, expected) in cases {
+            let error = h
+                .api
+                .dispatch_typed(plugin, method, params)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, expected);
+            assert!(!error.message.is_empty());
+        }
+    }
+
+    #[test]
+    fn character_dto_is_a_stable_explicit_projection() {
+        let dto = character_dto(&sample_character(7, "Alice"));
+        assert_eq!(dto["id"], 7);
+        assert_eq!(dto["name"], "Alice");
+        assert!(dto.get("state").is_none());
+        assert!(dto.get("definition").is_none());
+        assert_eq!(dto.as_object().unwrap().len(), 6);
+    }
+
+    #[tokio::test]
     async fn dispatch_unknown_method_rejected() {
         let h = build_harness(true).await;
         let err = h
@@ -1582,7 +1860,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(one["definition"]["name"], "Alice");
+        assert_eq!(one["name"], "Alice");
+        assert!(one.get("definition").is_none());
 
         let none = h
             .api
@@ -1706,7 +1985,7 @@ mod tests {
             .unwrap();
         let arr = semantic.as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["memory_type"], "Semantic");
+        assert_eq!(arr[0]["memory_type"], "semantic");
 
         let visible = h
             .api

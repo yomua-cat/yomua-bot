@@ -30,38 +30,46 @@ impl ProtocolError {
     }
 }
 
-fn error_dto(message: &str) -> serde_json::Value {
-    let code = if message.contains("protocol_version") {
-        "UNSUPPORTED_PROTOCOL_VERSION"
-    } else if message.contains("权限不足") {
+const ERROR_PREFIX: &str = "\u{1}plugin-error:";
+
+pub fn mark_error(code: &str, message: &str) -> String {
+    format!("{ERROR_PREFIX}{code}:{message}")
+}
+
+pub fn error_display(value: &str) -> &str {
+    value
+        .strip_prefix(ERROR_PREFIX)
+        .and_then(|rest| rest.split_once(':').map(|(_, message)| message))
+        .unwrap_or(value)
+}
+
+fn error_dto(value: &str) -> serde_json::Value {
+    let (code, message) = value
+        .strip_prefix(ERROR_PREFIX)
+        .and_then(|rest| rest.split_once(':'))
+        .unwrap_or(("INTERNAL_ERROR", value));
+    let code = match code {
         "PERMISSION_DENIED"
-    } else if message.contains("插件名不匹配") {
-        "IDENTITY_MISMATCH"
-    } else if message.contains("未知事件") {
-        "UNKNOWN_EVENT"
-    } else if message.contains("协议") || message.contains("帧") {
-        "PROTOCOL_ERROR"
-    } else if message.contains("握手") {
-        "HANDSHAKE_FAILED"
-    } else if message.contains("未知方法") {
-        "UNKNOWN_METHOD"
-    } else if message.contains("参数") || message.contains("必须") || message.contains("缺少")
-    {
-        "INVALID_ARGUMENT"
-    } else if message.contains("不存在") {
-        "NOT_FOUND"
-    } else {
-        "INTERNAL_ERROR"
+        | "UNKNOWN_METHOD"
+        | "INVALID_ARGUMENT"
+        | "NOT_FOUND"
+        | "PROTOCOL_ERROR"
+        | "INTERNAL_ERROR"
+        | "FORBIDDEN"
+        | "IDENTITY_MISMATCH"
+        | "UNKNOWN_EVENT"
+        | "UNSUPPORTED_PROTOCOL_VERSION"
+        | "HANDSHAKE_FAILED" => code,
+        _ => "INTERNAL_ERROR",
     };
     serde_json::json!({"code": code, "message": message})
 }
 
 fn error_message(value: &serde_json::Value) -> Option<String> {
-    value
-        .as_object()?
-        .get("message")?
-        .as_str()
-        .map(str::to_string)
+    let object = value.as_object()?;
+    let code = object.get("code")?.as_str()?;
+    let message = object.get("message")?.as_str()?;
+    Some(mark_error(code, message))
 }
 
 /// 长度前缀占用的字节数。
@@ -585,15 +593,25 @@ mod tests {
             id: 1,
             ok: false,
             result: None,
-            error: Some("权限不足：需要 message.read 权限".to_string()),
+            error: Some(mark_error("PERMISSION_DENIED", "中文文案可自由调整")),
         })
         .unwrap();
         let value: serde_json::Value = rmp_serde::from_slice(&frame[LEN_PREFIX_BYTES..]).unwrap();
         assert_eq!(value["payload"]["error"]["code"], "PERMISSION_DENIED");
-        assert_eq!(
-            value["payload"]["error"]["message"],
-            "权限不足：需要 message.read 权限"
-        );
+        assert_eq!(value["payload"]["error"]["message"], "中文文案可自由调整");
+    }
+
+    #[test]
+    fn legacy_unmarked_errors_always_use_internal_code() {
+        for message in ["权限不足", "未知方法：foo", "参数错误", "插件未注册"] {
+            let value = error_dto(message);
+            assert_eq!(value["code"], "INTERNAL_ERROR");
+            assert_eq!(value["message"], message);
+        }
+
+        let permission = error_dto(&mark_error("PERMISSION_DENIED", "permission text"));
+        assert_eq!(permission["code"], "PERMISSION_DENIED");
+        assert_eq!(permission["message"], "permission text");
     }
 
     #[test]

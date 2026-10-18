@@ -40,7 +40,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use yomua_bot::infrastructure::plugin::protocol::{
-    decode_full_read, encode_frame, Hello, WireMessage, MAX_FRAME_LEN,
+    decode_full_read, encode_frame, error_display, Hello, WireMessage, MAX_FRAME_LEN,
 };
 
 /// 握手超时：连接后等待 Core 回 `hello_ack` 的时限。
@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(Ok(Some(WireMessage::HelloAck { ok: false, reason }))) => {
             eprintln!(
                 "握手被拒绝：{}",
-                reason.unwrap_or_else(|| "未知原因".to_string())
+                reason.as_deref().map(error_display).unwrap_or("未知原因")
             );
             std::process::exit(1);
         }
@@ -227,7 +227,7 @@ async fn call(
                 if ok {
                     return Ok(result.unwrap_or(serde_json::Value::Null));
                 }
-                let err = error.unwrap_or_else(|| "未知错误".to_string());
+                let err = error.as_deref().map(error_display).unwrap_or("未知错误");
                 return Err(format!("方法 {method} 失败：{err}").into());
             }
             WireMessage::Notify { event, data } => {
