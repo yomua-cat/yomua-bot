@@ -10,7 +10,9 @@ use tokio::sync::watch;
 
 use crate::application::control::replay_pending_memory_edit;
 use crate::application::llm_scheduler::LlmScheduler;
+use crate::domain::memory::{CandidateReviewDecision, Memory, MemoryCandidateReview};
 use crate::domain::repository::MemoryRepository;
+use crate::infrastructure::llm::{LlmMessage, LlmRequest, LlmRole};
 
 /// 候选记忆维护的默认间隔。
 pub const MEMORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
@@ -42,12 +44,25 @@ impl MemoryMaintenanceDriver {
     }
 
     pub async fn tick(&self) -> Result<u64, crate::error::RepositoryError> {
-        let promoted = self.memory_repo.promote_safe_candidates(100).await?;
-        if promoted > 0 {
-            tracing::info!(promoted, "已确认可安全提升的候选记忆");
+        let mut reviewed = 0;
+        if let Some(scheduler) = &self.llm_scheduler {
+            let candidates = self.memory_repo.find_pending_candidates(10).await?;
+            for candidate in candidates {
+                match self.review_candidate(scheduler.as_ref(), &candidate).await {
+                    Ok(Some(review)) => {
+                        if self.memory_repo.apply_candidate_review(&review).await? {
+                            reviewed += 1;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(memory_id = candidate.id, %error, "候选记忆审核失败")
+                    }
+                }
+            }
         }
         let Some(scheduler) = &self.llm_scheduler else {
-            return Ok(promoted);
+            return Ok(0);
         };
 
         // pending 请求已经持久化；每次只取少量，避免后台恢复占满实时模型额度。
@@ -65,7 +80,77 @@ impl MemoryMaintenanceDriver {
         if recovered > 0 {
             tracing::info!(recovered, "已恢复挂起的记忆修改请求");
         }
-        Ok(promoted + recovered)
+        Ok(reviewed + recovered)
+    }
+
+    async fn review_candidate(
+        &self,
+        scheduler: &dyn LlmScheduler,
+        candidate: &Memory,
+    ) -> Result<Option<MemoryCandidateReview>, crate::error::RuntimeError> {
+        let prompt = format!(
+            "审核一条长期记忆候选。只能根据给出的内容判断，不得补充事实。\n候选ID: {}\n类型: {:?}\n内容: {}\n\
+             如果它是用户明确陈述的稳定事实或关系信息，返回 confirm；如果明显不应保存，返回 reject；证据不足返回 defer。\n\
+             只输出 JSON：{{\"candidate_id\":整数,\"decision\":\"confirm|reject|defer\",\"confidence\":0到1之间的小数,\"reason\":\"不超过200字的简短理由\"}}",
+            candidate.id, candidate.memory_type, candidate.content
+        );
+        let response = scheduler
+            .submit(LlmRequest {
+                system: Some("你是记忆审核器。输出必须是单个 JSON 对象，不得输出额外文字。".into()),
+                messages: vec![LlmMessage {
+                    role: LlmRole::User,
+                    content: prompt,
+                }],
+                model: None,
+                temperature: Some(0.0),
+                max_tokens: Some(192),
+                priority: 3,
+                metadata: serde_json::json!({"llm_role":"decision","decision_kind":"memory_candidate_review","memory_id":candidate.id}),
+            })
+            .await?;
+        let value = parse_review_json(&response.content)?;
+        let candidate_id = value
+            .get("candidate_id")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| crate::error::RuntimeError::Llm("记忆审核缺少 candidate_id".into()))?;
+        if candidate_id != candidate.id {
+            return Err(crate::error::RuntimeError::Llm(
+                "记忆审核 candidate_id 不匹配".into(),
+            ));
+        }
+        let confidence = value
+            .get("confidence")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| crate::error::RuntimeError::Llm("记忆审核缺少 confidence".into()))?;
+        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+            return Err(crate::error::RuntimeError::Llm(
+                "记忆审核 confidence 超出范围".into(),
+            ));
+        }
+        let reason = value
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty() && reason.chars().count() <= 200)
+            .ok_or_else(|| crate::error::RuntimeError::Llm("记忆审核 reason 无效".into()))?;
+        let decision = match value.get("decision").and_then(serde_json::Value::as_str) {
+            Some("confirm") => CandidateReviewDecision::Confirm,
+            Some("reject") => CandidateReviewDecision::Reject,
+            Some("defer") => CandidateReviewDecision::Defer,
+            _ => {
+                return Err(crate::error::RuntimeError::Llm(
+                    "记忆审核 decision 无效".into(),
+                ))
+            }
+        };
+        Ok(Some(MemoryCandidateReview {
+            candidate_id,
+            decision,
+            confidence,
+            reason: reason.to_string(),
+            model: response.model,
+            reviewed_at: chrono::Utc::now(),
+        }))
     }
 
     pub async fn run_until_stopped(self: Arc<Self>, mut stop: watch::Receiver<bool>) {
@@ -86,5 +171,34 @@ impl MemoryMaintenanceDriver {
                 }
             }
         }
+    }
+}
+
+fn parse_review_json(content: &str) -> Result<serde_json::Value, crate::error::RuntimeError> {
+    let trimmed = content.trim();
+    let json = trimmed
+        .strip_prefix("```json")
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    serde_json::from_str(json)
+        .map_err(|error| crate::error::RuntimeError::Llm(format!("记忆审核不是有效 JSON: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_review_json;
+
+    #[test]
+    fn review_json_accepts_fenced_object_only() {
+        let value =
+            parse_review_json("```json\n{\"candidate_id\":7,\"decision\":\"defer\"}\n```").unwrap();
+        assert_eq!(value["candidate_id"], 7);
+        assert_eq!(value["decision"], "defer");
+    }
+
+    #[test]
+    fn review_json_rejects_extra_prose() {
+        assert!(parse_review_json("结论：{\"decision\":\"confirm\"}").is_err());
     }
 }

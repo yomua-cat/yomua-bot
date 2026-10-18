@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 
-use crate::domain::memory::{Memory, MemoryType, SemanticMatchResult};
+use crate::domain::memory::{
+    CandidateReviewDecision, Memory, MemoryCandidateReview, MemoryType, SemanticMatchResult,
+};
 use crate::domain::repository::MemoryRepository;
 use crate::error::RepositoryError;
 
@@ -35,52 +37,88 @@ impl MemoryRepository for SqliteMemoryRepository {
         rows.into_iter().map(parse_memory_row).collect()
     }
 
-    async fn promote_safe_candidates(&self, limit: i64) -> Result<u64, RepositoryError> {
-        let mut tx = self.pool.begin().await?;
-        let ids: Vec<i64> = sqlx::query_scalar(
-            r#"SELECT id
+    async fn find_pending_candidates(&self, limit: i64) -> Result<Vec<Memory>, RepositoryError> {
+        let rows: Vec<MemoryRow> = sqlx::query_as(
+            r#"SELECT id,character_id,user_id,conversation_id,memory_type,content,importance,
+                      created_at,last_accessed,metadata,embedding
                  FROM memories
                 WHERE COALESCE(json_extract(metadata, '$.status'), 'formal') = 'candidate'
-                  AND json_extract(metadata, '$.kind') = 'statement'
                   AND json_extract(metadata, '$.source_message_id') IS NOT NULL
-                  AND COALESCE(json_extract(metadata, '$.candidate_confidence'), 0) >= 0.8
-                  AND importance >= 0.5
-                ORDER BY importance DESC, created_at ASC, id ASC
+                  AND COALESCE(json_extract(metadata, '$.review.decision'), '') NOT IN ('confirm', 'reject')
+                  AND (COALESCE(json_extract(metadata, '$.review.decision'), '') != 'defer'
+                       OR datetime(json_extract(metadata, '$.review.reviewed_at')) < datetime('now', '-1 day'))
+                ORDER BY created_at ASC, id ASC
                 LIMIT ?"#,
         )
         .bind(limit.max(0))
-        .fetch_all(&mut *tx)
+        .fetch_all(&self.pool)
         .await?;
+        rows.into_iter().map(parse_memory_row).collect()
+    }
 
-        if ids.is_empty() {
-            tx.rollback().await?;
-            return Ok(0);
-        }
-
-        let confirmed_at = chrono::Utc::now().to_rfc3339();
-        let mut promoted = 0_u64;
-        for id in ids {
-            let result = sqlx::query(
-                r#"UPDATE memories
-                      SET metadata = json_set(
-                          CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
-                          '$.status', 'formal',
-                          '$.verification', 'program_confirmed',
-                          '$.confirmed_at', ?,
-                          '$.confirmation_reason', '有来源的确定性陈述候选，置信度和重要度满足程序门槛'
-                      )
-                    WHERE id = ?
-                      AND COALESCE(json_extract(metadata, '$.status'), 'formal') = 'candidate'"#,
-            )
-            .bind(&confirmed_at)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-            promoted += u64::from(result.rows_affected() == 1);
-        }
-
-        tx.commit().await?;
-        Ok(promoted)
+    async fn apply_candidate_review(
+        &self,
+        review: &MemoryCandidateReview,
+    ) -> Result<bool, RepositoryError> {
+        let decision = match review.decision {
+            CandidateReviewDecision::Confirm => "confirm",
+            CandidateReviewDecision::Reject => "reject",
+            CandidateReviewDecision::Defer => "defer",
+        };
+        let status = if matches!(review.decision, CandidateReviewDecision::Confirm) {
+            "formal"
+        } else {
+            "candidate"
+        };
+        let metadata = serde_json::json!({
+            "decision": decision,
+            "confidence": review.confidence,
+            "reason": review.reason,
+            "model": review.model,
+            "reviewed_at": review.reviewed_at,
+        });
+        let result = sqlx::query(
+            r#"UPDATE memories
+                  SET metadata = json_set(
+                      CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                      '$.status', ?,
+                      '$.verification', 'decision_model_reviewed',
+                      '$.review', json(?),
+                      '$.visibility', CASE WHEN memory_type IN ('semantic', 'relationship') THEN 'shared' ELSE 'conversation' END,
+                      '$.shared', json(CASE WHEN memory_type IN ('semantic', 'relationship') THEN 'true' ELSE 'false' END),
+                      '$.confirmed_at', CASE WHEN ? = 'formal' THEN ? ELSE json_extract(metadata, '$.confirmed_at') END
+                  )
+                WHERE id = ?
+                  AND COALESCE(json_extract(metadata, '$.status'), 'formal') = 'candidate'
+                  AND json_extract(metadata, '$.source_message_id') IS NOT NULL
+                  AND (? != 'formal' OR (
+                       json_extract(metadata, '$.kind') = 'statement'
+                       AND memory_type IN ('semantic', 'relationship', 'episodic')
+                       AND user_id IS NOT NULL
+                       AND conversation_id IS NOT NULL
+                       AND importance >= 0.5
+                       AND ? >= 0.8
+                       AND json_extract(metadata, '$.source_user_id') = user_id
+                       AND CAST(json_extract(metadata, '$.source_conversation_id') AS INTEGER) = conversation_id
+                       AND EXISTS (
+                           SELECT 1 FROM messages source
+                            WHERE source.id = CAST(json_extract(memories.metadata, '$.source_message_id') AS INTEGER)
+                              AND source.conversation_id = memories.conversation_id
+                              AND json_extract(source.metadata, '$.author_kind') = 'user'
+                              AND CAST(json_extract(source.metadata, '$.user_id') AS INTEGER) = memories.user_id
+                       )
+                  ))"#,
+        )
+        .bind(status)
+        .bind(metadata.to_string())
+        .bind(status)
+        .bind(review.reviewed_at.to_rfc3339())
+        .bind(review.candidate_id)
+        .bind(status)
+        .bind(review.confidence)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn candidate_exists_for_source(

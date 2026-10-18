@@ -1956,7 +1956,7 @@ mod storage_tests {
     }
 
     #[tokio::test]
-    async fn safe_statement_candidates_are_promoted_with_audit_metadata() {
+    async fn candidate_reviews_require_model_evidence_and_keep_audit_metadata() {
         let storage = setup_storage().await;
         let memory_repo = crate::infrastructure::storage::repository::SqliteMemoryRepository::new(
             storage.pool().clone(),
@@ -1977,20 +1977,44 @@ mod storage_tests {
             "kind": "statement",
             "status": "candidate",
             "source_message_id": 42,
-            "candidate_confidence": 0.9,
             "shared": true,
         });
         memory_repo.insert(&candidate).await.unwrap();
 
-        assert_eq!(memory_repo.promote_safe_candidates(10).await.unwrap(), 1);
-        let stored = memory_repo
-            .find_by_character_id(character_id, None, 10)
+        assert_eq!(
+            memory_repo.find_pending_candidates(10).await.unwrap().len(),
+            1
+        );
+        let rejected = memory_repo
+            .apply_candidate_review(&MemoryCandidateReview {
+                candidate_id: 1,
+                decision: CandidateReviewDecision::Reject,
+                confidence: 0.95,
+                reason: "测试拒绝".into(),
+                model: "test-reviewer".into(),
+                reviewed_at: chrono::Utc::now(),
+            })
             .await
             .unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].metadata["status"], "formal");
-        assert_eq!(stored[0].metadata["verification"], "program_confirmed");
-        assert!(stored[0].metadata["confirmed_at"].is_string());
+        assert!(rejected);
+        let stored = memory_repo.find_by_id(1).await.unwrap().unwrap();
+        assert_eq!(stored.metadata["status"], "candidate");
+        assert_eq!(stored.metadata["verification"], "decision_model_reviewed");
+        assert_eq!(stored.metadata["review"]["decision"], "reject");
+
+        // 没有可靠用户/会话来源时，即使模型要求确认也不能跨会话正式化。
+        let confirmed = memory_repo
+            .apply_candidate_review(&MemoryCandidateReview {
+                candidate_id: 1,
+                decision: CandidateReviewDecision::Confirm,
+                confidence: 0.99,
+                reason: "不应绕过来源约束".into(),
+                model: "test-reviewer".into(),
+                reviewed_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        assert!(!confirmed);
 
         // 推断候选不走默认确认路径。
         let mut inference = Memory::new(
@@ -2006,11 +2030,89 @@ mod storage_tests {
             "source_message_id": 43,
         });
         memory_repo.insert(&inference).await.unwrap();
-        assert_eq!(memory_repo.promote_safe_candidates(10).await.unwrap(), 0);
+        assert_eq!(
+            memory_repo.find_pending_candidates(10).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]
-    async fn promoted_candidate_remains_idempotent_for_same_source() {
+    async fn confirmed_candidate_requires_matching_source_and_sets_visibility() {
+        let storage = setup_storage().await;
+        let memory_repo = crate::infrastructure::storage::repository::SqliteMemoryRepository::new(
+            storage.pool().clone(),
+        );
+        let character_id: i64 =
+            sqlx::query_scalar("INSERT INTO characters(name) VALUES('来源校验') RETURNING id")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type,external_id) VALUES('group','review-source') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let user_id: i64 = sqlx::query_scalar(
+            "INSERT INTO users(platform,external_id) VALUES('onebot_qq','review-user') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let participant_id: i64 = sqlx::query_scalar(
+            "INSERT INTO participants(conversation_id,external_id,display_name,role,user_id,metadata) VALUES(?,?,?,?,?,?) RETURNING id",
+        )
+        .bind(conversation_id)
+        .bind("review-user")
+        .bind("审核用户")
+        .bind("user")
+        .bind(user_id)
+        .bind(serde_json::json!({"platform":"onebot_qq"}).to_string())
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let source_message_id: i64 = sqlx::query_scalar(
+            "INSERT INTO messages(conversation_id,sender_id,content,metadata) VALUES(?,?,?,?) RETURNING id",
+        )
+        .bind(conversation_id)
+        .bind(participant_id)
+        .bind(serde_json::json!({"type":"text","text":"我喜欢喝咖啡"}).to_string())
+        .bind(serde_json::json!({"author_kind":"user","user_id":user_id}).to_string())
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let mut candidate = Memory::new(
+            character_id,
+            Some(conversation_id),
+            MemoryType::Semantic,
+            "我喜欢喝咖啡".into(),
+            0.8,
+        );
+        candidate.user_id = Some(user_id);
+        candidate.metadata = serde_json::json!({
+            "kind":"statement","status":"candidate","source_message_id":source_message_id,
+            "source_user_id":user_id,"source_conversation_id":conversation_id,"shared":false
+        });
+        let candidate_id = memory_repo.insert(&candidate).await.unwrap();
+        assert!(memory_repo
+            .apply_candidate_review(&MemoryCandidateReview {
+                candidate_id,
+                decision: CandidateReviewDecision::Confirm,
+                confidence: 0.93,
+                reason: "用户明确陈述稳定偏好".into(),
+                model: "test-reviewer".into(),
+                reviewed_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap());
+        let stored = memory_repo.find_by_id(candidate_id).await.unwrap().unwrap();
+        assert_eq!(stored.metadata["status"], "formal");
+        assert_eq!(stored.metadata["shared"], true);
+        assert_eq!(stored.metadata["visibility"], "shared");
+    }
+
+    #[tokio::test]
+    async fn reviewed_candidate_remains_idempotent_for_same_source() {
         let storage = setup_storage().await;
         let memory_repo = crate::infrastructure::storage::repository::SqliteMemoryRepository::new(
             storage.pool().clone(),
@@ -2032,7 +2134,6 @@ mod storage_tests {
             "kind": "statement",
             "status": "candidate",
             "source_message_id": 9001,
-            "candidate_confidence": 0.95,
             "shared": true,
         });
 
@@ -2041,8 +2142,6 @@ mod storage_tests {
             .await
             .unwrap()
             .expect("首次处理应创建候选");
-        assert_eq!(memory_repo.promote_safe_candidates(10).await.unwrap(), 1);
-
         let retry = memory_repo.insert_candidate_once(&candidate).await.unwrap();
         assert!(retry.is_none(), "正式记忆仍应阻止同来源重试");
         let count: i64 = sqlx::query_scalar(
@@ -2062,7 +2161,7 @@ mod storage_tests {
             .fetch_one(storage.pool())
             .await
             .unwrap(),
-            "formal"
+            "candidate"
         );
     }
 

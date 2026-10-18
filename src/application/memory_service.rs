@@ -3,9 +3,7 @@
 //! 候选记忆的基本生命周期：
 //! `消息 → MemoryCandidate → 重要度评估 → 持久化记忆`。
 //!
-//! MVP 使用**确定性启发式**提取：不要求每条消息都成为记忆，
-//! 只有重要度达到阈值的消息才落库。未来可在认知层引入 LLM 协助提取，
-//! 但 LLM 必须经调度器、且与这里是可选叠加关系。
+//! 入站规则只生成带来源的候选；后台决策模型提出审核意见，程序验证后才会确认。
 
 use std::sync::Arc;
 
@@ -131,6 +129,7 @@ impl MemoryService {
             "participant_ids": [candidate.participant_id],
             "source_message_id": input.source_message_id,
             "source_participant_id": input.participant_id,
+            "source_user_id": input.user_id,
             "source_conversation_id": input.conversation_id,
             "source_occurred_at": input.source_occurred_at,
             "keywords": candidate.keywords,
@@ -140,10 +139,6 @@ impl MemoryService {
             "candidate_reason": "确定性规则命中，等待后台确认",
             // 直接陈述类候选才允许走程序自动确认；事件类信息仍需更严格的
             // 后台语义审核，避免把随口一说固化成长期事实。
-            "candidate_confidence": match candidate.memory_type {
-                MemoryType::Relationship | MemoryType::Semantic => 0.9,
-                MemoryType::Episodic | MemoryType::System => 0.6,
-            },
             "visibility": if candidate.memory_type == MemoryType::Episodic { "conversation" } else { "shared" },
             "shared": candidate.memory_type != MemoryType::Episodic,
         });

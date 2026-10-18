@@ -65,6 +65,24 @@ pub enum MemoryType {
     System,
 }
 
+/// 决策模型对候选记忆的审核意见；是否正式化仍由应用规则与仓储约束共同决定。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryCandidateReview {
+    pub candidate_id: i64,
+    pub decision: CandidateReviewDecision,
+    pub confidence: f64,
+    pub reason: String,
+    pub model: String,
+    pub reviewed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateReviewDecision {
+    Confirm,
+    Reject,
+    Defer,
+}
+
 impl Memory {
     /// 创建一条新记忆。
     pub fn new(

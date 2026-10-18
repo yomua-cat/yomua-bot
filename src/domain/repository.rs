@@ -12,7 +12,7 @@ use crate::domain::character::{
 };
 use crate::domain::conversation::{Conversation, ConversationType, Participant};
 use crate::domain::emotion::Mood;
-use crate::domain::memory::{Memory, SemanticMatchResult};
+use crate::domain::memory::{Memory, MemoryCandidateReview, SemanticMatchResult};
 use crate::domain::message::Message;
 use crate::domain::relationship::Relationship;
 use crate::error::RepositoryError;
@@ -691,12 +691,19 @@ pub trait MemoryRepository: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// 自动确认可以由程序安全判断的候选记忆。
+    /// 读取等待审核的候选记忆。候选不会因为读取而改变状态。
+    async fn find_pending_candidates(&self, _limit: i64) -> Result<Vec<Memory>, RepositoryError> {
+        Ok(Vec::new())
+    }
+
+    /// 应用一条经过校验的候选审核意见。
     ///
-    /// 只有带可靠来源且由确定性规则提取的 statement 候选适合走默认路径；
-    /// 模型推断的 inference 候选必须继续等待更严格的复核。
-    async fn promote_safe_candidates(&self, _limit: i64) -> Result<u64, RepositoryError> {
-        Ok(0)
+    /// 返回 `true` 表示状态确实发生变化；重复审核或已处理候选返回 `false`。
+    async fn apply_candidate_review(
+        &self,
+        _review: &MemoryCandidateReview,
+    ) -> Result<bool, RepositoryError> {
+        Ok(false)
     }
 
     /// 判断某条来源消息是否已经生成候选记忆，抵御 Outbox 重试的重复副作用。
