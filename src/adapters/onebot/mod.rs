@@ -287,9 +287,18 @@ impl OneBotAdapter for OneBotAdapterImpl {
         let mut tasks = self.tasks.lock().await;
         let wait = Duration::from_secs(self.config.action_timeout_secs.max(1));
         for task in tasks.iter_mut() {
-            if tokio::time::timeout(wait, &mut *task).await.is_err() {
+            // 只观察任务是否完成，不能用 timeout(&mut JoinHandle) 轮询：
+            // JoinHandle 一旦返回完成结果就不能再次 await，整体关停超时
+            // 后 force_stop 仍会接管同一批句柄，提前消费会导致 Tokio panic。
+            let finished = tokio::time::timeout(wait, async {
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            if !finished {
                 task.abort();
-                let _ = task.await;
             }
         }
         tasks.clear();
