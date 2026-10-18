@@ -72,7 +72,7 @@ flowchart TD
 
 `decision.toml` 启用后，请求经 `DecisionLlmServiceImpl` 以 `llm_role=decision` 交给调度器。明确提及由规则引擎直接处理；未提及消息只有规则结果或关系/状态处于边界时才由启发式触发器调用模型。主动任务先通过规则引擎的主动开关、静默、冷却和意愿门槛，再由同一编排器评估；模型保留才预留额度并入队，模型否决则不产生主动消息副作用。主动情境只接受 `keep` 或 `suggest_ignore`，不接受回复建议或延迟调整。
 
-配置路由负责 Provider、模型、输出上限、共享预算和网络/HTTP 可重试备用模型；解析层要求 JSON 中包含已知 `action`，`adjust_delay` 还必须包含整数 `delay_delta_ms`。Pipeline 对建议做语义校验，失败时回到规则决策；编排器应用建议时再次守住硬约束。未绑定、MentionOnly 模式下未提及、静默时段下未提及和主动情境不能被建议回复绕过；规则决策仍保留优先级、认知级别、原因和时间等字段。全部模型失败、输出无效或未触发模型时都使用规则结果。
+配置路由负责 Provider、模型、输出上限、共享预算和网络/HTTP 可重试备用模型。普通聊天模型返回 JSON 建议；Jev 通过 TypeSafe Provider 发送 `state + choice question`，再由决策服务转换为同一组动作。Pipeline 对建议做语义校验，失败时回到规则决策；编排器应用建议时再次守住硬约束。未绑定、MentionOnly 模式下未提及、静默时段下未提及和主动情境不能被建议回复绕过；规则决策仍保留优先级、认知级别、原因和时间等字段。全部模型失败、输出无效或未触发模型时都使用规则结果。
 
 [ContextBuilder](../src/application/context.rs)加载角色归属的历史、Lorebook、记忆、关系及会话情绪。调用方显式传入全域 `user_id`，participant 只用于本会话消息作者与当前轮身份；跨会话记忆和关系均以该 `user_id` 查询。稳定事实和关系信息默认纳入角色内部上下文，确认禁用策略后由数据库层排除；具体经历仍限于来源会话。[CharacterHistoryProvider](../src/application/character_history.rs)负责历史归属和序号边界。[ContextAssembler](../src/application/context_assembler.rs)估算 token、预留输出空间并按层降级，需要已知的 `context_window`。主程序从 `llm.toml` 的 `[options]` 读取预算，即使使用多模型配置也是如此。
 

@@ -716,9 +716,33 @@ Respond with ONLY a valid JSON object. `action` must be one of `keep`, `suggest_
 
     /// 解析 LLM 返回的 JSON 响应。
     fn parse_response(&self, content: &str) -> Result<DecisionResult, DecisionFailure> {
+        Self::parse_response_content(content)
+    }
+
+    fn parse_response_content(content: &str) -> Result<DecisionResult, DecisionFailure> {
         // 尝试解析为严格结构
         let raw: serde_json::Value =
             serde_json::from_str(content).map_err(|e| DecisionFailure::JsonParse(e.to_string()))?;
+
+        // Jev 返回 answers.action.choice；先转换为现有 DecisionResult，再复用同一验证器。
+        let (raw, jev_confidence) = if raw.get("answers").is_some() {
+            let answer = raw
+                .get("answers")
+                .and_then(|answers| answers.get("action"))
+                .ok_or_else(|| {
+                    DecisionFailure::SchemaValidation("Jev 响应缺少 answers.action".into())
+                })?;
+            let choice = answer
+                .get("choice")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    DecisionFailure::SchemaValidation("Jev action 不是 choice 题答案".into())
+                })?;
+            let confidence = answer.get("confidence").and_then(|value| value.as_f64());
+            (serde_json::json!({"action": choice}), confidence)
+        } else {
+            (raw, None)
+        };
 
         // 提取 action
         let action_str = raw.get("action").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -752,7 +776,10 @@ Respond with ONLY a valid JSON object. `action` must be one of `keep`, `suggest_
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        let confidence = raw.get("confidence").and_then(|v| v.as_f64());
+        let confidence = raw
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .or(jev_confidence);
 
         Ok(DecisionResult {
             action,
@@ -772,6 +799,43 @@ impl DecisionLlmService for DecisionLlmServiceImpl {
         let system = self.build_system_prompt();
         let user = self.build_user_message(ctx, built_in);
 
+        let situation = serde_json::to_value(ctx).unwrap_or_else(|_| serde_json::json!({}));
+        let baseline =
+            serde_json::to_value(&built_in.behavior).unwrap_or_else(|_| serde_json::json!({}));
+        let state = serde_json::json!({
+            "situation": situation,
+            "built_in_decision": baseline,
+        });
+        let is_proactive = matches!(ctx.situation, DecisionSituation::Proactive);
+        let mut criteria = serde_json::Map::from_iter([
+            ("keep".into(), serde_json::json!("保留规则引擎的决定。")),
+            (
+                "suggest_reply".into(),
+                serde_json::json!("建议回复当前消息；仅在程序硬规则允许时生效。"),
+            ),
+            (
+                "suggest_ignore".into(),
+                serde_json::json!("建议忽略当前消息或取消本次主动行为。"),
+            ),
+        ]);
+        if is_proactive {
+            criteria.remove("suggest_reply");
+        }
+        let typesafe_request = serde_json::json!({
+            "state": state,
+            "model": "jev-latest",
+            "questions": {
+                "action": {
+                    "type": "choice",
+                    "instructions": if is_proactive {
+                        "规则允许主动行为。请选择保留本次主动行为，或取消本次主动行为。"
+                    } else {
+                        "请在不违反程序硬约束的前提下，选择保留规则决定、建议回复或建议忽略。"
+                    },
+                    "criteria": criteria,
+                }
+            }
+        });
         let request = crate::infrastructure::llm::LlmRequest {
             system: Some(system),
             messages: vec![crate::infrastructure::llm::LlmMessage {
@@ -782,7 +846,10 @@ impl DecisionLlmService for DecisionLlmServiceImpl {
             temperature: Some(0.1), // 低温度以获得确定性 JSON
             max_tokens: Some(512),
             priority: 1,
-            metadata: serde_json::json!({ "llm_role": "decision" }),
+            metadata: serde_json::json!({
+                "llm_role": "decision",
+                "typesafe_request": typesafe_request,
+            }),
         };
 
         let response = self
@@ -796,5 +863,29 @@ impl DecisionLlmService for DecisionLlmServiceImpl {
 
     fn name(&self) -> &str {
         "DecisionLlmServiceImpl"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DecisionAction, DecisionLlmServiceImpl};
+
+    #[test]
+    fn parses_jev_choice_answer() {
+        let result = DecisionLlmServiceImpl::parse_response_content(
+            r#"{"model":"jev-1.13.0","answers":{"action":{"type":"choice","choice":"suggest_ignore","probabilities":{"keep":0.1,"suggest_ignore":0.9},"confidence":0.8}},"usage":{"input_tokens":10,"output_tokens":4}}"#,
+        )
+        .unwrap();
+        assert_eq!(result.action, DecisionAction::SuggestIgnore);
+        assert_eq!(result.confidence, Some(0.8));
+    }
+
+    #[test]
+    fn rejects_jev_reply_choice_for_proactive_at_validation_layer() {
+        let result = DecisionLlmServiceImpl::parse_response_content(
+            r#"{"answers":{"action":{"type":"choice","choice":"suggest_reply","confidence":0.9}}}"#,
+        )
+        .unwrap();
+        assert_eq!(result.action, DecisionAction::SuggestReply);
     }
 }

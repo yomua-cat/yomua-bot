@@ -100,4 +100,4 @@ cargo clippy --locked --offline --all-targets --all-features -- -D warnings
 2. 完成矛盾记忆的来源修订与冲突处理，并在隔离模型环境验证候选审核体验。
 3. 补齐配置热重载、统一关停和插件进程级测试。
 4. 将结构化控制协议纳入真实 ctl 子进程测试，再提升 CI 门槛。
-5. 为决策模型增加分级会议、权重、超时和预算配置，并在本地模型环境验收。
+5. 在隔离配置中启用 `provider_type = "typesafe"` 的 Jev 决策 Provider，验证 `/v1/systemone` 请求、`choice` 答案映射、主动行为的 `keep/suggest_ignore` 限制，以及失败时回退规则决定。

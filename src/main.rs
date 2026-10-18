@@ -73,6 +73,7 @@ use yomua_bot::error::RuntimeError;
 use yomua_bot::infrastructure::llm::openai_compatible::{
     OpenAiCompatibleConfig, OpenAiCompatibleProvider,
 };
+use yomua_bot::infrastructure::llm::typesafe::TypeSafeProvider;
 use yomua_bot::infrastructure::llm::{
     ApproximateTokenEstimator, FixedModelCapabilities, LlmProvider,
 };
@@ -107,7 +108,7 @@ fn build_model_scheduler(
     LlmConfig::apply_decision_config(&mut resolved, decision_config)?;
     let mut providers = std::collections::HashMap::new();
     for (name, config) in &resolved.providers {
-        let provider: Arc<dyn LlmProvider> = Arc::new(build_provider_from_config(config)?);
+        let provider = build_provider_from_config(config)?;
         providers.insert(name.clone(), provider);
     }
     let default = providers
@@ -139,21 +140,30 @@ fn build_model_scheduler(
 /// 实际的 model 名称由 `LlmModelInstanceConfig.model` 指定，在路由时由 Scheduler 使用。
 fn build_provider_from_config(
     pc: &yomua_bot::application::config::LlmProviderConfig,
-) -> Result<OpenAiCompatibleProvider, RuntimeError> {
+) -> Result<Arc<dyn LlmProvider>, RuntimeError> {
     let provider_type = pc.provider_type.as_str();
+    if provider_type == "typesafe" {
+        return Ok(Arc::new(TypeSafeProvider::new(
+            pc.base_url.clone(),
+            pc.api_key.clone(),
+            Duration::from_secs(pc.timeout_secs.unwrap_or(60)),
+        )));
+    }
     if provider_type != "openai-compatible" {
         return Err(RuntimeError::Config(format!(
-            "不支持的 Provider 类型: {provider_type}（仅支持 openai-compatible）"
+            "不支持的 Provider 类型: {provider_type}（支持 openai-compatible 或 typesafe）"
         )));
     }
 
-    Ok(OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
-        base_url: pc.base_url.clone(),
-        api_key: pc.api_key.clone(),
-        model: String::new(), // 模型名由 LlmScheduler 根据 role 路由时动态指定
-        embedding_model: pc.embedding_model.clone(),
-        timeout: Duration::from_secs(pc.timeout_secs.unwrap_or(60)),
-    }))
+    Ok(Arc::new(OpenAiCompatibleProvider::new(
+        OpenAiCompatibleConfig {
+            base_url: pc.base_url.clone(),
+            api_key: pc.api_key.clone(),
+            model: String::new(), // 模型名由 LlmScheduler 根据 role 路由时动态指定
+            embedding_model: pc.embedding_model.clone(),
+            timeout: Duration::from_secs(pc.timeout_secs.unwrap_or(60)),
+        },
+    )))
 }
 
 /// 从单 Provider `options` JSON 构建 Provider（当前单 Provider 配置）。

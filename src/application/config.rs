@@ -58,7 +58,7 @@ impl Default for RuntimeConfig {
 /// 单个 LLM Provider 的配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmProviderConfig {
-    /// Provider 类型（当前仅支持 "openai-compatible"）。
+    /// Provider 类型："openai-compatible" 或 TypeSafe 的 "typesafe"。
     pub provider_type: String,
 
     /// 服务根地址。
@@ -245,31 +245,43 @@ impl LlmConfig {
             if !self.roles.is_empty() || !self.model_instances.is_empty() {
                 return Err(RuntimeError::Config("模型实例配置缺少 providers".into()));
             }
-            let kind = self.provider.as_deref().unwrap_or("openai-compatible");
-            if !["openai-compatible", "openai", "ollama"].contains(&kind) {
-                return Err(RuntimeError::Config(format!(
-                    "不支持的模型 Provider：{kind}"
-                )));
-            }
             let model = self
                 .options
                 .get("model")
                 .and_then(|v| v.as_str())
                 .filter(|v| !v.trim().is_empty())
                 .ok_or_else(|| RuntimeError::Config("启用模型时必须设置 options.model".into()))?;
+            let explicit_kind = self
+                .provider
+                .as_deref()
+                .or_else(|| self.options.get("provider_type").and_then(|v| v.as_str()));
             let base_url = self
                 .options
                 .get("base_url")
                 .and_then(|v| v.as_str())
-                .unwrap_or(if kind == "ollama" {
+                .unwrap_or(if explicit_kind == Some("ollama") {
                     "http://127.0.0.1:11434/v1"
                 } else {
                     "https://api.openai.com/v1"
                 });
+            let kind = self
+                .provider
+                .as_deref()
+                .or_else(|| self.options.get("provider_type").and_then(|v| v.as_str()))
+                .unwrap_or(if base_url.contains("typesafe.ai") {
+                    "typesafe"
+                } else {
+                    "openai-compatible"
+                });
+            if !["openai-compatible", "openai", "ollama", "typesafe"].contains(&kind) {
+                return Err(RuntimeError::Config(format!(
+                    "不支持的模型 Provider：{kind}"
+                )));
+            }
             providers.insert(
                 "default".into(),
                 LlmProviderConfig {
-                    provider_type: "openai-compatible".into(),
+                    provider_type: kind.into(),
                     base_url: base_url.into(),
                     api_key: self
                         .options
@@ -385,7 +397,9 @@ impl LlmConfig {
                 budget_tokens: None,
             });
         for (name, provider) in &providers {
-            if provider.provider_type != "openai-compatible" {
+            if !["openai-compatible", "openai", "ollama", "typesafe"]
+                .contains(&provider.provider_type.as_str())
+            {
                 return Err(RuntimeError::Config(format!(
                     "Provider {name} 类型不支持：{}",
                     provider.provider_type

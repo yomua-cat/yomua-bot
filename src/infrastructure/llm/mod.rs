@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::RuntimeError;
 
 pub mod openai_compatible;
+pub mod typesafe;
 
 // ---------------------------------------------------------------------------
 // Token 预算 / 模型能力
