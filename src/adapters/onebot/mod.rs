@@ -613,6 +613,21 @@ impl InboundProcessor {
                 return;
             }
         };
+        let sender_user_id = match self
+            .conversation_manager
+            .user_id_for_participant(sender_id)
+            .await
+        {
+            Ok(Some(user_id)) => user_id,
+            Ok(None) => {
+                tracing::error!(target: "adapter", sender_id, "用户参与者缺少全域用户身份，拒绝持久化消息");
+                return;
+            }
+            Err(error) => {
+                tracing::error!(target: "adapter", sender_id, %error, "读取全域用户身份失败，拒绝持久化消息");
+                return;
+            }
+        };
 
         // C2-4: 通过 BindingManager 确定 active character
         // 与 ReplyProcessor 行为一致：无绑定时会话不处理（不落库、不进角色上下文）
@@ -656,7 +671,7 @@ impl InboundProcessor {
                 Some(inbound.platform_message_id),
                 character_id,
                 inbound.is_mentioned,
-                serde_json::json!({"author_kind": if inbound.is_other_bot { "other_bot" } else { "user" },"external_sender_id":inbound.external_sender_id,"display_name":inbound.display_name,"mentions":inbound.mention_targets,"reply_to_platform_message_id":inbound.reply_to,"content_metadata":inbound.content_metadata,"binding_id":sorted[0].id,"binding_version":sorted[0].switched_at}),
+                serde_json::json!({"author_kind": if inbound.is_other_bot { "other_bot" } else { "user" },"external_sender_id":inbound.external_sender_id,"user_id":sender_user_id,"display_name":inbound.display_name,"mentions":inbound.mention_targets,"reply_to_platform_message_id":inbound.reply_to,"content_metadata":inbound.content_metadata,"binding_id":sorted[0].id,"binding_version":sorted[0].switched_at}),
             )
             .await;
 
@@ -802,6 +817,12 @@ mod tests {
         }
         async fn insert(&self, _p: &Participant) -> Result<i64, RepositoryError> {
             Ok(1)
+        }
+        async fn user_id_for_participant(
+            &self,
+            _participant_id: i64,
+        ) -> Result<Option<i64>, RepositoryError> {
+            Ok(Some(1))
         }
     }
 
@@ -1307,7 +1328,7 @@ mod tests {
         let events = drain(&mut sub);
         assert_eq!(events.len(), 1, "普通消息应只发布一条事件");
         assert!(
-            matches!(&events[0], CoreEvent::MessageAccepted(e) if e.content == "你好"),
+            matches!(&events[0], CoreEvent::MessageAccepted(e) if e.content == "你好" && e.metadata["user_id"] == 1),
             "普通消息应发布 MessageAccepted，实际 {:?}",
             events[0]
         );

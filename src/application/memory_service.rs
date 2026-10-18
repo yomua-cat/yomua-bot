@@ -30,6 +30,18 @@ pub struct MemoryCandidate {
     pub participant_id: Option<i64>,
 }
 
+/// 一次记忆提取的完整来源身份与时间。
+#[derive(Debug, Clone)]
+pub struct MemoryExtractionInput<'a> {
+    pub character_id: i64,
+    pub conversation_id: Option<i64>,
+    pub participant_id: i64,
+    pub user_id: Option<i64>,
+    pub message_text: &'a str,
+    pub source_message_id: i64,
+    pub source_occurred_at: DateTime<Utc>,
+}
+
 /// 记忆服务 —— 负责确定性提取与持久化。
 pub struct MemoryService {
     memory_repo: Arc<dyn MemoryRepository>,
@@ -98,32 +110,29 @@ impl MemoryService {
     /// 从一条用户消息中提取记忆并对重要度达标的候选落库。
     ///
     /// 返回本次落库的记忆条数。不重要（低于阈值）的消息会被忽略。
+    /// 写入候选记忆时同时传入会话参与者和全域用户身份，禁止通过 metadata 隐式反查。
     pub async fn extract_and_store(
         &self,
-        character_id: i64,
-        conversation_id: Option<i64>,
-        participant_id: i64,
-        message_text: &str,
-        source_message_id: i64,
-        source_occurred_at: DateTime<Utc>,
+        input: MemoryExtractionInput<'_>,
     ) -> Result<usize, RuntimeError> {
-        let Some(candidate) = self.evaluate(message_text, participant_id) else {
+        let Some(candidate) = self.evaluate(input.message_text, input.participant_id) else {
             return Ok(0);
         };
 
         let mut memory = Memory::new(
-            character_id,
-            conversation_id,
+            input.character_id,
+            input.conversation_id,
             candidate.memory_type,
             candidate.content,
             candidate.importance,
         );
+        memory.user_id = input.user_id;
         memory.metadata = serde_json::json!({
             "participant_ids": [candidate.participant_id],
-            "source_message_id": source_message_id,
-            "source_participant_id": participant_id,
-            "source_conversation_id": conversation_id,
-            "source_occurred_at": source_occurred_at,
+            "source_message_id": input.source_message_id,
+            "source_participant_id": input.participant_id,
+            "source_conversation_id": input.conversation_id,
+            "source_occurred_at": input.source_occurred_at,
             "keywords": candidate.keywords,
             "kind": "statement",
             "status": "candidate",
@@ -364,20 +373,29 @@ mod tests {
         let (svc, repo) = service();
         // 值得记忆的消息 → 落库 1 条。
         let n = svc
-            .extract_and_store(
-                1,
-                Some(10),
-                99,
-                "我今天考试考砸了，心情不太好",
-                100,
-                Utc::now(),
-            )
+            .extract_and_store(MemoryExtractionInput {
+                character_id: 1,
+                conversation_id: Some(10),
+                participant_id: 99,
+                user_id: Some(500),
+                message_text: "我今天考试考砸了，心情不太好",
+                source_message_id: 100,
+                source_occurred_at: Utc::now(),
+            })
             .await
             .expect("提取应成功");
         assert_eq!(n, 1);
         // 无关紧要的短消息 → 不落库。
         let n = svc
-            .extract_and_store(1, Some(10), 99, "哈哈", 101, Utc::now())
+            .extract_and_store(MemoryExtractionInput {
+                character_id: 1,
+                conversation_id: Some(10),
+                participant_id: 99,
+                user_id: Some(500),
+                message_text: "哈哈",
+                source_message_id: 101,
+                source_occurred_at: Utc::now(),
+            })
             .await
             .expect("提取应成功");
         assert_eq!(n, 0);
@@ -392,5 +410,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].memory_type, MemoryType::Episodic);
+        assert_eq!(stored[0].user_id, Some(500));
     }
 }

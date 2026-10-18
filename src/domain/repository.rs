@@ -232,6 +232,16 @@ pub trait ParticipantRepository: Send + Sync {
         Ok(None)
     }
 
+    /// 显式解析会话参与者对应的全域用户身份；非用户参与者返回 `None`。
+    async fn user_id_for_participant(
+        &self,
+        _participant_id: i64,
+    ) -> Result<Option<i64>, RepositoryError> {
+        Err(RepositoryError::NotImplemented(
+            "参与者全域用户身份解析".into(),
+        ))
+    }
+
     /// 将一个平台用户的历史归并到另一个用户，返回被保留的用户 ID。
     async fn merge_users(
         &self,
@@ -758,11 +768,11 @@ pub trait MemoryRepository: Send + Sync {
 
     /// 按当前消息作者的全域用户身份读取可见记忆。
     /// 默认实现退化为会话范围查询，SQLite 实现只额外加入同一用户明确共享的记忆。
-    async fn find_visible_for_participant(
+    async fn find_visible_for_user(
         &self,
         character_id: i64,
         conversation_id: i64,
-        _participant_id: i64,
+        _user_id: Option<i64>,
         limit: i64,
     ) -> Result<Vec<Memory>, RepositoryError> {
         self.find_visible(character_id, conversation_id, limit)
@@ -775,7 +785,7 @@ pub trait MemoryRepository: Send + Sync {
         &self,
         character_id: i64,
         conversation_id: i64,
-        participant_id: i64,
+        user_id: Option<i64>,
         keywords: &[String],
         limit: i64,
     ) -> Result<Vec<Memory>, RepositoryError> {
@@ -783,7 +793,7 @@ pub trait MemoryRepository: Send + Sync {
             return Ok(Vec::new());
         }
         let mut items = self
-            .find_visible_for_participant(character_id, conversation_id, participant_id, i64::MAX)
+            .find_visible_for_user(character_id, conversation_id, user_id, i64::MAX)
             .await?;
         items.retain(|memory| {
             keywords

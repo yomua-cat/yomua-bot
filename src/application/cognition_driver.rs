@@ -381,9 +381,34 @@ impl CognitionDriver {
             0.7,
         );
         memory.embedding = embedding.and_then(|v| serde_json::to_string(&v).ok());
+        let mut source_user_ids = selected_messages
+            .iter()
+            .filter_map(|message| {
+                if message
+                    .metadata
+                    .get("author_kind")
+                    .and_then(|value| value.as_str())
+                    != Some("user")
+                {
+                    return None;
+                }
+                message
+                    .metadata
+                    .get("user_id")
+                    .and_then(|value| value.as_i64())
+            })
+            .collect::<Vec<_>>();
+        source_user_ids.sort_unstable();
+        source_user_ids.dedup();
+        memory.user_id = if source_user_ids.len() == 1 {
+            source_user_ids.first().copied()
+        } else {
+            None
+        };
         memory.metadata = serde_json::json!({
             "source_message_ids": selected_messages.iter().map(|m| m.id).collect::<Vec<_>>(),
             "source_participant_ids": selected_messages.iter().map(|m| m.sender_id).collect::<Vec<_>>(),
+            "source_user_ids": source_user_ids,
             "source_conversation_id": binding.conversation_id,
             "source_occurred_at": selected_messages
                 .iter()

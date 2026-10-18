@@ -140,6 +140,17 @@ impl ConversationManager {
             .map(|participant| participant.id))
     }
 
+    /// 返回会话参与者对应的全域用户 ID；角色和系统参与者返回 `None`。
+    pub async fn user_id_for_participant(
+        &self,
+        participant_id: i64,
+    ) -> Result<Option<i64>, RuntimeError> {
+        self.participant_repo
+            .user_id_for_participant(participant_id)
+            .await
+            .map_err(RuntimeError::Repository)
+    }
+
     /// 解析一条入站消息的外部发起者 / 会话，并返回核心 ID 元组。
     ///
     /// 这是外部 ID → 核心 ID 的核心入口。

@@ -31,7 +31,10 @@ pub struct CognitionLayer {
 pub struct ConversationGeneration {
     pub character: Character,
     pub conversation_id: i64,
+    /// 本会话内的消息作者身份，用于消息归属与当前轮标注。
     pub participant_id: i64,
+    /// 跨会话稳定的用户身份，用于关系和共享记忆读取。
+    pub user_id: Option<i64>,
     pub user_message: String,
     pub is_mentioned: bool,
     pub limits: ContextLimits,
@@ -81,7 +84,7 @@ impl CognitionLayer {
             .build(
                 &request.character,
                 request.conversation_id,
-                request.participant_id,
+                request.user_id,
                 request.limits,
                 request.current_sequence,
             )

@@ -151,12 +151,14 @@ impl ContextBuilder {
     ///
     /// # 参数
     /// - `current_sequence`: 如果为 `Some(seq)`，使用 sequence-based 过滤：
-    ///   `conversation_sequence < seq`，确保 History 不包含当前消息
+    ///   `conversation_sequence < seq`，确保 History 不包含当前消息。
+    ///
+    /// 使用显式全域用户身份组装上下文；`None` 只读取当前会话记忆且不加载关系。
     pub async fn build(
         &self,
         character: &Character,
         conversation_id: i64,
-        participant_id: i64,
+        user_id: Option<i64>,
         limits: ContextLimits,
         current_sequence: Option<i64>,
     ) -> Result<ConversationContext, RuntimeError> {
@@ -203,10 +205,10 @@ impl ContextBuilder {
         let memory = {
             let by_importance = self
                 .memory_repo
-                .find_visible_for_participant(
+                .find_visible_for_user(
                     character.id,
                     conversation_id,
-                    participant_id,
+                    user_id,
                     limits.memory_limit as i64,
                 )
                 .await?;
@@ -216,7 +218,7 @@ impl ContextBuilder {
                 .search_visible_by_keywords(
                     character.id,
                     conversation_id,
-                    participant_id,
+                    user_id,
                     &keywords,
                     limits.memory_limit as i64,
                 )
@@ -225,10 +227,14 @@ impl ContextBuilder {
         };
 
         // 与当前参与者的关系。
-        let relationship = self
-            .relationship_repo
-            .find(character.id, participant_id)
-            .await?;
+        let relationship = match user_id {
+            Some(user_id) => {
+                self.relationship_repo
+                    .find_by_user_id(character.id, user_id)
+                    .await?
+            }
+            None => None,
+        };
 
         // 当前情绪（Mood，Character × Conversation 范围）。
         let current_mood = self
@@ -561,6 +567,21 @@ mod tests {
         ) -> Result<Vec<Relationship>, RepositoryError> {
             Ok(vec![])
         }
+        async fn find_by_user_id(
+            &self,
+            character_id: i64,
+            user_id: i64,
+        ) -> Result<Option<Relationship>, RepositoryError> {
+            Ok(self
+                .relationships
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|relationship| {
+                    relationship.character_id == character_id && relationship.user_id == user_id
+                })
+                .cloned())
+        }
         async fn upsert(&self, _r: &Relationship) -> Result<(), RepositoryError> {
             Ok(())
         }
@@ -791,7 +812,7 @@ mod tests {
         .await;
         let character = build_character();
         let ctx = builder
-            .build(&character, 10, 99, ContextLimits::default(), None)
+            .build(&character, 10, Some(99), ContextLimits::default(), None)
             .await
             .expect("build 应成功");
 
@@ -841,7 +862,13 @@ mod tests {
         };
         let builder = build_builder(vec![], vec![], vec![rel], vec![binding]).await;
         let ctx = builder
-            .build(&build_character(), 10, 99, ContextLimits::default(), None)
+            .build(
+                &build_character(),
+                10,
+                Some(99),
+                ContextLimits::default(),
+                None,
+            )
             .await
             .unwrap();
         assert!(ctx.binding.is_some());
@@ -863,7 +890,7 @@ mod tests {
             ..Default::default()
         };
         let ctx = builder
-            .build(&build_character(), 10, 99, limits, None)
+            .build(&build_character(), 10, Some(99), limits, None)
             .await
             .unwrap();
         assert_eq!(ctx.memory.len(), 2);
@@ -886,7 +913,7 @@ mod tests {
             ..Default::default()
         };
         let ctx = builder
-            .build(&build_character(), 10, 99, limits, None)
+            .build(&build_character(), 10, Some(99), limits, None)
             .await
             .unwrap();
         assert_eq!(ctx.matching_lorebook.len(), 1);
@@ -916,7 +943,13 @@ mod tests {
         )
         .await;
         let ctx = builder
-            .build(&build_character(), 10, 99, ContextLimits::default(), None)
+            .build(
+                &build_character(),
+                10,
+                Some(99),
+                ContextLimits::default(),
+                None,
+            )
             .await
             .expect("build 应成功");
 
@@ -967,7 +1000,13 @@ mod tests {
             binding_repo,
         );
         let result = builder
-            .build(&build_character(), 999, 1, ContextLimits::default(), None)
+            .build(
+                &build_character(),
+                999,
+                Some(1),
+                ContextLimits::default(),
+                None,
+            )
             .await;
         assert!(result.is_err());
     }
@@ -1040,7 +1079,13 @@ mod tests {
         let binding = binding_with_switched_at(Some(t2));
         let builder = build_builder(messages, vec![], vec![], vec![binding]).await;
         let ctx = builder
-            .build(&build_character(), 10, 99, ContextLimits::default(), None)
+            .build(
+                &build_character(),
+                10,
+                Some(99),
+                ContextLimits::default(),
+                None,
+            )
             .await
             .expect("build 应成功");
 
@@ -1065,7 +1110,13 @@ mod tests {
         let binding = binding_with_switched_at(None);
         let builder = build_builder(messages, vec![], vec![], vec![binding]).await;
         let ctx = builder
-            .build(&build_character(), 10, 99, ContextLimits::default(), None)
+            .build(
+                &build_character(),
+                10,
+                Some(99),
+                ContextLimits::default(),
+                None,
+            )
             .await
             .expect("build 应成功");
 
@@ -1095,7 +1146,7 @@ mod tests {
         let binding = binding_with_switched_at(Some(t2));
         let builder = build_builder(messages, vec![], vec![], vec![binding]).await;
         let ctx = builder
-            .build(&character, 10, 99, ContextLimits::default(), None)
+            .build(&character, 10, Some(99), ContextLimits::default(), None)
             .await
             .expect("build 应成功");
 

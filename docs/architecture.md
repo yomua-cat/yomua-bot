@@ -70,7 +70,7 @@ flowchart TD
 
 [规则行为引擎](../src/application/behavior_engine.rs)结合回复模式、提及、静默时段、状态和关系决定是否回复及延迟。[决策编排器](../src/application/decision_orchestrator.rs)以规则结果为基线；`decision.toml` 启用后接入 advisory 决策模型，模型输出必须经过验证器和硬约束策略。
 
-[ContextBuilder](../src/application/context.rs)加载角色归属的历史、Lorebook、记忆、关系及会话情绪；关系查询会先把当前 participant 映射到全域 User，跨会话记忆默认纳入该 User 的稳定事实和关系信息，确认禁用策略后由数据库层排除，并只进入角色内部上下文，不把来源会话写入对用户可见的回复，其他记忆限于来源会话。[CharacterHistoryProvider](../src/application/character_history.rs)负责历史归属和序号边界。[ContextAssembler](../src/application/context_assembler.rs)估算 token、预留输出空间并按层降级，需要已知的 `context_window`。主程序从 `llm.toml` 的 `[options]` 读取预算，即使使用多模型配置也是如此。
+[ContextBuilder](../src/application/context.rs)加载角色归属的历史、Lorebook、记忆、关系及会话情绪。调用方显式传入全域 `user_id`，participant 只用于本会话消息作者与当前轮身份；跨会话记忆和关系均以该 `user_id` 查询。稳定事实和关系信息默认纳入角色内部上下文，确认禁用策略后由数据库层排除；具体经历仍限于来源会话。[CharacterHistoryProvider](../src/application/character_history.rs)负责历史归属和序号边界。[ContextAssembler](../src/application/context_assembler.rs)估算 token、预留输出空间并按层降级，需要已知的 `context_window`。主程序从 `llm.toml` 的 `[options]` 读取预算，即使使用多模型配置也是如此。
 
 全域用户删除由 `ParticipantRepository` 在 SQLite 事务内执行：删除该用户来源的普通/向量记忆和关系数据，匿名化会话参与者、OneBot 私聊路由、消息/outbox 作者元数据与用户黑名单，再删除 `users` 身份。为保留历史审计与引用，消息行、正文和内部引用关系保留；历史作者显示为“已删除用户”，旧私聊主动发言会关闭。任何步骤失败都会回滚整笔删除。
 

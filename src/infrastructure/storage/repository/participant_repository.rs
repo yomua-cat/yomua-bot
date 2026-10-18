@@ -143,6 +143,17 @@ impl ParticipantRepository for SqliteParticipantRepository {
         Ok(Some(id))
     }
 
+    async fn user_id_for_participant(
+        &self,
+        participant_id: i64,
+    ) -> Result<Option<i64>, RepositoryError> {
+        sqlx::query_scalar("SELECT user_id FROM participants WHERE id=? AND role='user'")
+            .bind(participant_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(RepositoryError::from)
+    }
+
     async fn merge_users(
         &self,
         source_user_id: i64,

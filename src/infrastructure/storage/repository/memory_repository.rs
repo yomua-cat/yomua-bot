@@ -152,16 +152,6 @@ impl MemoryRepository for SqliteMemoryRepository {
             tx.rollback().await?;
             return Ok(None);
         };
-        sqlx::query(
-            r#"UPDATE memories
-                  SET user_id = (SELECT p.user_id FROM participants p
-                                   WHERE p.id = json_extract(?, '$.source_participant_id'))
-                WHERE id = ? AND user_id IS NULL"#,
-        )
-        .bind(&metadata)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
         tx.commit().await?;
         Ok(Some(id))
     }
@@ -201,15 +191,6 @@ impl MemoryRepository for SqliteMemoryRepository {
             let metadata = memory.metadata.to_string();
             sqlx::query("INSERT INTO memories(character_id,user_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding) VALUES(?,?,?,?,?,?,?,?,?,?)")
             .bind(character_id).bind(memory.user_id).bind(conversation_id).bind(kind).bind(&memory.content).bind(memory.importance).bind(memory.created_at.to_rfc3339()).bind(memory.last_accessed.to_rfc3339()).bind(&metadata).bind(&memory.embedding).execute(&mut *tx).await?;
-            sqlx::query(
-                r#"UPDATE memories
-                      SET user_id = (SELECT p.user_id FROM participants p
-                                       WHERE p.id = json_extract(?, '$.source_participant_id'))
-                    WHERE id = last_insert_rowid() AND user_id IS NULL"#,
-            )
-            .bind(&metadata)
-            .execute(&mut *tx)
-            .await?;
         }
         tx.commit().await?;
         Ok(true)
@@ -225,37 +206,33 @@ impl MemoryRepository for SqliteMemoryRepository {
         rows.into_iter().map(parse_memory_row).collect()
     }
 
-    async fn find_visible_for_participant(
+    async fn find_visible_for_user(
         &self,
         character_id: i64,
         conversation_id: i64,
-        participant_id: i64,
+        user_id: Option<i64>,
         limit: i64,
     ) -> Result<Vec<Memory>, RepositoryError> {
-        let rows: Vec<MemoryRow> = sqlx::query_as(
-            r#"SELECT id,character_id,user_id,conversation_id,memory_type,content,importance,
-                      created_at,last_accessed,metadata,embedding
-                 FROM memories
-                WHERE character_id=?
-                  AND COALESCE(json_extract(metadata,'$.status'),'formal') != 'candidate'
-                  AND (conversation_id=? OR (
-                       user_id=(SELECT user_id FROM participants WHERE id=? AND role='user')
-                       AND COALESCE(json_extract(metadata,'$.shared'),0)=1
-                       AND NOT EXISTS (
-                           SELECT 1 FROM memory_sharing_policies policy
-                            WHERE policy.character_id = memories.character_id
-                              AND policy.user_id = memories.user_id
-                              AND policy.status = 'confirmed'
-                       )
-                  ))
-                ORDER BY importance DESC,created_at DESC,id DESC LIMIT ?"#,
-        )
-        .bind(character_id)
-        .bind(conversation_id)
-        .bind(participant_id)
-        .bind(limit.max(0))
-        .fetch_all(&self.pool)
-        .await?;
+        let base = "SELECT id,character_id,user_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding FROM memories WHERE character_id=? AND COALESCE(json_extract(metadata,'$.status'),'formal') != 'candidate' AND (conversation_id=?";
+        let rows: Vec<MemoryRow> = match user_id {
+            Some(user_id) => sqlx::query_as(&format!(
+                "{base} OR (user_id=? AND COALESCE(json_extract(metadata,'$.shared'),0)=1 AND NOT EXISTS (SELECT 1 FROM memory_sharing_policies policy WHERE policy.character_id=memories.character_id AND policy.user_id=memories.user_id AND policy.status='confirmed'))) ORDER BY importance DESC,created_at DESC,id DESC LIMIT ?"
+            ))
+            .bind(character_id)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(limit.max(0))
+            .fetch_all(&self.pool)
+            .await?,
+            None => sqlx::query_as(&format!(
+                "{base}) ORDER BY importance DESC,created_at DESC,id DESC LIMIT ?"
+            ))
+            .bind(character_id)
+            .bind(conversation_id)
+            .bind(limit.max(0))
+            .fetch_all(&self.pool)
+            .await?,
+        };
         rows.into_iter().map(parse_memory_row).collect()
     }
 
@@ -263,7 +240,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         &self,
         character_id: i64,
         conversation_id: i64,
-        participant_id: i64,
+        user_id: Option<i64>,
         keywords: &[String],
         limit: i64,
     ) -> Result<Vec<Memory>, RepositoryError> {
@@ -283,11 +260,18 @@ impl MemoryRepository for SqliteMemoryRepository {
             " AND COALESCE(json_extract(metadata,'$.status'),'formal') != 'candidate' AND (conversation_id=",
         );
         builder.push_bind(conversation_id);
-        builder.push(" OR (user_id=(SELECT user_id FROM participants WHERE id=");
-        builder.push_bind(participant_id);
-        builder.push(
-            " AND role='user') AND COALESCE(json_extract(metadata,'$.shared'),0)=1 AND NOT EXISTS (SELECT 1 FROM memory_sharing_policies policy WHERE policy.character_id=memories.character_id AND policy.user_id=memories.user_id AND policy.status='confirmed')) ) AND (",
-        );
+        match user_id {
+            Some(user_id) => {
+                builder.push(" OR (user_id=");
+                builder.push_bind(user_id);
+                builder.push(
+                    " AND COALESCE(json_extract(metadata,'$.shared'),0)=1 AND NOT EXISTS (SELECT 1 FROM memory_sharing_policies policy WHERE policy.character_id=memories.character_id AND policy.user_id=memories.user_id AND policy.status='confirmed')) ) AND (",
+                );
+            }
+            None => {
+                builder.push(") AND (");
+            }
+        }
         for (index, keyword) in keywords.iter().enumerate() {
             if index > 0 {
                 builder.push(" OR ");
@@ -507,18 +491,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let id = result.last_insert_rowid();
-        sqlx::query(
-            r#"UPDATE memories
-                  SET user_id = (SELECT p.user_id FROM participants p
-                                   WHERE p.id = json_extract(?, '$.source_participant_id'))
-                WHERE id = ? AND user_id IS NULL"#,
-        )
-        .bind(&metadata)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(id)
+        Ok(result.last_insert_rowid())
     }
 
     async fn update(&self, memory: &Memory) -> Result<(), RepositoryError> {

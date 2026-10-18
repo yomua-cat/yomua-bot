@@ -17,7 +17,7 @@ use crate::application::binding::BindingManager;
 use crate::application::cognition::CognitionLayer;
 use crate::application::context::ContextLimits;
 use crate::application::event_bus::EventBus;
-use crate::application::memory_service::MemoryService;
+use crate::application::memory_service::{MemoryExtractionInput, MemoryService};
 use crate::application::mood_service::MoodService;
 use crate::application::relationship_service::RelationshipService;
 use crate::application::runtime::CharacterRuntime;
@@ -903,19 +903,24 @@ impl ReplyProcessor {
             .relationship_service
             .canonical_participant_id(event.character_id, event.sender_id, stable_user_key)
             .await?;
+        let sender_user_id = self
+            .participant_repo
+            .user_id_for_participant(event.sender_id)
+            .await?;
         self.ensure_event_still_owned(event, lease).await?;
         if event.message_id > 0 && !non_human_source {
             self.memory_service
-                .extract_and_store(
-                    event.character_id,
-                    Some(event.conversation_id),
+                .extract_and_store(MemoryExtractionInput {
+                    character_id: event.character_id,
+                    conversation_id: Some(event.conversation_id),
                     // 记忆来源必须保留当前事件的实际参与者；关系服务的
                     // canonical participant 只用于稳定关系键，不能替代来源会话。
-                    event.sender_id,
-                    &event.content,
-                    event.message_id,
-                    event.timestamp,
-                )
+                    participant_id: event.sender_id,
+                    user_id: sender_user_id,
+                    message_text: &event.content,
+                    source_message_id: event.message_id,
+                    source_occurred_at: event.timestamp,
+                })
                 .await?;
         }
         self.ensure_event_still_owned(event, lease).await?;
@@ -953,15 +958,20 @@ impl ReplyProcessor {
                 .canonical_participant_id(event.character_id, message.sender_id, stable_user_key)
                 .await?;
             if let crate::domain::message::MessageContent::Text(text) = &message.content {
+                let user_id = self
+                    .participant_repo
+                    .user_id_for_participant(message.sender_id)
+                    .await?;
                 self.memory_service
-                    .extract_and_store(
-                        event.character_id,
-                        Some(event.conversation_id),
-                        message.sender_id,
-                        text,
-                        message.id,
-                        message.occurred_at.unwrap_or(message.timestamp),
-                    )
+                    .extract_and_store(MemoryExtractionInput {
+                        character_id: event.character_id,
+                        conversation_id: Some(event.conversation_id),
+                        participant_id: message.sender_id,
+                        user_id,
+                        message_text: text,
+                        source_message_id: message.id,
+                        source_occurred_at: message.occurred_at.unwrap_or(message.timestamp),
+                    })
                     .await?;
             }
             match self
@@ -1037,7 +1047,8 @@ impl ReplyProcessor {
                     event,
                     &character,
                     event.character_id,
-                    relationship_participant_id,
+                    event.sender_id,
+                    sender_user_id,
                     &batch_content,
                 )
                 .await
@@ -1306,6 +1317,7 @@ impl ReplyProcessor {
         character: &crate::domain::character::Character,
         character_id: i64,
         participant_id: i64,
+        user_id: Option<i64>,
         content: &str,
     ) -> Result<String, RuntimeError> {
         if self.cognition.enabled() {
@@ -1321,6 +1333,7 @@ impl ReplyProcessor {
                     character: character.clone(),
                     conversation_id: event.conversation_id,
                     participant_id,
+                    user_id,
                     user_message: content.to_string(),
                     is_mentioned: event.is_mentioned,
                     limits: ContextLimits::default(),
@@ -1859,6 +1872,30 @@ mod tests {
             _participant: &crate::domain::conversation::Participant,
         ) -> Result<i64, RepositoryError> {
             Ok(1)
+        }
+        async fn user_id_for_participant(
+            &self,
+            participant_id: i64,
+        ) -> Result<Option<i64>, RepositoryError> {
+            Ok(self
+                .participants
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|participant| participant.id == participant_id)
+                .and_then(|participant| {
+                    if participant.role == crate::domain::conversation::ParticipantRole::User {
+                        Some(
+                            participant
+                                .metadata
+                                .get("user_id")
+                                .and_then(|value| value.as_i64())
+                                .unwrap_or(participant.id),
+                        )
+                    } else {
+                        None
+                    }
+                }))
         }
     }
 

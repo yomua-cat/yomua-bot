@@ -1649,6 +1649,23 @@ mod storage_tests {
             })
             .await
             .unwrap();
+        let user_a = part_repo
+            .user_id_for_participant(participant_a)
+            .await
+            .unwrap();
+        let user_b = part_repo
+            .user_id_for_participant(participant_b)
+            .await
+            .unwrap();
+        let user_d = part_repo
+            .user_id_for_participant(participant_d)
+            .await
+            .unwrap();
+        let user_c = part_repo
+            .user_id_for_participant(participant_c)
+            .await
+            .unwrap();
+        assert_eq!(user_a, user_b);
         let mut memory = Memory::new(
             character_id,
             Some(conversation_a),
@@ -1656,6 +1673,7 @@ mod storage_tests {
             "小明喜欢猫".into(),
             0.9,
         );
+        memory.user_id = user_a;
         memory.metadata =
             serde_json::json!({"source_participant_id": participant_a, "shared": true});
         memory_repo.insert(&memory).await.unwrap();
@@ -1667,6 +1685,7 @@ mod storage_tests {
             "小明在群A提到的具体经历".into(),
             0.9,
         );
+        private_memory.user_id = user_a;
         private_memory.metadata =
             serde_json::json!({"source_participant_id": participant_a, "shared": false});
         memory_repo.insert(&private_memory).await.unwrap();
@@ -1678,6 +1697,7 @@ mod storage_tests {
             "小红喜欢狗".into(),
             0.9,
         );
+        other_user_memory.user_id = user_c;
         other_user_memory.metadata =
             serde_json::json!({"source_participant_id": participant_c, "shared": true});
         memory_repo.insert(&other_user_memory).await.unwrap();
@@ -1689,12 +1709,13 @@ mod storage_tests {
             "群B的共同经历".into(),
             0.9,
         );
+        local_memory.user_id = user_d;
         local_memory.metadata =
             serde_json::json!({"source_participant_id": participant_d, "shared": false});
         memory_repo.insert(&local_memory).await.unwrap();
 
         let visible = memory_repo
-            .find_visible_for_participant(character_id, conversation_b, participant_b, 10)
+            .find_visible_for_user(character_id, conversation_b, user_b, 10)
             .await
             .unwrap();
         let visible_content = visible
@@ -1708,7 +1729,7 @@ mod storage_tests {
         assert!(!visible_content.contains(&"小红喜欢狗"));
 
         let other_user_visible = memory_repo
-            .find_visible_for_participant(character_id, conversation_b, participant_d, 10)
+            .find_visible_for_user(character_id, conversation_b, user_d, 10)
             .await
             .unwrap();
         let other_user_content = other_user_visible
@@ -1784,7 +1805,7 @@ mod storage_tests {
             .await
             .unwrap();
         let still_visible = memory_repo
-            .find_visible_for_participant(character_id, conversation_b, participant_b, 10)
+            .find_visible_for_user(character_id, conversation_b, user_b, 10)
             .await
             .unwrap();
         assert!(still_visible
@@ -1797,7 +1818,7 @@ mod storage_tests {
             .await
             .unwrap();
         let blocked = memory_repo
-            .find_visible_for_participant(character_id, conversation_b, participant_b, 10)
+            .find_visible_for_user(character_id, conversation_b, user_b, 10)
             .await
             .unwrap();
         assert!(!blocked.iter().any(|memory| memory.content == "小明喜欢猫"));
@@ -1814,7 +1835,7 @@ mod storage_tests {
             .unwrap();
         assert!(vector_blocked.is_empty());
         let source_visible = memory_repo
-            .find_visible_for_participant(character_id, conversation_a, participant_a, 10)
+            .find_visible_for_user(character_id, conversation_a, Some(user_a), 10)
             .await
             .unwrap();
         assert!(source_visible
@@ -1827,7 +1848,7 @@ mod storage_tests {
             .await
             .unwrap();
         let restored = memory_repo
-            .find_visible_for_participant(character_id, conversation_b, participant_b, 10)
+            .find_visible_for_user(character_id, conversation_b, user_b, 10)
             .await
             .unwrap();
         assert!(restored.iter().any(|memory| memory.content == "小明喜欢猫"));
@@ -1866,33 +1887,42 @@ mod storage_tests {
             updated_at: chrono::Utc::now(),
         };
         let character_id = char_repo.insert(&character).await.unwrap();
+        let user_id = crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+            storage.pool().clone(),
+        )
+        .ensure_user("onebot_qq", "700007")
+        .await
+        .unwrap()
+        .unwrap();
         let service = crate::application::memory_service::MemoryService::new(memory_repo.clone());
         let occurred_at = chrono::Utc::now();
 
         assert_eq!(
             service
-                .extract_and_store(
+                .extract_and_store(crate::application::memory_service::MemoryExtractionInput {
                     character_id,
-                    None,
-                    7,
-                    "我喜欢喝咖啡，每天都要来一杯",
-                    9001,
-                    occurred_at,
-                )
+                    conversation_id: None,
+                    participant_id: 7,
+                    user_id: Some(user_id),
+                    message_text: "我喜欢喝咖啡，每天都要来一杯",
+                    source_message_id: 9001,
+                    source_occurred_at: occurred_at,
+                },)
                 .await
                 .unwrap(),
             1
         );
         assert_eq!(
             service
-                .extract_and_store(
+                .extract_and_store(crate::application::memory_service::MemoryExtractionInput {
                     character_id,
-                    None,
-                    7,
-                    "我喜欢喝咖啡，每天都要来一杯",
-                    9001,
-                    occurred_at,
-                )
+                    conversation_id: None,
+                    participant_id: 7,
+                    user_id: Some(user_id),
+                    message_text: "我喜欢喝咖啡，每天都要来一杯",
+                    source_message_id: 9001,
+                    source_occurred_at: occurred_at,
+                },)
                 .await
                 .unwrap(),
             0,
@@ -1907,6 +1937,14 @@ mod storage_tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+        let stored_user_id: i64 = sqlx::query_scalar(
+            "SELECT user_id FROM memories WHERE character_id=? AND json_extract(metadata, '$.source_message_id')=9001",
+        )
+        .bind(character_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored_user_id, user_id);
         assert!(
             memory_repo
                 .find_by_character_id(character_id, None, 10)
