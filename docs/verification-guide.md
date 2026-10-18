@@ -58,6 +58,7 @@
 - 回复处理：`src/application/reply_processor.rs`。核对角色绑定/停用、连续消息批次、当前消息只出现一次、生成落库、发送前复核和 unknown 状态。
 - 上下文：`src/application/context_assembler.rs`、`src/application/character_history.rs`。核对硬约束、角色卡、动态状态、可见记忆、历史、当前批次和预算降级顺序。
 - 参与决策：`src/application/decision_orchestrator.rs`、`src/application/decision_pipeline.rs`、`src/application/behavior_engine.rs`。核对明确 @、普通群消息、静默和决策模型失败回退。
+- LLM 备用链：运行 `capabilities_for_uses_smallest_model_in_fallback_chain` 与 `capabilities_for_ignores_fallbacks_beyond_attempt_limit`，确认上下文能力只覆盖本次可能尝试的模型。
 - 记忆与关系：`src/application/memory_service.rs`、`src/application/cognition_driver.rs`、`src/infrastructure/storage/repository/memory_repository.rs`、`relationship_repository.rs`。核对候选/正式记忆、会话可见范围、稳定用户身份和幂等交互。
 - 控制协议与 ctl：`src/application/control_schema.rs`、`src/application/control.rs`、`src/bin/yomua-bot-ctl.rs`。核对一段、二段、三段命令，帮助文本，中文错误，危险命令确认和 unknown 查询/重试。
 - 插件：`src/infrastructure/plugin/manifest.rs`、`registry.rs`、`transport.rs`、`supervisor.rs`。核对握手归属、订阅权限、失败隔离、任务退出和核心状态写保护。

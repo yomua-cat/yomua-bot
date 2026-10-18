@@ -353,11 +353,14 @@ impl LlmScheduler for DefaultLlmScheduler {
         role: &str,
     ) -> Option<crate::infrastructure::llm::FixedModelCapabilities> {
         let route = self.routes.as_ref()?.get(role)?;
-        let context_window = route.models.iter().try_fold(None, |minimum, model| {
+        // 能力必须与本次实际可能尝试的模型一致。未启用的备用模型不应
+        // 无谓压缩上下文，也不应让主模型已有的能力退化为未知。
+        let mut models = route.models.iter().take(route.max_attempts);
+        let context_window = models.clone().try_fold(None, |minimum, model| {
             let value = model.context_window?;
             Some(Some(minimum.unwrap_or(value).min(value)))
         })?;
-        let max_output_tokens = route.models.iter().try_fold(None, |minimum, model| {
+        let max_output_tokens = models.try_fold(None, |minimum, model| {
             let value = model.max_output_tokens?;
             Some(Some(minimum.unwrap_or(value).min(value)))
         })?;
@@ -1073,5 +1076,44 @@ mod tests {
             .expect("应返回备用链能力");
         assert_eq!(capabilities.context_window, Some(8_192));
         assert_eq!(capabilities.max_output, Some(512));
+    }
+
+    #[test]
+    fn capabilities_for_ignores_fallbacks_beyond_attempt_limit() {
+        let provider = Arc::new(FakeProvider::new(false, "provider"));
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "provider".to_string(),
+            provider.clone() as Arc<dyn LlmProvider>,
+        );
+        let routes = std::collections::HashMap::from([(
+            "conversation".to_string(),
+            LlmRouteConfig {
+                models: vec![
+                    crate::application::config::LlmModelInstanceConfig {
+                        provider: "provider".into(),
+                        model: "primary".into(),
+                        context_window: Some(32_768),
+                        max_output_tokens: Some(2_048),
+                    },
+                    crate::application::config::LlmModelInstanceConfig {
+                        provider: "provider".into(),
+                        model: "unused-backup".into(),
+                        context_window: Some(8_192),
+                        max_output_tokens: Some(512),
+                    },
+                ],
+                max_attempts: 1,
+                budget_tokens: None,
+            },
+        )]);
+        let scheduler =
+            DefaultLlmScheduler::with_provider_routes(provider, 2, 2, providers, routes);
+
+        let capabilities = scheduler
+            .capabilities_for("conversation")
+            .expect("主模型能力应可用");
+        assert_eq!(capabilities.context_window, Some(32_768));
+        assert_eq!(capabilities.max_output, Some(2_048));
     }
 }
