@@ -778,8 +778,10 @@ mod tests {
             &mut h,
             DecisionResult {
                 action: DecisionAction::SuggestIgnore,
-                reasoning: Some("本轮先不主动发言".to_string()),
                 confidence: Some(0.9),
+                questions: Vec::new(),
+                probabilities: std::collections::BTreeMap::new(),
+                model_version: "test".to_string(),
             },
         );
 

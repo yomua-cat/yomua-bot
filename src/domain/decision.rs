@@ -6,6 +6,7 @@
 //! - Built-in Decision 完整保留 6 字段，LLM 全部失败时精确恢复
 //! - Decision LLM 是 advisory override，不是主行为引擎
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -419,12 +420,25 @@ impl LlmAssistanceTrigger for HeuristicTrigger {
 pub struct DecisionResult {
     /// 建议的动作 override。
     pub action: DecisionAction,
-    /// LLM 的推理说明（仅用于日志/审计，不用于执行业务逻辑）。
-    #[serde(default)]
-    pub reasoning: Option<String>,
-    /// LLM 自我报告的置信度（0.0-1.0），仅用于监控。
-    #[serde(default)]
+    /// 每个 typed question 的原始答案，供审计和回放使用。
+    pub questions: Vec<DecisionQuestionResult>,
+    /// 聚合后的动作概率。
+    pub probabilities: BTreeMap<String, f64>,
+    /// 所有必需问题通过后的保守置信度。
     pub confidence: Option<f64>,
+    /// Provider 返回的模型版本。
+    pub model_version: String,
+}
+
+/// TypeSafe 问题的结构化答案。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionQuestionResult {
+    pub name: String,
+    pub question_type: String,
+    pub value: serde_json::Value,
+    #[serde(default)]
+    pub probabilities: BTreeMap<String, f64>,
+    pub confidence: f64,
 }
 
 /// Decision LLM 可以建议的动作 override。
@@ -447,8 +461,10 @@ impl DecisionResult {
     pub fn keep() -> Self {
         Self {
             action: DecisionAction::Keep,
-            reasoning: None,
-            confidence: None,
+            questions: Vec::new(),
+            probabilities: BTreeMap::new(),
+            confidence: Some(1.0),
+            model_version: "builtin".to_string(),
         }
     }
 }
@@ -520,6 +536,7 @@ pub struct DecisionResultValidator {
     max_delay: u64,
     /// 最大允许的 confidence。
     max_confidence: f64,
+    min_confidence: f64,
 }
 
 impl DecisionResultValidator {
@@ -528,6 +545,7 @@ impl DecisionResultValidator {
             max_delay_delta,
             max_delay,
             max_confidence: 1.0,
+            min_confidence: 0.65,
         }
     }
 
@@ -582,13 +600,74 @@ impl DecisionResultValidator {
             });
         }
 
-        // 3. confidence 范围
-        if let Some(c) = result.confidence {
-            if !(0.0..=self.max_confidence).contains(&c) {
+        if let DecisionAction::SuggestReply = result.action {
+            let allowed = match context.situation {
+                DecisionSituation::Proactive => false,
+                DecisionSituation::Response { is_mentioned, .. } => {
+                    context.behavior_config.has_binding
+                        && !context.behavior_config.in_mute_window
+                        && (is_mentioned
+                            || context.behavior_config.reply_mode
+                                != crate::domain::character::ReplyMode::MentionOnly)
+                }
+            };
+            if !allowed {
                 errors.push(ValidationError {
-                    field: "confidence".to_string(),
-                    expected: format!("0.0 ≤ confidence ≤ {}", self.max_confidence),
-                    actual: c.to_string(),
+                    field: "action".to_string(),
+                    expected: "reply must satisfy binding, mute and reply-mode constraints"
+                        .to_string(),
+                    actual: "SuggestReply".to_string(),
+                });
+            }
+        }
+        if let DecisionAction::SuggestIgnore = result.action {
+            if matches!(
+                context.situation,
+                DecisionSituation::Response {
+                    is_mentioned: true,
+                    ..
+                }
+            ) {
+                errors.push(ValidationError {
+                    field: "action".to_string(),
+                    expected: "explicitly mentioned messages cannot be ignored".to_string(),
+                    actual: "SuggestIgnore".to_string(),
+                });
+            }
+        }
+
+        // 3. confidence 与 typed question 完整性
+        if result
+            .confidence
+            .is_some_and(|confidence| !(0.0..=self.max_confidence).contains(&confidence))
+        {
+            errors.push(ValidationError {
+                field: "confidence".to_string(),
+                expected: format!("0.0 ≤ confidence ≤ {}", self.max_confidence),
+                actual: result.confidence.unwrap_or_default().to_string(),
+            });
+        }
+        if !matches!(result.action, DecisionAction::Keep)
+            && result.confidence.unwrap_or_default() < self.min_confidence
+        {
+            errors.push(ValidationError {
+                field: "confidence".to_string(),
+                expected: format!("confidence ≥ {}", self.min_confidence),
+                actual: result.confidence.unwrap_or_default().to_string(),
+            });
+        }
+        if !matches!(result.action, DecisionAction::Keep) {
+            let constraints_probability = result
+                .questions
+                .iter()
+                .find(|question| question.name == "hard_constraints")
+                .and_then(|question| question.value.as_f64())
+                .unwrap_or(0.0);
+            if constraints_probability < 0.9 {
+                errors.push(ValidationError {
+                    field: "hard_constraints".to_string(),
+                    expected: "noul probability ≥ 0.9".to_string(),
+                    actual: constraints_probability.to_string(),
                 });
             }
         }
@@ -684,15 +763,13 @@ You analyze the current situation and provide an ADVISORY decision override to t
 - "adjust_delay": Adjust the built-in's delay by adding delta_ms (can be negative to reduce delay).
 
 ## Output Format (JSON)
-Respond with ONLY a valid JSON object. `action` must be one of `keep`, `suggest_reply`, `suggest_ignore`, or `adjust_delay`. For `adjust_delay`, provide integer `delay_delta_ms`; for other actions it may be omitted. Example:
-{"action":"adjust_delay","delay_delta_ms":500,"reasoning":"A short pause is appropriate.","confidence":0.8}
+The provider receives typed questions and must answer them structurally. Never emit a chat completion object or free-form explanation.
 
 ## Decision Rules
 - "keep" should be used when the built-in decision is already optimal.
 - "suggest_reply" / "suggest_ignore" should be used sparingly and with strong justification.
 - "adjust_delay" delay_delta_ms must be between -5000 and +5000 milliseconds.
 - When the situation is "Proactive", only "keep" and "suggest_ignore" are allowed. Do not suggest a reply or delay change.
-- "reasoning" should briefly explain your override rationale (1-3 sentences).
 - NEVER suggest actions that would violate hard constraints (no binding, muted context, etc.).
 
 ## Strict Prohibitions
@@ -720,46 +797,98 @@ Respond with ONLY a valid JSON object. `action` must be one of `keep`, `suggest_
     }
 
     fn parse_response_content(content: &str) -> Result<DecisionResult, DecisionFailure> {
-        // 尝试解析为严格结构
         let raw: serde_json::Value =
             serde_json::from_str(content).map_err(|e| DecisionFailure::JsonParse(e.to_string()))?;
-
-        // Jev 返回 answers.action.choice；先转换为现有 DecisionResult，再复用同一验证器。
-        let (raw, jev_confidence) = if raw.get("answers").is_some() {
-            let answer = raw
-                .get("answers")
-                .and_then(|answers| answers.get("action"))
-                .ok_or_else(|| {
-                    DecisionFailure::SchemaValidation("Jev 响应缺少 answers.action".into())
-                })?;
-            let choice = answer
-                .get("choice")
+        let model_version = raw
+            .get("model")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let answers = raw
+            .get("answers")
+            .and_then(|value| value.as_object())
+            .ok_or_else(|| DecisionFailure::SchemaValidation("Jev 响应缺少 answers 对象".into()))?;
+        let mut questions = Vec::with_capacity(answers.len());
+        let mut probabilities = BTreeMap::new();
+        let mut confidence = 1.0_f64;
+        for (name, answer) in answers {
+            let question_type = answer
+                .get("type")
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| {
-                    DecisionFailure::SchemaValidation("Jev action 不是 choice 题答案".into())
+                    DecisionFailure::SchemaValidation(format!("answers.{name} 缺少 type"))
                 })?;
-            let confidence = answer.get("confidence").and_then(|value| value.as_f64());
-            (serde_json::json!({"action": choice}), confidence)
-        } else {
-            (raw, None)
-        };
-
-        // 提取 action
-        let action_str = raw.get("action").and_then(|v| v.as_str()).ok_or_else(|| {
-            DecisionFailure::SchemaValidation("missing or non-string 'action'".to_string())
-        })?;
+            let value = match question_type {
+                "choice" => answer.get("choice").cloned().ok_or_else(|| {
+                    DecisionFailure::SchemaValidation(format!("answers.{name} 缺少 choice"))
+                })?,
+                "score" => answer.get("score").cloned().ok_or_else(|| {
+                    DecisionFailure::SchemaValidation(format!("answers.{name} 缺少 score"))
+                })?,
+                "noul" => answer
+                    .get("noul")
+                    .or_else(|| answer.get("allowed"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Number(serde_json::Number::from(0))),
+                other => {
+                    return Err(DecisionFailure::SchemaValidation(format!(
+                        "answers.{name} 使用不支持的问题类型 {other}"
+                    )))
+                }
+            };
+            let question_confidence = answer
+                .get("confidence")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(1.0);
+            confidence = confidence.min(question_confidence);
+            if let Some(raw_probabilities) = answer
+                .get("probabilities")
+                .and_then(|value| value.as_object())
+            {
+                for (key, probability) in raw_probabilities {
+                    if let Some(probability) = probability.as_f64() {
+                        probabilities.insert(format!("{name}:{key}"), probability);
+                    }
+                }
+            }
+            questions.push(DecisionQuestionResult {
+                name: name.clone(),
+                question_type: question_type.to_string(),
+                value,
+                probabilities: answer
+                    .get("probabilities")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+                    .unwrap_or_default(),
+                confidence: question_confidence,
+            });
+        }
+        let action_str = answers
+            .get("action")
+            .and_then(|answer| answer.get("choice"))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                DecisionFailure::SchemaValidation("answers.action.choice 缺失".into())
+            })?;
 
         let action = match action_str {
             "keep" => DecisionAction::Keep,
             "suggest_reply" => DecisionAction::SuggestReply,
             "suggest_ignore" => DecisionAction::SuggestIgnore,
             "adjust_delay" => {
-                let delta = raw
+                let delta = answers
                     .get("delay_delta_ms")
-                    .and_then(|v| v.as_i64())
+                    .and_then(|answer| answer.get("score"))
+                    .and_then(|value| value.as_i64())
+                    .or_else(|| {
+                        answers
+                            .get("delay_delta_ms")
+                            .and_then(|answer| answer.get("score"))
+                            .and_then(|value| value.as_f64())
+                            .map(|value| value.round() as i64)
+                    })
                     .ok_or_else(|| {
                         DecisionFailure::SchemaValidation(
-                            "adjust_delay requires integer 'delay_delta_ms'".to_string(),
+                            "adjust_delay requires score question delay_delta_ms".to_string(),
                         )
                     })?;
                 DecisionAction::AdjustDelay { delta_ms: delta }
@@ -771,20 +900,12 @@ Respond with ONLY a valid JSON object. `action` must be one of `keep`, `suggest_
             }
         };
 
-        let reasoning = raw
-            .get("reasoning")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        let confidence = raw
-            .get("confidence")
-            .and_then(|v| v.as_f64())
-            .or(jev_confidence);
-
         Ok(DecisionResult {
             action,
-            reasoning,
-            confidence,
+            questions,
+            probabilities,
+            confidence: Some(confidence),
+            model_version,
         })
     }
 }
@@ -821,11 +942,10 @@ impl DecisionLlmService for DecisionLlmServiceImpl {
         if is_proactive {
             criteria.remove("suggest_reply");
         }
-        let typesafe_request = serde_json::json!({
-            "state": state,
-            "model": "jev-latest",
-            "questions": {
-                "action": {
+        let mut questions = serde_json::Map::from_iter([
+            (
+                "action".into(),
+                serde_json::json!({
                     "type": "choice",
                     "instructions": if is_proactive {
                         "规则允许主动行为。请选择保留本次主动行为，或取消本次主动行为。"
@@ -833,8 +953,31 @@ impl DecisionLlmService for DecisionLlmServiceImpl {
                         "请在不违反程序硬约束的前提下，选择保留规则决定、建议回复或建议忽略。"
                     },
                     "criteria": criteria,
-                }
-            }
+                }),
+            ),
+            (
+                "hard_constraints".into(),
+                serde_json::json!({
+                    "type": "noul",
+                    "instructions": "只有确认该建议不违反绑定、静默、提及和主动行为硬约束时才通过。"
+                }),
+            ),
+        ]);
+        if matches!(ctx.situation, DecisionSituation::Response { .. }) {
+            questions.insert(
+                "delay_delta_ms".into(),
+                serde_json::json!({
+                    "type": "score",
+                    "instructions": "若 action=adjust_delay，给出 -5000 到 5000 的整数毫秒变化；否则给 0。",
+                    "min": -5000,
+                    "max": 5000,
+                }),
+            );
+        }
+        let typesafe_request = serde_json::json!({
+            "state": state,
+            "model": "jev-latest",
+            "questions": questions,
         });
         let request = crate::infrastructure::llm::LlmRequest {
             system: Some(system),
@@ -873,11 +1016,20 @@ mod tests {
     #[test]
     fn parses_jev_choice_answer() {
         let result = DecisionLlmServiceImpl::parse_response_content(
-            r#"{"model":"jev-1.13.0","answers":{"action":{"type":"choice","choice":"suggest_ignore","probabilities":{"keep":0.1,"suggest_ignore":0.9},"confidence":0.8}},"usage":{"input_tokens":10,"output_tokens":4}}"#,
+            r#"{"model":"jev-1.13.0","answers":{"action":{"type":"choice","choice":"suggest_ignore","probabilities":{"keep":0.1,"suggest_ignore":0.9},"confidence":0.8},"hard_constraints":{"type":"noul","noul":0.99},"delay_delta_ms":{"type":"score","score":0,"confidence":1.0}},"usage":{"input_tokens":10,"output_tokens":4}}"#,
         )
         .unwrap();
         assert_eq!(result.action, DecisionAction::SuggestIgnore);
         assert_eq!(result.confidence, Some(0.8));
+        assert_eq!(result.model_version, "jev-1.13.0");
+        assert_eq!(result.probabilities["action:suggest_ignore"], 0.9);
+        assert_eq!(result.questions.len(), 3);
+        assert!(result
+            .questions
+            .iter()
+            .find(|question| question.name == "hard_constraints")
+            .and_then(|question| question.value.as_f64())
+            .is_some_and(|probability| probability >= 0.9));
     }
 
     #[test]

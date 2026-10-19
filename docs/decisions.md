@@ -20,3 +20,7 @@
 - Jev 接入采用 TypeSafe System One 的单次 `state + choice` 裁决；废弃此前未实现的“分级会议”路线。Jev 只返回动作选择和置信度，超时、预算和备用链继续由统一调度器处理。影响：LLM Provider、决策服务、配置和验收文档。来源：2026-10-18 Jev 适配调查会话。
 - 主动行为的静默时段和每日额度按可配置 UTC 小时偏移解释，默认 `+8`（北京时间）；`reload-config` 后后续决策立即使用新偏移。影响：运行时配置、行为引擎、主动驱动、行为状态仓储和配置文档。来源：2026-10-18 主会话阶段讨论。
 - 插件继续使用现有 Unix socket + MessagePack 传输；本阶段只稳定 API、协议 DTO、错误码和测试，不新增 TCP、TLS 或 WebSocket 传输方式。影响：插件协议、传输层、插件文档和部署约束。来源：2026-10-18 主会话阶段讨论。
+
+## 2026-10-19
+
+- Jev 决策不再保留旧的聊天 JSON 兼容层，直接采用 TypeSafe typed questions 作为唯一决策协议；同一 state 发送 action choice、hard_constraints noul 和普通回复的 delay_delta_ms score，结果保留问题答案、概率、聚合置信度和模型版本。影响：DecisionResult、决策解析、验证器、TypeSafe 请求装配、主动行为和决策文档。来源：2026-10-19 主会话确认。

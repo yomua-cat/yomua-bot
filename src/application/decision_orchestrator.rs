@@ -457,8 +457,10 @@ mod tests {
             DecisionLlmPipeline::new(Arc::new(FailingDecisionLlmService), None, validator, policy)
                 .with_override_result(DecisionResult {
                     action: DecisionAction::SuggestIgnore,
-                    reasoning: None,
                     confidence: None,
+                    questions: Vec::new(),
+                    probabilities: std::collections::BTreeMap::new(),
+                    model_version: "test".to_string(),
                 }),
         );
         let orchestrator = DecisionOrchestrator::new(evaluator, trigger, Some(pipeline));
@@ -496,8 +498,10 @@ mod tests {
             )
             .with_override_result(DecisionResult {
                 action: DecisionAction::SuggestReply,
-                reasoning: Some("模型建议参与".to_string()),
                 confidence: Some(0.99),
+                questions: Vec::new(),
+                probabilities: std::collections::BTreeMap::new(),
+                model_version: "test".to_string(),
             }),
         );
         let orchestrator = DecisionOrchestrator::new(evaluator, trigger, Some(pipeline));
@@ -533,8 +537,10 @@ mod tests {
             )
             .with_override_result(DecisionResult {
                 action: DecisionAction::SuggestReply,
-                reasoning: None,
                 confidence: None,
+                questions: Vec::new(),
+                probabilities: std::collections::BTreeMap::new(),
+                model_version: "test".to_string(),
             }),
         );
         let orchestrator = DecisionOrchestrator::new(evaluator, trigger, Some(pipeline));
@@ -611,8 +617,10 @@ mod tests {
             )
             .with_override_result(DecisionResult {
                 action: DecisionAction::SuggestIgnore,
-                reasoning: Some("本轮先不主动发言".to_string()),
                 confidence: Some(0.9),
+                questions: Vec::new(),
+                probabilities: std::collections::BTreeMap::new(),
+                model_version: "test".to_string(),
             }),
         );
         let orchestrator =
@@ -635,8 +643,10 @@ mod tests {
             ) -> Result<DecisionResult, DecisionFailure> {
                 Ok(DecisionResult {
                     action: DecisionAction::AdjustDelay { delta_ms: i64::MIN },
-                    reasoning: None,
                     confidence: None,
+                    questions: Vec::new(),
+                    probabilities: std::collections::BTreeMap::new(),
+                    model_version: "test".to_string(),
                 })
             }
 
@@ -677,8 +687,10 @@ mod tests {
             ) -> Result<DecisionResult, DecisionFailure> {
                 Ok(DecisionResult {
                     action: DecisionAction::AdjustDelay { delta_ms: 500 },
-                    reasoning: None,
                     confidence: None,
+                    questions: Vec::new(),
+                    probabilities: std::collections::BTreeMap::new(),
+                    model_version: "test".to_string(),
                 })
             }
 
@@ -804,8 +816,10 @@ mod tests {
                     action: DecisionAction::AdjustDelay {
                         delta_ms: 1_000_000, // way over max
                     },
-                    reasoning: None,
                     confidence: None,
+                    questions: Vec::new(),
+                    probabilities: std::collections::BTreeMap::new(),
+                    model_version: "test".to_string(),
                 })
             }
             fn name(&self) -> &str {
@@ -846,8 +860,10 @@ mod tests {
             DecisionLlmPipeline::new(Arc::new(FailingDecisionLlmService), None, validator, policy)
                 .with_override_result(DecisionResult {
                     action: DecisionAction::AdjustDelay { delta_ms: 500 },
-                    reasoning: Some("increase delay".to_string()),
                     confidence: Some(0.8),
+                    questions: Vec::new(),
+                    probabilities: std::collections::BTreeMap::new(),
+                    model_version: "test".to_string(),
                 }),
         );
         let orchestrator = DecisionOrchestrator::new(evaluator, trigger, Some(pipeline));
@@ -874,8 +890,10 @@ mod tests {
 
         let result = DecisionResult {
             action: DecisionAction::SuggestReply,
-            reasoning: None,
             confidence: None,
+            questions: Vec::new(),
+            probabilities: std::collections::BTreeMap::new(),
+            model_version: "test".to_string(),
         };
 
         let ctx = DecisionContext::from_input(
@@ -915,8 +933,10 @@ mod tests {
             ) -> Result<DecisionResult, DecisionFailure> {
                 Ok(DecisionResult {
                     action: DecisionAction::Keep,
-                    reasoning: None,
                     confidence: Some(1.5), // out of range
+                    questions: Vec::new(),
+                    probabilities: std::collections::BTreeMap::new(),
+                    model_version: "test".to_string(),
                 })
             }
             fn name(&self) -> &str {
@@ -986,8 +1006,10 @@ mod tests {
             DecisionLlmPipeline::new(Arc::new(FailingDecisionLlmService), None, validator, policy)
                 .with_override_result(DecisionResult {
                     action: DecisionAction::SuggestIgnore,
-                    reasoning: None,
                     confidence: None,
+                    questions: Vec::new(),
+                    probabilities: std::collections::BTreeMap::new(),
+                    model_version: "test".to_string(),
                 }),
         );
         let orchestrator = DecisionOrchestrator::new(evaluator, trigger, Some(pipeline));

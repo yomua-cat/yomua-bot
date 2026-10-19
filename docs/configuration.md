@@ -180,7 +180,7 @@ context_window = 8192
 max_output_tokens = 256
 ```
 
-`decision.toml` 的备用链同样共享本次请求的输出 token 上限，并只在网络错误、超时、HTTP 429、529 或 5xx 时切换。Jev 决策使用一个 `choice` 问题返回 `keep`、`suggest_reply` 或 `suggest_ignore`，程序把答案映射为现有 `DecisionResult`；主动情境只发送 `keep` 和 `suggest_ignore`。规则引擎和程序校验仍拥有最终裁决权。
+`decision.toml` 的备用链同样共享本次请求的输出 token 上限，并只在网络错误、超时、HTTP 429、529 或 5xx 时切换。Jev 决策使用同一 `state` 下的多个 typed questions：`action` 用 `choice` 选择动作，`hard_constraints` 用 `noul` 返回硬约束成立概率（至少 0.9 才允许 override），普通回复额外用 `score` 给出延迟变化。程序保留每个问题的原始值、概率、置信度和模型版本，聚合置信度后再执行验证；主动情境不会发送延迟问题，也只接受 `keep` 和 `suggest_ignore`。规则引擎和程序校验仍拥有最终裁决权。
 
 ## 修改与重载
 
