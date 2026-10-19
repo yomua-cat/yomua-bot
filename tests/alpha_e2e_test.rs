@@ -548,18 +548,24 @@ async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
 async fn p0_1_load_real_config() {
     let temp = tempfile::tempdir().unwrap();
 
-    // 写入真实 llm.toml（启用 + 配置）
+    // 写入真实格式的 llm.toml 配置。
     std::fs::write(
         temp.path().join("llm.toml"),
         r#"
 enabled = true
 
-[options]
+[providers.local]
+provider_type = "openai-compatible"
+base_url = "http://localhost:9999/v1"
+
+[model_instances.conversation]
+provider = "local"
+model = "test-model"
 context_window = 4096
 max_output_tokens = 512
-output_reservation = 512
-base_url = "http://localhost:9999/v1"
-model = "test-model"
+
+[roles.conversation]
+model_instance = "conversation"
 "#,
     )
     .unwrap();
@@ -567,18 +573,14 @@ model = "test-model"
     let cfg = load_llm(temp.path().join("llm.toml").to_str().unwrap()).unwrap();
     assert!(cfg.enabled);
     assert_eq!(
-        cfg.options.get("model").and_then(|v| v.as_str()),
-        Some("test-model")
-    );
-    assert_eq!(
-        cfg.options.get("context_window").and_then(|v| v.as_u64()),
-        Some(4096)
+        cfg.resolve().unwrap().unwrap().conversation_model().model,
+        "test-model"
     );
 
     println!(
         "[P0-1] ✅ 真实配置加载: enabled={}, model={}",
         cfg.enabled,
-        cfg.options.get("model").and_then(|v| v.as_str()).unwrap()
+        cfg.resolve().unwrap().unwrap().conversation_model().model
     );
 }
 

@@ -24,7 +24,7 @@ use crate::infrastructure::llm::{LlmMessage, LlmRequest, LlmRole};
 #[derive(Debug, thiserror::Error)]
 pub enum ContextAssemblyError {
     /// 无法确定模型的 context_window，无法执行 budget 控制。
-    #[error("无法确定模型的 context_window。请在 llm.toml [options] 中配置 context_window。")]
+    #[error("无法确定模型的 context_window。请在 llm.toml [model_instances.<name>] 中配置 context_window。")]
     UnknownContextWindow,
 
     /// output_reservation >= context_window，预算配置无效。

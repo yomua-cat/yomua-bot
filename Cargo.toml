@@ -2,7 +2,7 @@
 
 [package]
 name = "yomua-bot"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Character Runtime / Character Agent Framework"
 license = "MIT"

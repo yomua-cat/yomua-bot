@@ -89,6 +89,6 @@ sqlite3 /absolute/path/to/yomua-data/runtime.db \
 | 已连接但不回复 | 角色绑定、角色参与者记录、Outbox payload、行为决策与模型错误 |
 | `无法连接到 control socket` | 主进程状态、数据目录、socket 权限或控制服务错误日志 |
 | 插件启动失败 | 绝对目录、可执行文件、权限、socket 路径长度及握手日志 |
-| 模型上下文组装失败 | `[options].context_window`、输出预留及实际 token 预算 |
+| 模型上下文组装失败 | `[model_instances.<name>].context_window`、模型输出上限及对应 Role 的实际 token 预算 |
 
 真实 QQ 收发、外部模型、故障恢复和长期运行仍需独立验收，具体记录见[项目现状](status.md)。

@@ -170,7 +170,6 @@ fn build_provider_from_config(
     )?))
 }
 
-/// 从单 Provider `options` JSON 构建 Provider（当前单 Provider 配置）。
 /// 运行时 CLI 帮助文本。
 const RUNTIME_HELP: &str = r#"yomua-bot —— Character Runtime
 

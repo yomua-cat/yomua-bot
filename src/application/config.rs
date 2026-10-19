@@ -204,56 +204,29 @@ pub struct DecisionConfig {
     pub budget_tokens: Option<u32>,
 }
 
-/// LLM 配置。
-///
-/// 支持两种格式：
-/// 1. 旧格式（仅 `[options]`）：当前单 Provider 配置，单一 Provider 用于 Conversation
-/// 2. 新格式（`providers` + `roles`）：多 Provider + 多 Role 路由
-///
-/// 当 `providers` 存在时，`options` 仅作当前单 Provider 配置用（无 providers 时 fallback）；
-/// 当 `roles` 存在时，`roles.conversation` 定义 Conversation Role 的默认配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// LLM 配置，统一使用 Provider、Model Instance 和 Role 三层路由结构。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LlmConfig {
     /// 是否启用 LLM。
     pub enabled: bool,
 
-    /// 【单 Provider 格式】优先使用的 Provider 名称（例如 "ollama"、"openai"）。
-    /// 仅在未配置多 Provider 时使用。
-    pub provider: Option<String>,
-
-    /// 【单 Provider 格式】提供给 Provider 的任意附加配置（base_url / api_key / model / timeout_secs）。
-    /// 仅在未配置多 Provider 时使用。
-    pub options: serde_json::Value,
-
-    /// 【新格式】Provider 注册表。key 为 Provider 名称。
+    /// Provider 注册表。key 为 Provider 名称。
     /// 示例: { "zhipu": { "provider_type": "openai-compatible", "base_url": "...", ... } }
     #[serde(default)]
     pub providers: std::collections::HashMap<String, LlmProviderConfig>,
 
-    /// 【新格式】Model Instance 注册表。key 为 Model Instance 名称。
+    /// Model Instance 注册表。key 为 Model Instance 名称。
     /// 示例: { "charglm-4": { provider = "zhipu", model = "charglm-4", context_window = 4096, ... } }
     /// 一个 Model Instance 可被多个 Role 引用，实现真正的"同一模型，多个调用方"。
     #[serde(default)]
     pub model_instances: std::collections::HashMap<String, LlmModelInstanceConfig>,
 
-    /// 【新格式】Role → Model Instance 配置映射。
+    /// Role → Model Instance 配置映射。
     /// key 为 Role 名称（如 "conversation"、"cognition"）。决策模型单独配置在 decision.toml。
     /// Role 配置引用 `model_instances` 中已注册的 Model Instance。
     #[serde(default)]
     pub roles: std::collections::HashMap<String, LlmRoleConfig>,
-}
-
-impl Default for LlmConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            provider: None,
-            options: serde_json::json!({}),
-            providers: std::collections::HashMap::new(),
-            model_instances: std::collections::HashMap::new(),
-            roles: std::collections::HashMap::new(),
-        }
-    }
 }
 
 /// 已校验并展开的模型路由，启动装配只使用这一份结果。
@@ -286,149 +259,64 @@ impl LlmConfig {
         if !self.enabled {
             return Ok(None);
         }
-        let mut providers = self.providers.clone();
+        let providers = self.providers.clone();
         let mut roles = HashMap::new();
         let mut routes = HashMap::new();
         if providers.is_empty() {
-            if !self.roles.is_empty() || !self.model_instances.is_empty() {
-                return Err(RuntimeError::Config("模型实例配置缺少 providers".into()));
+            return Err(RuntimeError::Config(
+                "启用模型时必须配置 providers、model_instances 和 roles.conversation".into(),
+            ));
+        }
+        for (role, config) in &self.roles {
+            if !["conversation", "cognition"].contains(&role.as_str()) {
+                return Err(RuntimeError::Config(format!("未知的模型任务角色：{role}")));
             }
             let model = self
-                .options
-                .get("model")
-                .and_then(|v| v.as_str())
-                .filter(|v| !v.trim().is_empty())
-                .ok_or_else(|| RuntimeError::Config("启用模型时必须设置 options.model".into()))?;
-            let explicit_kind = self
-                .provider
-                .as_deref()
-                .or_else(|| self.options.get("provider_type").and_then(|v| v.as_str()));
-            let base_url = self
-                .options
-                .get("base_url")
-                .and_then(|v| v.as_str())
-                .unwrap_or(if explicit_kind == Some("ollama") {
-                    "http://127.0.0.1:11434/v1"
-                } else {
-                    "https://api.openai.com/v1"
-                });
-            let kind = self
-                .provider
-                .as_deref()
-                .or_else(|| self.options.get("provider_type").and_then(|v| v.as_str()))
-                .unwrap_or(if base_url.contains("typesafe.ai") {
-                    "typesafe"
-                } else {
-                    "openai-compatible"
-                });
-            if !["openai-compatible", "openai", "ollama", "typesafe"].contains(&kind) {
+                .model_instances
+                .get(&config.model_instance)
+                .ok_or_else(|| {
+                    RuntimeError::Config(format!(
+                        "任务 {role} 引用的模型实例不存在：{}",
+                        config.model_instance
+                    ))
+                })?;
+            roles.insert(role.clone(), model.clone());
+
+            let mut models = vec![model.clone()];
+            let mut seen = std::collections::HashSet::from([config.model_instance.clone()]);
+            for fallback_name in &config.fallback_model_instances {
+                if !seen.insert(fallback_name.clone()) {
+                    return Err(RuntimeError::Config(format!(
+                        "任务 {role} 的备用模型重复引用：{fallback_name}"
+                    )));
+                }
+                let fallback = self.model_instances.get(fallback_name).ok_or_else(|| {
+                    RuntimeError::Config(format!(
+                        "任务 {role} 引用的备用模型实例不存在：{fallback_name}"
+                    ))
+                })?;
+                models.push(fallback.clone());
+            }
+            let max_attempts = config.max_attempts.unwrap_or(models.len());
+            if max_attempts == 0 || max_attempts > models.len() {
                 return Err(RuntimeError::Config(format!(
-                    "不支持的模型 Provider：{kind}"
+                    "任务 {role} 的 max_attempts 必须在 1 到 {} 之间",
+                    models.len()
                 )));
             }
-            providers.insert(
-                "default".into(),
-                LlmProviderConfig {
-                    provider_type: kind.into(),
-                    base_url: base_url.into(),
-                    api_key: self
-                        .options
-                        .get("api_key")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned),
-                    embedding_model: self
-                        .options
-                        .get("embedding_model")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned),
-                    timeout_secs: self.options.get("timeout_secs").and_then(|v| v.as_u64()),
-                },
-            );
-            let capability = |name: &str| -> Result<Option<usize>, RuntimeError> {
-                self.options
-                    .get(name)
-                    .map(|v| {
-                        v.as_u64()
-                            .and_then(|v| usize::try_from(v).ok())
-                            .ok_or_else(|| {
-                                RuntimeError::Config(format!("options.{name} 必须为正整数"))
-                            })
-                    })
-                    .transpose()
-            };
-            roles.insert(
-                "conversation".into(),
-                LlmModelInstanceConfig {
-                    provider: "default".into(),
-                    model: model.into(),
-                    context_window: capability("context_window")?,
-                    max_output_tokens: capability("max_output_tokens")?,
-                },
-            );
-            routes.insert(
-                "conversation".into(),
-                ResolvedLlmRoute {
-                    models: vec![roles["conversation"].clone()],
-                    max_attempts: 1,
-                    budget_tokens: self
-                        .options
-                        .get("budget_tokens")
-                        .and_then(|v| v.as_u64())
-                        .and_then(|v| u32::try_from(v).ok()),
-                },
-            );
-        } else {
-            for (role, config) in &self.roles {
-                if !["conversation", "cognition"].contains(&role.as_str()) {
-                    return Err(RuntimeError::Config(format!("未知的模型任务角色：{role}")));
-                }
-                let model = self
-                    .model_instances
-                    .get(&config.model_instance)
-                    .ok_or_else(|| {
-                        RuntimeError::Config(format!(
-                            "任务 {role} 引用的模型实例不存在：{}",
-                            config.model_instance
-                        ))
-                    })?;
-                roles.insert(role.clone(), model.clone());
-
-                let mut models = vec![model.clone()];
-                let mut seen = std::collections::HashSet::from([config.model_instance.clone()]);
-                for fallback_name in &config.fallback_model_instances {
-                    if !seen.insert(fallback_name.clone()) {
-                        return Err(RuntimeError::Config(format!(
-                            "任务 {role} 的备用模型重复引用：{fallback_name}"
-                        )));
-                    }
-                    let fallback = self.model_instances.get(fallback_name).ok_or_else(|| {
-                        RuntimeError::Config(format!(
-                            "任务 {role} 引用的备用模型实例不存在：{fallback_name}"
-                        ))
-                    })?;
-                    models.push(fallback.clone());
-                }
-                let max_attempts = config.max_attempts.unwrap_or(models.len());
-                if max_attempts == 0 || max_attempts > models.len() {
-                    return Err(RuntimeError::Config(format!(
-                        "任务 {role} 的 max_attempts 必须在 1 到 {} 之间",
-                        models.len()
-                    )));
-                }
-                if config.budget_tokens == Some(0) {
-                    return Err(RuntimeError::Config(format!(
-                        "任务 {role} 的 budget_tokens 必须大于 0"
-                    )));
-                }
-                routes.insert(
-                    role.clone(),
-                    ResolvedLlmRoute {
-                        models,
-                        max_attempts,
-                        budget_tokens: config.budget_tokens,
-                    },
-                );
+            if config.budget_tokens == Some(0) {
+                return Err(RuntimeError::Config(format!(
+                    "任务 {role} 的 budget_tokens 必须大于 0"
+                )));
             }
+            routes.insert(
+                role.clone(),
+                ResolvedLlmRoute {
+                    models,
+                    max_attempts,
+                    budget_tokens: config.budget_tokens,
+                },
+            );
         }
         let conversation = roles
             .get("conversation")
@@ -505,11 +393,6 @@ impl LlmConfig {
         }))
     }
 
-    /// 返回是否启用了多 Provider 模式（`providers` 非空）。
-    pub fn has_multi_provider(&self) -> bool {
-        !self.providers.is_empty()
-    }
-
     /// 返回是否配置了 Model Instance 注册表（`model_instances` 非空）。
     pub fn has_model_instances(&self) -> bool {
         !self.model_instances.is_empty()
@@ -522,8 +405,7 @@ impl LlmConfig {
 
     /// 获取 Conversation Role 引用的 Model Instance 配置。
     ///
-    /// 优先使用 `roles["conversation"]`；若不存在，
-    /// fallback 到旧格式的 `options`（backward compatible）。
+    /// 返回 Conversation Role 引用的 Model Instance。
     pub fn conversation_role_model_instance(&self) -> Option<&LlmModelInstanceConfig> {
         self.roles
             .get("conversation")
@@ -725,21 +607,8 @@ pub const LLM_TEMPLATE: &str = r#"# yomua-bot LLM 配置
 
 enabled = false
 
-# 首次发布支持单 Provider 模式，适合先跑通一条对话链路。
-# provider = "openai-compatible"
-
-# 启用后取消以下注释并替换全部占位值。
-[options]
-# model = "REPLACE_WITH_MODEL_NAME"
-# base_url = "https://api.example.invalid/v1"
-# api_key = "REPLACE_WITH_LLM_API_KEY"
-# embedding_model = "REPLACE_WITH_EMBEDDING_MODEL" # 可选；不配置则不使用向量增强
-# timeout_secs = 60
-# context_window = 8192
-# max_output_tokens = 1024
-# output_reservation = 1024
-
-# 多 Provider 配置示例：取消注释并填写后，可让对话和认知使用不同模型。
+# 启用后取消以下 Provider、Model Instance 和 Role 配置并替换全部占位值。
+# 同一 Provider 可以注册多个模型；对话和认知可分别路由。
 # 备用模型只在网络错误、超时、429 或 5xx 时尝试；400/401/响应格式错误不会盲目切换。
 # [providers.primary]
 # provider_type = "openai-compatible"
@@ -1176,18 +1045,54 @@ mod tests {
     }
 
     #[test]
+    fn llm_template_is_valid_when_disabled() {
+        let cfg: LlmConfig = toml::from_str(LLM_TEMPLATE).unwrap();
+        assert!(!cfg.enabled);
+        assert!(cfg.providers.is_empty());
+        assert!(cfg.model_instances.is_empty());
+        assert!(cfg.roles.is_empty());
+    }
+
+    #[test]
     fn llm_config_parses_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("llm.toml");
         fs::write(
             &path,
-            "enabled = true\nprovider = \"ollama\"\n[options]\nmodel = \"qwen2.5\"\n",
+            r#"enabled = true
+
+[providers.local]
+provider_type = "openai-compatible"
+base_url = "http://127.0.0.1:11434/v1"
+
+[model_instances.conversation]
+provider = "local"
+model = "qwen2.5"
+context_window = 8192
+max_output_tokens = 1024
+
+[roles.conversation]
+model_instance = "conversation"
+"#,
         )
         .unwrap();
         let cfg = load_llm(path.to_str().unwrap()).unwrap();
         assert!(cfg.enabled);
-        assert_eq!(cfg.provider.as_deref(), Some("ollama"));
-        assert_eq!(cfg.options["model"], "qwen2.5");
+        assert_eq!(
+            cfg.resolve().unwrap().unwrap().conversation_model().model,
+            "qwen2.5"
+        );
+    }
+
+    #[test]
+    fn llm_config_rejects_legacy_single_provider_fields() {
+        for legacy in [
+            "enabled = true\nprovider = \"ollama\"\n",
+            "enabled = true\n[options]\nmodel = \"qwen2.5\"\n",
+        ] {
+            let error = toml::from_str::<LlmConfig>(legacy).unwrap_err();
+            assert!(error.to_string().contains("unknown field"));
+        }
     }
 
     #[test]
@@ -1195,8 +1100,6 @@ mod tests {
         let cfg: LlmConfig = toml::from_str(
             r#"
 enabled = true
-
-[options]
 
 [providers.local]
 provider_type = "openai-compatible"
@@ -1219,28 +1122,6 @@ model_instance = "conversation"
             resolved
                 .providers
                 .get("local")
-                .and_then(|provider| provider.embedding_model.as_deref()),
-            Some("nomic-embed-text")
-        );
-    }
-
-    #[test]
-    fn legacy_options_embedding_model_is_preserved() {
-        let cfg: LlmConfig = toml::from_str(
-            r#"
-enabled = true
-provider = "ollama"
-[options]
-model = "qwen2.5"
-embedding_model = "nomic-embed-text"
-"#,
-        )
-        .unwrap();
-        let resolved = cfg.resolve().unwrap().expect("配置应启用");
-        assert_eq!(
-            resolved
-                .providers
-                .get("default")
                 .and_then(|provider| provider.embedding_model.as_deref()),
             Some("nomic-embed-text")
         );
@@ -1304,8 +1185,6 @@ max_output_tokens = 256
         let llm: LlmConfig = toml::from_str(
             r#"
 enabled = true
-
-[options]
 
 [providers.chat]
 provider_type = "openai-compatible"

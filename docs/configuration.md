@@ -8,7 +8,7 @@
 
 任一配置文件不存在时，常驻入口会在配置目录补齐缺失模板，然后以退出码 1 退出。模板中的 `admin_users = []` 必须修改；启用 OneBot 鉴权或 LLM 时也必须替换占位字段。配置文件全部存在后才会进行完整校验，不会因为缺少某一份文件而悄悄使用不完整默认值。
 
-文件存在时直接反序列化，缺少必要字段会报错，不是按字段逐项合并默认值。`llm.toml` 应保留 `[options]`，即使关闭 LLM 或使用多模型格式。
+文件存在时直接反序列化，缺少必要字段会报错，不是按字段逐项合并默认值。`llm.toml` 统一使用 Provider、Model Instance 和 Role 三层结构；旧版顶层 `provider` 与 `[options]` 会被拒绝，需要迁移到新结构。
 
 `data_dir` 和 `plugins_dir` 的相对路径基于进程工作目录，不基于配置目录。部署时建议使用绝对路径。控制客户端不读取 TOML，需要独立传入 `--data-dir` 或 `--socket`。
 
@@ -76,42 +76,14 @@ action_timeout_secs = 10
 
 ```toml
 enabled = false
-[options]
 ```
 
 LLM 关闭时保留入站消息，但不会伪造固定回复，也不发起模型请求。回复仍受角色绑定、参与者记录与行为判断约束。
-
-## llm.toml：单模型
-
-```toml
-enabled = true
-provider = "openai-compatible"
-
-[options]
-base_url = "https://llm.example.invalid/v1"
-api_key = "REPLACE_WITH_LLM_KEY"
-model = "REPLACE_WITH_MODEL_NAME"
-timeout_secs = 60
-# 示例预算值，必须按模型实际能力修改。
-context_window = 8192
-max_output_tokens = 1024
-output_reservation = 1024
-```
-
-`base_url` 是兼容 API 的根地址，Provider 会拼接 Chat Completions 路径。示例域名不可用于请求。省略时实现默认使用本地地址 `http://127.0.0.1:11434/v1`；模型名依次取 `options.model`、`provider` 或 `default-model`。建议显式填写，避免错误兜底。
-
-`context_window` 必须已知才能组装对话；`output_reservation` 默认 512，必须留出可用输入空间。服务端可用性、凭据及上下文窗口真实性需要单独验证。
 
 ## llm.toml：Provider 与对话模型
 
 ```toml
 enabled = true
-
-# 当前对话预算仍从这里读取。
-[options]
-context_window = 8192
-max_output_tokens = 1024
-output_reservation = 1024
 
 [providers.primary]
 provider_type = "openai-compatible"
@@ -157,7 +129,7 @@ Provider 登记连接地址、密钥、超时和可选的 `embedding_model`；�
 
 Grok 不需要专用代码。把 xAI 的 OpenAI-compatible 地址配置成一个 Provider，再为不同 Grok 模型各建一个 model instance 即可。
 
-model instance 中的能力字段用于该任务的上下文和输出限制；单 Provider 模式仍从 `[options]` 读取能力。不同任务使用不同模型时，应分别填写各 model instance 的能力，不要把决策模型的窗口当成对话模型窗口。
+每个 model instance 的能力字段用于上下文和输出限制；`budget_tokens`、备用实例和最大尝试数属于对应的 Role。不同任务使用不同模型时，应分别填写各 model instance 的能力，不要把决策模型的窗口当成对话模型窗口。
 
 ## decision.toml：独立决策模型
 
