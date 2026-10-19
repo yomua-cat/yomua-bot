@@ -634,6 +634,90 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use tokio::sync::mpsc;
 
+    #[tokio::test]
+    async fn onebot_connector_ignores_runtime_model_proxy_and_connects_directly() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let runtime_config = crate::application::config::RuntimeConfig {
+            proxy: Some(format!("http://{proxy_address}")),
+            ..crate::application::config::RuntimeConfig::default()
+        };
+
+        let proxy_server = tokio::spawn(async move {
+            let (mut stream, _) = proxy_listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            let request = String::from_utf8_lossy(&bytes)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            stream
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let second_connection =
+                tokio::time::timeout(Duration::from_millis(200), proxy_listener.accept())
+                    .await
+                    .is_ok();
+            (request, second_connection)
+        });
+
+        let client = crate::infrastructure::llm::build_http_client(
+            Duration::from_secs(1),
+            runtime_config.proxy.as_deref(),
+        )
+        .unwrap();
+        let proxy_response = client
+            .get("http://model-target.invalid/test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(proxy_response.status(), reqwest::StatusCode::BAD_GATEWAY);
+
+        let websocket_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let websocket_address = websocket_listener.local_addr().unwrap();
+        let websocket_server = tokio::spawn(async move {
+            let (stream, _) = websocket_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            websocket
+                .send(Message::Text("connected".into()))
+                .await
+                .unwrap();
+            websocket.next().await
+        });
+        let connector = TungsteniteConnector;
+        let mut transport = connector
+            .connect(&OneBotConfig {
+                websocket_url: format!("ws://{websocket_address}"),
+                ..OneBotConfig::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transport.read_text().await.unwrap().as_deref(),
+            Some("connected")
+        );
+        drop(transport);
+        let _ = websocket_server.await.unwrap();
+        let (proxy_request, proxy_received_onebot_connection) = proxy_server.await.unwrap();
+        assert!(proxy_request.starts_with("GET http://model-target.invalid/test "));
+        assert!(!proxy_received_onebot_connection);
+    }
+
     #[test]
     fn action_response_requires_ok_status_and_zero_retcode() {
         let mut response = ActionResponse {

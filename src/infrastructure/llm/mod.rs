@@ -11,6 +11,35 @@ use crate::error::RuntimeError;
 pub mod openai_compatible;
 pub mod typesafe;
 
+/// 创建仅供模型 Provider 使用的 HTTP 客户端；代理配置错误时拒绝启动。
+pub fn build_http_client(
+    timeout: std::time::Duration,
+    proxy_url: Option<&str>,
+) -> Result<reqwest::Client, RuntimeError> {
+    let mut builder = reqwest::Client::builder().timeout(timeout).no_proxy();
+    if let Some(proxy_url) = proxy_url {
+        let mut url = reqwest::Url::parse(proxy_url)
+            .map_err(|_| RuntimeError::Config("模型代理 URL 无效".into()))?;
+        let username = url.username().to_owned();
+        let password = url.password().map(str::to_owned);
+        if !username.is_empty() || password.is_some() {
+            url.set_username("")
+                .map_err(|_| RuntimeError::Config("模型代理 URL 无效".into()))?;
+            url.set_password(None)
+                .map_err(|_| RuntimeError::Config("模型代理 URL 无效".into()))?;
+        }
+        let mut proxy = reqwest::Proxy::all(url.as_str())
+            .map_err(|_| RuntimeError::Config("模型代理配置无效".into()))?;
+        if !username.is_empty() || password.is_some() {
+            proxy = proxy.basic_auth(&username, password.as_deref().unwrap_or(""));
+        }
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|_| RuntimeError::Config("构建模型 HTTP 客户端失败".into()))
+}
+
 // ---------------------------------------------------------------------------
 // Token 预算 / 模型能力
 // ---------------------------------------------------------------------------

@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use yomua_bot::application::config::{load_decision, DecisionConfig, LlmModelInstanceConfig};
+use yomua_bot::application::config::{
+    load_decision, load_runtime, validate_runtime, DecisionConfig, LlmModelInstanceConfig,
+};
 use yomua_bot::application::decision_orchestrator::DecisionOrchestrator;
 use yomua_bot::application::decision_pipeline::DecisionLlmPipeline;
 use yomua_bot::application::llm_scheduler::{DefaultLlmScheduler, LlmRouteConfig};
@@ -131,7 +133,10 @@ fn build_context(mode: ProbeMode) -> (DecisionContext, BuiltInDecision) {
     (context, BuiltInDecision::from_behavior(behavior))
 }
 
-fn build_scheduler(config: &DecisionConfig) -> Result<Arc<DefaultLlmScheduler>, String> {
+fn build_scheduler(
+    config: &DecisionConfig,
+    proxy: Option<&str>,
+) -> Result<Arc<DefaultLlmScheduler>, String> {
     let primary = config
         .primary
         .as_ref()
@@ -157,13 +162,19 @@ fn build_scheduler(config: &DecisionConfig) -> Result<Arc<DefaultLlmScheduler>, 
                 model.provider, provider_config.provider_type
             ));
         }
-        providers.entry(model.provider.clone()).or_insert_with(|| {
-            Arc::new(TypeSafeProvider::new(
+        if !providers.contains_key(&model.provider) {
+            let provider = TypeSafeProvider::new(
                 provider_config.base_url.clone(),
                 provider_config.api_key.clone(),
                 Duration::from_secs(provider_config.timeout_secs.unwrap_or(60)),
-            )) as Arc<dyn LlmProvider>
-        });
+                proxy,
+            )
+            .map_err(|error| error.to_string())?;
+            providers.insert(
+                model.provider.clone(),
+                Arc::new(provider) as Arc<dyn LlmProvider>,
+            );
+        }
     }
     let provider = providers
         .get(&primary.provider)
@@ -251,6 +262,18 @@ fn failure_kind(error: &DecisionFailure) -> &'static str {
 #[tokio::main]
 async fn main() {
     let (config_dir, mode) = main_args();
+    let runtime_path = std::path::Path::new(&config_dir).join("runtime.toml");
+    let runtime = match load_runtime(&runtime_path.display().to_string()) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("config_error={error}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(error) = validate_runtime(&runtime).into_iter().next() {
+        eprintln!("config_error={error}");
+        std::process::exit(1);
+    }
     let path = std::path::Path::new(&config_dir).join("decision.toml");
     let config = match load_decision(&path.display().to_string()) {
         Ok(config) => config,
@@ -259,7 +282,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let scheduler = match build_scheduler(&config) {
+    let scheduler = match build_scheduler(&config, runtime.proxy.as_deref()) {
         Ok(scheduler) => scheduler,
         Err(error) => {
             eprintln!("config_error={error}");

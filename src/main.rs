@@ -101,6 +101,7 @@ const DEFAULT_CONFIG_DIR: &str = "config";
 fn build_model_scheduler(
     config: &LlmConfig,
     decision_config: &DecisionConfig,
+    proxy: Option<&str>,
 ) -> Result<Option<Arc<DefaultLlmScheduler>>, RuntimeError> {
     let Some(mut resolved) = config.resolve()? else {
         return Ok(None);
@@ -108,7 +109,7 @@ fn build_model_scheduler(
     LlmConfig::apply_decision_config(&mut resolved, decision_config)?;
     let mut providers = std::collections::HashMap::new();
     for (name, config) in &resolved.providers {
-        let provider = build_provider_from_config(config)?;
+        let provider = build_provider_from_config(config, proxy)?;
         providers.insert(name.clone(), provider);
     }
     let default = providers
@@ -140,6 +141,7 @@ fn build_model_scheduler(
 /// 实际的 model 名称由 `LlmModelInstanceConfig.model` 指定，在路由时由 Scheduler 使用。
 fn build_provider_from_config(
     pc: &yomua_bot::application::config::LlmProviderConfig,
+    proxy: Option<&str>,
 ) -> Result<Arc<dyn LlmProvider>, RuntimeError> {
     let provider_type = pc.provider_type.as_str();
     if provider_type == "typesafe" {
@@ -147,7 +149,8 @@ fn build_provider_from_config(
             pc.base_url.clone(),
             pc.api_key.clone(),
             Duration::from_secs(pc.timeout_secs.unwrap_or(60)),
-        )));
+            proxy,
+        )?));
     }
     if provider_type != "openai-compatible" {
         return Err(RuntimeError::Config(format!(
@@ -163,7 +166,8 @@ fn build_provider_from_config(
             embedding_model: pc.embedding_model.clone(),
             timeout: Duration::from_secs(pc.timeout_secs.unwrap_or(60)),
         },
-    )))
+        proxy,
+    )?))
 }
 
 /// 从单 Provider `options` JSON 构建 Provider（当前单 Provider 配置）。
@@ -1090,7 +1094,7 @@ struct AppLayer {
 
 /// 装配应用层编排依赖。
 fn build_app_layer(
-    _runtime_cfg: &yomua_bot::application::config::RuntimeConfig,
+    runtime_cfg: &yomua_bot::application::config::RuntimeConfig,
     llm_cfg: &LlmConfig,
     decision_cfg: &DecisionConfig,
     repos: &Repos,
@@ -1146,7 +1150,7 @@ fn build_app_layer(
         .with_live_settings(settings),
     );
 
-    let llm_scheduler = build_model_scheduler(llm_cfg, decision_cfg)?;
+    let llm_scheduler = build_model_scheduler(llm_cfg, decision_cfg, runtime_cfg.proxy.as_deref())?;
     let scheduler: Option<Arc<dyn LlmScheduler>> = llm_scheduler
         .clone()
         .map(|scheduler| scheduler as Arc<dyn LlmScheduler>);

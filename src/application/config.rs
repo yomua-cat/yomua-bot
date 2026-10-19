@@ -43,6 +43,9 @@ pub struct RuntimeConfig {
 
     /// 主动行为和静默时段使用的 UTC 偏移，例如 "+8" 或 "-5"。
     pub timezone: String,
+
+    /// 所有模型 Provider 共用的可选 HTTP(S) 出站代理。
+    pub proxy: Option<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -56,6 +59,7 @@ impl Default for RuntimeConfig {
             broadcast_capacity: None,
             default_character_id: None,
             timezone: "+8".to_string(),
+            proxy: None,
         }
     }
 }
@@ -98,6 +102,22 @@ pub struct LlmProviderConfig {
 
     /// 超时时间（秒）。
     pub timeout_secs: Option<u64>,
+}
+
+fn validate_proxy(proxy: Option<&str>) -> Result<(), String> {
+    let Some(proxy) = proxy else {
+        return Ok(());
+    };
+    let url = reqwest::Url::parse(proxy).map_err(|_| "proxy URL 无效".to_string())?;
+    if !["http", "https"].contains(&url.scheme())
+        || url.host_str().is_none()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || (url.username().is_empty() && url.password().is_some())
+    {
+        return Err("proxy 必须是有效的 HTTP(S) 代理 URL".to_string());
+    }
+    Ok(())
 }
 
 /// 单个 LLM Model Instance 的配置。
@@ -653,6 +673,9 @@ log_level = "info"
 # 优雅关停的整体超时（秒）。
 shutdown_timeout_secs = 10
 
+# 可选：所有模型 HTTP 请求共用的出站代理。代理凭据可写在 URL 中；该配置不影响 OneBot WebSocket。
+# proxy = "http://user:password@127.0.0.1:7890"
+
 # 插件目录；删除注释并填写路径后启用插件。
 # plugins_dir = "plugins"
 
@@ -842,6 +865,9 @@ pub fn validate_runtime(cfg: &RuntimeConfig) -> Vec<String> {
     if let Err(error) = parse_timezone_offset(&cfg.timezone) {
         errors.push(error);
     }
+    if let Err(error) = validate_proxy(cfg.proxy.as_deref()) {
+        errors.push(error);
+    }
 
     errors
 }
@@ -910,6 +936,9 @@ impl ConfigurationBundle {
         }
         if self.runtime.shutdown_timeout_secs != next.runtime.shutdown_timeout_secs {
             fields.push("runtime.shutdown_timeout_secs");
+        }
+        if self.runtime.proxy != next.runtime.proxy {
+            fields.push("runtime.proxy");
         }
         if serde_json::to_value(&self.onebot).ok() != serde_json::to_value(&next.onebot).ok() {
             fields.push("onebot");
@@ -1009,6 +1038,39 @@ mod tests {
         assert_eq!(cfg.data_dir, "/tmp/runtime-data");
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.shutdown_timeout_secs, 5);
+    }
+
+    #[test]
+    fn runtime_proxy_is_parsed_and_validated_without_exposing_credentials() {
+        let mut cfg = RuntimeConfig {
+            admin_users: Some(vec!["test-admin".into()]),
+            proxy: Some("http://proxy-user:proxy-secret@127.0.0.1:7890".into()),
+            ..RuntimeConfig::default()
+        };
+        assert!(validate_runtime(&cfg).is_empty());
+        cfg.proxy = Some("file:///tmp/proxy".into());
+        let errors = validate_runtime(&cfg).join(";");
+        assert!(errors.contains("proxy"));
+        assert!(!errors.contains("proxy-user"));
+        assert!(!errors.contains("proxy-secret"));
+    }
+
+    #[test]
+    fn runtime_proxy_change_requires_restart() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("runtime.toml"),
+            "admin_users = [\"test-admin\"]\nproxy = \"http://127.0.0.1:7890\"\n",
+        )
+        .unwrap();
+        let current = ConfigurationBundle::load(dir.path()).unwrap();
+        fs::write(
+            dir.path().join("runtime.toml"),
+            "admin_users = [\"test-admin\"]\nproxy = \"http://127.0.0.1:7891\"\n",
+        )
+        .unwrap();
+        let next = ConfigurationBundle::load(dir.path()).unwrap();
+        assert!(current.restart_required(&next).contains(&"runtime.proxy"));
     }
 
     #[test]

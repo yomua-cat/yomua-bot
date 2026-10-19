@@ -19,20 +19,19 @@ pub struct TypeSafeProvider {
 }
 
 impl TypeSafeProvider {
-    pub fn new(base_url: String, api_key: Option<String>, timeout: Duration) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .unwrap_or_else(|error| {
-                tracing::warn!(target = "llm", error = %error, "构建 TypeSafe HTTP 客户端失败，使用默认客户端");
-                reqwest::Client::new()
-            });
-        Self {
+    pub fn new(
+        base_url: String,
+        api_key: Option<String>,
+        timeout: Duration,
+        proxy: Option<&str>,
+    ) -> Result<Self, RuntimeError> {
+        let client = crate::infrastructure::llm::build_http_client(timeout, proxy)?;
+        Ok(Self {
             base_url,
             api_key,
             timeout,
             client,
-        }
+        })
     }
 
     fn endpoint(&self) -> String {
@@ -87,12 +86,12 @@ impl LlmProvider for TypeSafeProvider {
         let response = builder
             .send()
             .await
-            .map_err(|error| RuntimeError::HttpError(format!("请求 TypeSafe 服务失败: {error}")))?;
+            .map_err(|_| RuntimeError::HttpError("请求 TypeSafe 服务失败".into()))?;
         let status = response.status();
         let raw = response
             .text()
             .await
-            .map_err(|error| RuntimeError::HttpError(format!("读取 TypeSafe 响应失败: {error}")))?;
+            .map_err(|_| RuntimeError::HttpError("读取 TypeSafe 响应失败".into()))?;
         if !status.is_success() {
             if status.as_u16() == 451 {
                 return Err(RuntimeError::Llm(
@@ -143,7 +142,7 @@ impl LlmProvider for TypeSafeProvider {
         let response = builder
             .send()
             .await
-            .map_err(|error| RuntimeError::HttpError(format!("检查 TypeSafe 服务失败: {error}")))?;
+            .map_err(|_| RuntimeError::HttpError("检查 TypeSafe 服务失败".into()))?;
         if response.status().is_success() {
             Ok(true)
         } else if response.status().as_u16() == 451 {
@@ -165,12 +164,112 @@ impl LlmProvider for TypeSafeProvider {
 #[cfg(test)]
 mod tests {
     use super::TypeSafeProvider;
-    use crate::infrastructure::llm::LlmRequest;
+    use crate::infrastructure::llm::{LlmProvider, LlmRequest};
     use serde_json::json;
     use std::time::Duration;
 
+    async fn read_headers(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert!(count > 0);
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn generate_request() -> LlmRequest {
+        LlmRequest {
+            system: None,
+            messages: Vec::new(),
+            model: None,
+            temperature: None,
+            max_tokens: None,
+            priority: 0,
+            metadata: json!({"typesafe_request": {"state": {}, "questions": []}}),
+        }
+    }
+
+    fn success_response() -> &'static [u8] {
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"model\":\"jev-latest\",\"usage\":{}}"
+    }
+
+    #[tokio::test]
+    async fn configured_proxy_receives_typesafe_request() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_headers(&mut stream).await;
+            stream.write_all(success_response()).await.unwrap();
+            request
+        });
+        let provider = TypeSafeProvider::new(
+            "http://typesafe.invalid".into(),
+            None,
+            Duration::from_secs(2),
+            Some(&format!("http://proxy-user:proxy-secret@{address}")),
+        )
+        .unwrap();
+
+        provider.generate(generate_request()).await.unwrap();
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST http://typesafe.invalid/v1/systemone "));
+        assert!(request.contains("proxy-authorization: Basic "));
+    }
+
+    #[tokio::test]
+    async fn disabled_proxy_connects_directly_to_provider() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_headers(&mut stream).await;
+            stream.write_all(success_response()).await.unwrap();
+            request
+        });
+        let provider = TypeSafeProvider::new(
+            format!("http://{address}"),
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .unwrap();
+
+        provider.generate(generate_request()).await.unwrap();
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /v1/systemone "));
+    }
+
+    #[tokio::test]
+    async fn proxy_failure_summary_does_not_expose_credentials() {
+        let proxy = "http://proxy-user:proxy-secret@127.0.0.1:1";
+        let provider = TypeSafeProvider::new(
+            "http://typesafe.invalid".into(),
+            None,
+            Duration::from_millis(200),
+            Some(proxy),
+        )
+        .unwrap();
+        let error = provider
+            .generate(generate_request())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("proxy-user"));
+        assert!(!error.contains("proxy-secret"));
+    }
+
     fn provider(base_url: &str) -> TypeSafeProvider {
-        TypeSafeProvider::new(base_url.into(), None, Duration::from_secs(1))
+        TypeSafeProvider::new(base_url.into(), None, Duration::from_secs(1), None).unwrap()
     }
 
     #[test]

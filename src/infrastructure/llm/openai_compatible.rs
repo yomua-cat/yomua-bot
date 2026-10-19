@@ -58,16 +58,9 @@ pub struct OpenAiCompatibleProvider {
 
 impl OpenAiCompatibleProvider {
     /// 创建一个 OpenAI-compatible Provider。
-    pub fn new(config: OpenAiCompatibleConfig) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .unwrap_or_else(|e| {
-                // 构建失败极不常见；降级为无超时默认客户端并记录。
-                tracing::warn!(target: "llm", error = %e, "构建 HTTP 客户端失败，使用默认值");
-                reqwest::Client::new()
-            });
-        Self { config, client }
+    pub fn new(config: OpenAiCompatibleConfig, proxy: Option<&str>) -> Result<Self, RuntimeError> {
+        let client = crate::infrastructure::llm::build_http_client(config.timeout, proxy)?;
+        Ok(Self { config, client })
     }
 
     /// 组装 Chat Completions 请求 JSON body。
@@ -222,9 +215,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
             builder = builder.bearer_auth(key);
         }
 
-        let resp = builder.send().await.map_err(|e| {
-            RuntimeError::HttpError(format!("请求 OpenAI-compatible 服务失败: {e}"))
-        })?;
+        let resp = builder
+            .send()
+            .await
+            .map_err(|_| RuntimeError::HttpError("请求 OpenAI-compatible 服务失败".into()))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -238,7 +232,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| RuntimeError::Llm(format!("解析响应 JSON 失败: {e}")))?;
+            .map_err(|_| RuntimeError::Llm("解析响应 JSON 失败".into()))?;
 
         self.parse_response(&body)
     }
@@ -252,7 +246,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let resp = request
             .send()
             .await
-            .map_err(|e| RuntimeError::Llm(format!("健康检查失败: {e}")))?;
+            .map_err(|_| RuntimeError::Llm("健康检查失败".into()))?;
         Ok(resp.status().is_success())
     }
 
@@ -283,7 +277,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let resp = builder
             .send()
             .await
-            .map_err(|e| RuntimeError::HttpError(e.to_string()))?;
+            .map_err(|_| RuntimeError::HttpError("请求 Embeddings API 失败".into()))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -295,7 +289,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let parsed: EmbeddingsResponse = resp
             .json()
             .await
-            .map_err(|e| RuntimeError::ParseError(e.to_string()))?;
+            .map_err(|_| RuntimeError::ParseError("解析 Embeddings API 响应失败".into()))?;
 
         validate_embeddings(parsed.data, expected_count)
     }
@@ -311,13 +305,17 @@ mod tests {
     use crate::infrastructure::llm::LlmMessage;
 
     fn provider() -> OpenAiCompatibleProvider {
-        OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
-            base_url: "http://127.0.0.1:11434/v1".to_string(),
-            api_key: Some("sk-test".to_string()),
-            model: "qwen".to_string(),
-            embedding_model: None,
-            timeout: Duration::from_secs(30),
-        })
+        OpenAiCompatibleProvider::new(
+            OpenAiCompatibleConfig {
+                base_url: "http://127.0.0.1:11434/v1".to_string(),
+                api_key: Some("sk-test".to_string()),
+                model: "qwen".to_string(),
+                embedding_model: None,
+                timeout: Duration::from_secs(30),
+            },
+            None,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -420,5 +418,60 @@ mod tests {
         let p = provider();
         let raw = serde_json::json!({});
         assert!(p.parse_response(&raw).is_err());
+    }
+
+    #[tokio::test]
+    async fn configured_proxy_receives_openai_compatible_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            let request = String::from_utf8_lossy(&bytes).into_owned();
+            let body = r#"{"model":"test-model","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        let provider = OpenAiCompatibleProvider::new(
+            OpenAiCompatibleConfig {
+                base_url: "http://openai-compatible.invalid/v1".into(),
+                api_key: None,
+                model: "test-model".into(),
+                embedding_model: None,
+                timeout: Duration::from_secs(2),
+            },
+            Some(&format!("http://{address}")),
+        )
+        .unwrap();
+        let request = LlmRequest {
+            system: None,
+            messages: vec![LlmMessage {
+                role: LlmRole::User,
+                content: "test".into(),
+            }],
+            model: None,
+            temperature: None,
+            max_tokens: None,
+            priority: 0,
+            metadata: serde_json::json!({}),
+        };
+
+        provider.generate(request).await.unwrap();
+        assert!(server
+            .await
+            .unwrap()
+            .starts_with("POST http://openai-compatible.invalid/v1/chat/completions "));
     }
 }

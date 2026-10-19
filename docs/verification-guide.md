@@ -27,11 +27,15 @@ cargo run --example decision_probe -- --config-dir config --mode response
 cargo run --example decision_probe -- --config-dir config --mode proactive
 ```
 
-探针读取 `decision.toml` 中的 TypeSafe Provider，复用真实的请求构造、调度、typed question 解析、验证器和最终动作覆盖逻辑。`enabled = false` 不会阻止探针运行，因为探针本身就是显式的单次验收入口。输出只包含模型版本、问题类型、答案摘要、概率、置信度、校验结果和最终动作，不输出 API Key、原始请求或原始响应。
+探针读取 `runtime.toml` 中的可选 `proxy` 和 `decision.toml` 中的 TypeSafe Provider，复用真实的请求构造、调度、typed question 解析、验证器和最终动作覆盖逻辑。`enabled = false` 不会阻止探针运行，因为探针本身就是显式的单次验收入口。输出只包含模型版本、问题类型、答案摘要、概率、置信度、校验结果和最终动作，不输出 API Key、代理凭据、原始请求或原始响应。
 
 探针返回 `request=success` 且 `validation=passed`，才表示本次请求完整走通。`request=failed` 时会显示脱敏的失败类别并明确回退到规则动作；HTTP 能连接但服务在答案前拒绝请求时，仍不能据此证明 Jev 的响应解析已经通过。
 
 ## 已有证据
+
+- 模型出站代理测试：TypeSafe 和 OpenAI-compatible mock HTTP 服务均确认启用代理时收到绝对目标 URI；TypeSafe 直连测试确认未配置代理时直接访问模型服务；不可达代理错误摘要不含代理凭据。
+- OneBot 直连隔离测试：在运行时配置存在模型代理地址时，真实 `tokio-tungstenite` 连接器仍成功直连本地 mock WebSocket 服务。
+- 代理配置测试：覆盖 `runtime.toml` 代理解析、非法 scheme 校验、凭据不进入校验错误，以及代理变更返回 `restart_required`。
 
 - `cargo check --locked --all-targets --offline`：通过。
 - `cargo test --locked --all-targets --no-run --offline`：通过编译检查。
