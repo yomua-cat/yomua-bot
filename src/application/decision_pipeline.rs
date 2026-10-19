@@ -185,7 +185,8 @@ impl DecisionLlmPipeline {
                             fallback = "backup_or_builtin",
                             "Primary LLM result validation failed, trying backup"
                         );
-                        self.try_backup(ctx, built_in).await
+                        self.try_backup(ctx, built_in, DecisionFailure::SemanticValidation(errors))
+                            .await
                     }
                 }
             }
@@ -199,7 +200,7 @@ impl DecisionLlmPipeline {
                     fallback = "backup_or_builtin",
                     "Primary LLM failed, trying backup"
                 );
-                self.try_backup(ctx, built_in).await
+                self.try_backup(ctx, built_in, primary_err).await
             }
         }
     }
@@ -209,6 +210,7 @@ impl DecisionLlmPipeline {
         &self,
         ctx: &DecisionContext,
         built_in: &BuiltInDecision,
+        primary_failure: DecisionFailure,
     ) -> Result<DecisionResult, DecisionFailure> {
         let Some(backup) = &self.backup else {
             tracing::warn!(
@@ -218,7 +220,7 @@ impl DecisionLlmPipeline {
                 fallback = "builtin",
                 "No backup configured, pipeline fails"
             );
-            return Err(DecisionFailure::AllProvidersFailed);
+            return Err(primary_failure);
         };
 
         match backup.call(ctx, built_in).await {

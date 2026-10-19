@@ -117,7 +117,7 @@ impl DecisionOrchestrator {
                     match pipeline.execute(&ctx, &built_in).await {
                         Ok(result) => {
                             // LLM 成功 → 应用 override
-                            Ok(self.apply_override(result, built_in, &ctx))
+                            Ok(Self::apply_override(result, built_in, &ctx))
                         }
                         Err(error) => {
                             // LLM 全部失败 → 返回原始
@@ -162,7 +162,7 @@ impl DecisionOrchestrator {
                     return Ok(built_in.behavior);
                 };
                 match pipeline.execute(&ctx, &built_in).await {
-                    Ok(result) => Ok(self.apply_override(result, built_in, &ctx)),
+                    Ok(result) => Ok(Self::apply_override(result, built_in, &ctx)),
                     Err(error) => {
                         tracing::warn!(
                             target = "decision",
@@ -179,8 +179,11 @@ impl DecisionOrchestrator {
     }
 
     /// 将 DecisionResult override 应用到 BuiltInDecision.behavior。
-    fn apply_override(
-        &self,
+    /// 将经过验证的 DecisionResult 应用到规则决策。
+    ///
+    /// 这是纯动作变换，不依赖编排器中的 evaluator、trigger 或 pipeline，
+    /// 因此真实探针和回放工具可以复用与生产路径相同的最终动作规则。
+    pub fn apply_override(
         result: DecisionResult,
         built_in: BuiltInDecision,
         context: &DecisionContext,
@@ -838,6 +841,29 @@ mod tests {
         assert_eq!(result.cognition_level, CognitionLevel::Light);
         assert_eq!(result.delay_ms, 1400);
         assert_eq!(result.reason, "mentioned=true");
+    }
+
+    #[tokio::test]
+    async fn pipeline_without_backup_preserves_primary_failure_kind() {
+        let output = sample_output();
+        let built_in = BuiltInDecision::from_behavior(output.decision.clone());
+        let context = DecisionContext::from_input(
+            &output.input,
+            DecisionSituation::Response {
+                message_content: "hello".to_string(),
+                is_mentioned: true,
+                participant_id: Some(1),
+            },
+        );
+        let pipeline = DecisionLlmPipeline::new(
+            Arc::new(FailingDecisionLlmService),
+            None,
+            DecisionResultValidator::new(2000, 60_000),
+            Arc::new(crate::domain::decision::DefaultOverridePolicy),
+        );
+
+        let error = pipeline.execute(&context, &built_in).await.unwrap_err();
+        assert!(matches!(error, DecisionFailure::Transport(_)));
     }
 
     // -------------------------------------------------------------------------
