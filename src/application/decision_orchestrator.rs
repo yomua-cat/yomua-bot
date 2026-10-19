@@ -11,6 +11,9 @@ use std::sync::Arc;
 use crate::domain::behavior::BehaviorDecision;
 // Re-export for use by application layers (main, reply_processor)
 pub use crate::application::decision_pipeline::DecisionLlmPipeline;
+use crate::application::decision_pipeline::{
+    audit_model_version, audit_probabilities, audit_question_results, decision_failure_kind,
+};
 pub use crate::domain::decision::{
     DecisionEvaluator, DecisionLlmService, DecisionResult, DecisionResultValidator, LlmAssistance,
     LlmAssistanceTrigger, NoOpTrigger,
@@ -116,9 +119,15 @@ impl DecisionOrchestrator {
                             // LLM 成功 → 应用 override
                             Ok(self.apply_override(result, built_in, &ctx))
                         }
-                        Err(_) => {
+                        Err(error) => {
                             // LLM 全部失败 → 返回原始
-                            tracing::warn!(target = "decision", "LLM 全部失败，使用 Built-in");
+                            tracing::warn!(
+                                target = "decision",
+                                validation = "failed",
+                                fallback = "builtin",
+                                failure = decision_failure_kind(&error),
+                                "LLM 全部失败，使用 Built-in"
+                            );
                             Ok(built_in.behavior)
                         }
                     }
@@ -154,8 +163,14 @@ impl DecisionOrchestrator {
                 };
                 match pipeline.execute(&ctx, &built_in).await {
                     Ok(result) => Ok(self.apply_override(result, built_in, &ctx)),
-                    Err(_) => {
-                        tracing::warn!(target = "decision", "主动决策模型失败，使用规则结果");
+                    Err(error) => {
+                        tracing::warn!(
+                            target = "decision",
+                            validation = "failed",
+                            fallback = "builtin",
+                            failure = decision_failure_kind(&error),
+                            "主动决策模型失败，使用规则结果"
+                        );
                         Ok(built_in.behavior)
                     }
                 }
@@ -171,6 +186,11 @@ impl DecisionOrchestrator {
         context: &DecisionContext,
     ) -> BehaviorDecision {
         use DecisionAction::*;
+        let model_version = audit_model_version(&result.model_version);
+        let questions = result.questions.clone();
+        let probabilities = result.probabilities.clone();
+        let confidence = result.confidence;
+        let suggested_action = result.action.clone();
         let mut behavior = built_in.behavior.clone();
 
         match result.action {
@@ -215,9 +235,17 @@ impl DecisionOrchestrator {
         tracing::info!(
             target = "decision",
             original_action = ?built_in.behavior.action,
+            suggested_action = ?suggested_action,
             final_action = ?behavior.action,
             original_delay = built_in.behavior.delay_ms,
             final_delay = behavior.delay_ms,
+            adopted = behavior.action != built_in.behavior.action
+                || behavior.delay_ms != built_in.behavior.delay_ms,
+            model_version = %model_version,
+            confidence = ?confidence,
+            questions = ?audit_question_results(&questions),
+            probabilities = ?audit_probabilities(&probabilities),
+            validation = "passed",
             "Decision LLM override applied"
         );
 
@@ -234,7 +262,7 @@ mod tests {
     use super::*;
     use crate::domain::behavior::{BehaviorAction, CognitionLevel, Priority};
     use crate::domain::character::{CharacterBinding, ReplyMode};
-    use crate::domain::decision::HeuristicTrigger;
+    use crate::domain::decision::{DecisionQuestionResult, HeuristicTrigger};
     use crate::domain::relationship::Relationship;
     use async_trait::async_trait;
     use chrono::Utc;
@@ -305,6 +333,25 @@ mod tests {
         }
         fn name(&self) -> &str {
             "always_keep"
+        }
+    }
+
+    struct StaticDecisionLlmService {
+        result: DecisionResult,
+    }
+
+    #[async_trait]
+    impl DecisionLlmService for StaticDecisionLlmService {
+        async fn call(
+            &self,
+            _: &DecisionContext,
+            _: &BuiltInDecision,
+        ) -> Result<DecisionResult, DecisionFailure> {
+            Ok(self.result.clone())
+        }
+
+        fn name(&self) -> &str {
+            "static_test"
         }
     }
 
@@ -957,6 +1004,70 @@ mod tests {
 
         // Validator rejects out-of-range confidence → Built-in
         assert_eq!(result.action, BehaviorAction::Reply);
+    }
+
+    #[tokio::test]
+    async fn low_confidence_model_result_falls_back_to_builtin() {
+        let output = sample_output();
+        let evaluator = Arc::new(MockDecisionEvaluator { output });
+        let pipeline = Arc::new(DecisionLlmPipeline::new(
+            Arc::new(StaticDecisionLlmService {
+                result: typed_result(DecisionAction::SuggestReply, 0.5, 0.99),
+            }),
+            None,
+            DecisionResultValidator::new(2_000, 60_000),
+            Arc::new(crate::domain::decision::DefaultOverridePolicy),
+        ));
+        let orchestrator =
+            DecisionOrchestrator::new(evaluator, Arc::new(AlwaysRequiredTrigger), Some(pipeline));
+
+        let result = orchestrator
+            .evaluate_response(1, 10, "hello", true, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(result.action, BehaviorAction::Reply);
+    }
+
+    #[tokio::test]
+    async fn low_hard_constraint_probability_falls_back_to_builtin() {
+        let output = sample_output();
+        let evaluator = Arc::new(MockDecisionEvaluator { output });
+        let pipeline = Arc::new(DecisionLlmPipeline::new(
+            Arc::new(StaticDecisionLlmService {
+                result: typed_result(DecisionAction::SuggestIgnore, 0.9, 0.8),
+            }),
+            None,
+            DecisionResultValidator::new(2_000, 60_000),
+            Arc::new(crate::domain::decision::DefaultOverridePolicy),
+        ));
+        let orchestrator =
+            DecisionOrchestrator::new(evaluator, Arc::new(AlwaysRequiredTrigger), Some(pipeline));
+
+        let result = orchestrator
+            .evaluate_response(1, 10, "hello", false, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(result.action, BehaviorAction::Reply);
+    }
+
+    fn typed_result(
+        action: DecisionAction,
+        confidence: f64,
+        hard_constraints: f64,
+    ) -> DecisionResult {
+        DecisionResult {
+            action,
+            questions: vec![DecisionQuestionResult {
+                name: "hard_constraints".into(),
+                question_type: "noul".into(),
+                value: serde_json::json!(hard_constraints),
+                probabilities: std::collections::BTreeMap::new(),
+                confidence,
+            }],
+            probabilities: std::collections::BTreeMap::new(),
+            confidence: Some(confidence),
+            model_version: "test-jev".into(),
+        }
     }
 
     // -------------------------------------------------------------------------

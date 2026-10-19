@@ -9,8 +9,85 @@ use std::sync::Arc;
 
 use crate::domain::decision::{
     BuiltInDecision, DecisionContext, DecisionFailure, DecisionLlmService, DecisionOverridePolicy,
-    DecisionResult, DecisionResultValidator,
+    DecisionQuestionResult, DecisionResult, DecisionResultValidator, ValidationError,
 };
+
+/// 将 typed question 压缩为可安全写入审计日志的摘要。
+///
+/// provider 返回的 value 不是可信日志字段，字符串只记录长度，复杂值只记录形状。
+pub(crate) fn audit_question_results(questions: &[DecisionQuestionResult]) -> Vec<String> {
+    questions
+        .iter()
+        .map(|question| {
+            let name = audit_text(&question.name);
+            let question_type = audit_text(&question.question_type);
+            let value = match &question.value {
+                serde_json::Value::Null => "null".to_string(),
+                serde_json::Value::Bool(value) => format!("bool={value}"),
+                serde_json::Value::Number(value) => format!("number={value}"),
+                serde_json::Value::String(value) => {
+                    format!("string_len={}", value.chars().count())
+                }
+                serde_json::Value::Array(values) => format!("array_len={}", values.len()),
+                serde_json::Value::Object(values) => format!("object_keys={}", values.len()),
+            };
+            format!(
+                "{}:{}:{}:confidence={:.3}",
+                name, question_type, value, question.confidence
+            )
+        })
+        .collect()
+}
+
+/// 仅保留概率键和数值，避免将 provider 原始结构写入日志。
+pub(crate) fn audit_probabilities(
+    probabilities: &std::collections::BTreeMap<String, f64>,
+) -> Vec<String> {
+    probabilities
+        .iter()
+        .map(|(key, value)| format!("{}={value:.3}", audit_text(key)))
+        .collect()
+}
+
+pub(crate) fn audit_model_version(model_version: &str) -> String {
+    let value = audit_text(model_version);
+    let lowercase = value.to_ascii_lowercase();
+    if lowercase.starts_with("sk-")
+        || lowercase.contains("api_key")
+        || lowercase.contains("secret")
+        || lowercase.contains("token")
+    {
+        "redacted".to_string()
+    } else {
+        value
+    }
+}
+
+fn audit_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | ':' | '/')
+        })
+        .take(64)
+        .collect()
+}
+
+pub(crate) fn audit_validation_fields(errors: &[ValidationError]) -> Vec<&str> {
+    errors.iter().map(|error| error.field.as_str()).collect()
+}
+
+pub(crate) fn decision_failure_kind(error: &DecisionFailure) -> &'static str {
+    match error {
+        DecisionFailure::Transport(_) => "transport",
+        DecisionFailure::ProviderError(_, _) => "provider_error",
+        DecisionFailure::Timeout => "timeout",
+        DecisionFailure::JsonParse(_) => "json_parse",
+        DecisionFailure::SchemaValidation(_) => "schema_validation",
+        DecisionFailure::SemanticValidation(_) => "semantic_validation",
+        DecisionFailure::AllProvidersFailed => "all_providers_failed",
+    }
+}
 
 /// Decision LLM Pipeline——执行 Primary → Backup → Built-in Fallback 逻辑。
 ///
@@ -84,6 +161,11 @@ impl DecisionLlmPipeline {
                             target = "decision",
                             primary = %self.primary.name(),
                             action = ?result.action,
+                            model_version = %audit_model_version(&result.model_version),
+                            confidence = ?result.confidence,
+                            questions = ?audit_question_results(&result.questions),
+                            probabilities = ?audit_probabilities(&result.probabilities),
+                            validation = "passed",
                             "Primary LLM succeeded and validated"
                         );
                         Ok(result)
@@ -93,7 +175,14 @@ impl DecisionLlmPipeline {
                         tracing::warn!(
                             target = "decision",
                             primary = %self.primary.name(),
-                            errors = ?errors,
+                            validation_errors = errors.len(),
+                            validation_fields = ?audit_validation_fields(&errors),
+                            model_version = %audit_model_version(&result.model_version),
+                            confidence = ?result.confidence,
+                            questions = ?audit_question_results(&result.questions),
+                            probabilities = ?audit_probabilities(&result.probabilities),
+                            validation = "rejected",
+                            fallback = "backup_or_builtin",
                             "Primary LLM result validation failed, trying backup"
                         );
                         self.try_backup(ctx, built_in).await
@@ -105,7 +194,9 @@ impl DecisionLlmPipeline {
                 tracing::warn!(
                     target = "decision",
                     primary = %self.primary.name(),
-                    error = %primary_err,
+                    failure = decision_failure_kind(&primary_err),
+                    validation = "unavailable",
+                    fallback = "backup_or_builtin",
                     "Primary LLM failed, trying backup"
                 );
                 self.try_backup(ctx, built_in).await
@@ -120,7 +211,13 @@ impl DecisionLlmPipeline {
         built_in: &BuiltInDecision,
     ) -> Result<DecisionResult, DecisionFailure> {
         let Some(backup) = &self.backup else {
-            tracing::warn!(target = "decision", "No backup configured, pipeline fails");
+            tracing::warn!(
+                target = "decision",
+                failure = "no_backup",
+                validation = "unavailable",
+                fallback = "builtin",
+                "No backup configured, pipeline fails"
+            );
             return Err(DecisionFailure::AllProvidersFailed);
         };
 
@@ -136,6 +233,11 @@ impl DecisionLlmPipeline {
                             target = "decision",
                             backup = %backup.name(),
                             action = ?result.action,
+                            model_version = %audit_model_version(&result.model_version),
+                            confidence = ?result.confidence,
+                            questions = ?audit_question_results(&result.questions),
+                            probabilities = ?audit_probabilities(&result.probabilities),
+                            validation = "passed",
                             "Backup LLM succeeded and validated"
                         );
                         Ok(result)
@@ -145,7 +247,14 @@ impl DecisionLlmPipeline {
                         tracing::warn!(
                             target = "decision",
                             backup = %backup.name(),
-                            errors = ?errors,
+                            validation_errors = errors.len(),
+                            validation_fields = ?audit_validation_fields(&errors),
+                            model_version = %audit_model_version(&result.model_version),
+                            confidence = ?result.confidence,
+                            questions = ?audit_question_results(&result.questions),
+                            probabilities = ?audit_probabilities(&result.probabilities),
+                            validation = "rejected",
+                            fallback = "builtin",
                             "Backup LLM result validation failed, pipeline fails"
                         );
                         Err(DecisionFailure::SemanticValidation(errors))
@@ -157,7 +266,9 @@ impl DecisionLlmPipeline {
                 tracing::warn!(
                     target = "decision",
                     backup = %backup.name(),
-                    error = %backup_err,
+                    failure = decision_failure_kind(&backup_err),
+                    validation = "unavailable",
+                    fallback = "builtin",
                     "Backup LLM also failed, pipeline fails"
                 );
                 Err(backup_err)
