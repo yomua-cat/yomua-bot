@@ -875,22 +875,23 @@ The provider receives typed questions and must answer them structurally. Never e
             "suggest_reply" => DecisionAction::SuggestReply,
             "suggest_ignore" => DecisionAction::SuggestIgnore,
             "adjust_delay" => {
-                let delta = answers
+                let score = answers
                     .get("delay_delta_ms")
                     .and_then(|answer| answer.get("score"))
-                    .and_then(|value| value.as_i64())
-                    .or_else(|| {
-                        answers
-                            .get("delay_delta_ms")
-                            .and_then(|answer| answer.get("score"))
-                            .and_then(|value| value.as_f64())
-                            .map(|value| value.round() as i64)
-                    })
                     .ok_or_else(|| {
                         DecisionFailure::SchemaValidation(
                             "adjust_delay requires score question delay_delta_ms".to_string(),
                         )
                     })?;
+                let score = score.as_f64().ok_or_else(|| {
+                    DecisionFailure::SchemaValidation("delay_delta_ms.score 必须是数字".to_string())
+                })?;
+                if !(0.0..=10.0).contains(&score) {
+                    return Err(DecisionFailure::SchemaValidation(
+                        "delay_delta_ms.score 必须在 0 到 10 之间".to_string(),
+                    ));
+                }
+                let delta = ((score - 5.0) * 1_000.0).round() as i64;
                 DecisionAction::AdjustDelay { delta_ms: delta }
             }
             other => {
@@ -907,6 +908,79 @@ The provider receives typed questions and must answer them structurally. Never e
             confidence: Some(confidence),
             model_version,
         })
+    }
+
+    fn build_typesafe_questions(is_proactive: bool) -> serde_json::Map<String, serde_json::Value> {
+        let mut criteria = serde_json::Map::from_iter([
+            ("keep".into(), serde_json::json!("保留规则引擎的决定。")),
+            (
+                "suggest_reply".into(),
+                serde_json::json!("建议回复当前消息；仅在程序硬规则允许时生效。"),
+            ),
+            (
+                "suggest_ignore".into(),
+                serde_json::json!("建议忽略当前消息或取消本次主动行为。"),
+            ),
+        ]);
+        if is_proactive {
+            criteria.remove("suggest_reply");
+        } else {
+            criteria.insert(
+                "adjust_delay".into(),
+                serde_json::json!(
+                    "只调整规则决定的等待时间；变化范围由 delay_delta_ms score 问题限定。"
+                ),
+            );
+        }
+
+        let mut questions = serde_json::Map::from_iter([
+            (
+                "action".into(),
+                serde_json::json!({
+                    "type": "choice",
+                    "instructions": if is_proactive {
+                        "规则允许主动行为。请选择保留本次主动行为，或取消本次主动行为。"
+                    } else {
+                        "请在不违反程序硬约束的前提下，选择保留规则决定、建议回复、建议忽略或调整等待时间。"
+                    },
+                    "criteria": criteria,
+                }),
+            ),
+            (
+                "hard_constraints".into(),
+                serde_json::json!({
+                    "type": "noul",
+                    "instructions": "判断当前建议是否满足程序硬约束。",
+                    "criteria": {
+                        "true": "建议不违反绑定、静默、提及和主动行为限制。",
+                        "false": "建议至少违反一项程序硬约束。"
+                    }
+                }),
+            ),
+        ]);
+        if !is_proactive {
+            questions.insert(
+                "delay_delta_ms".into(),
+                serde_json::json!({
+                    "type": "score",
+                    "instructions": "评估规则决定需要调整等待时间的方向和程度。分数 0 到 10 分别代表减少 5000 毫秒到增加 5000 毫秒；若 action 不是 adjust_delay，请选择 5。",
+                    "criteria": [
+                        "减少 5000 毫秒",
+                        "减少 4000 毫秒",
+                        "减少 3000 毫秒",
+                        "减少 2000 毫秒",
+                        "减少 1000 毫秒",
+                        "不调整等待时间",
+                        "增加 1000 毫秒",
+                        "增加 2000 毫秒",
+                        "增加 3000 毫秒",
+                        "增加 4000 毫秒",
+                        "增加 5000 毫秒"
+                    ]
+                }),
+            );
+        }
+        questions
     }
 }
 
@@ -928,52 +1002,7 @@ impl DecisionLlmService for DecisionLlmServiceImpl {
             "built_in_decision": baseline,
         });
         let is_proactive = matches!(ctx.situation, DecisionSituation::Proactive);
-        let mut criteria = serde_json::Map::from_iter([
-            ("keep".into(), serde_json::json!("保留规则引擎的决定。")),
-            (
-                "suggest_reply".into(),
-                serde_json::json!("建议回复当前消息；仅在程序硬规则允许时生效。"),
-            ),
-            (
-                "suggest_ignore".into(),
-                serde_json::json!("建议忽略当前消息或取消本次主动行为。"),
-            ),
-        ]);
-        if is_proactive {
-            criteria.remove("suggest_reply");
-        }
-        let mut questions = serde_json::Map::from_iter([
-            (
-                "action".into(),
-                serde_json::json!({
-                    "type": "choice",
-                    "instructions": if is_proactive {
-                        "规则允许主动行为。请选择保留本次主动行为，或取消本次主动行为。"
-                    } else {
-                        "请在不违反程序硬约束的前提下，选择保留规则决定、建议回复或建议忽略。"
-                    },
-                    "criteria": criteria,
-                }),
-            ),
-            (
-                "hard_constraints".into(),
-                serde_json::json!({
-                    "type": "noul",
-                    "instructions": "只有确认该建议不违反绑定、静默、提及和主动行为硬约束时才通过。"
-                }),
-            ),
-        ]);
-        if matches!(ctx.situation, DecisionSituation::Response { .. }) {
-            questions.insert(
-                "delay_delta_ms".into(),
-                serde_json::json!({
-                    "type": "score",
-                    "instructions": "若 action=adjust_delay，给出 -5000 到 5000 的整数毫秒变化；否则给 0。",
-                    "min": -5000,
-                    "max": 5000,
-                }),
-            );
-        }
+        let questions = Self::build_typesafe_questions(is_proactive);
         let typesafe_request = serde_json::json!({
             "state": state,
             "model": "jev-latest",
@@ -999,7 +1028,18 @@ impl DecisionLlmService for DecisionLlmServiceImpl {
             .scheduler
             .submit(request)
             .await
-            .map_err(|e| DecisionFailure::Transport(e.to_string()))?;
+            .map_err(|error| match error {
+                crate::error::RuntimeError::HttpError(message) => {
+                    DecisionFailure::Transport(message)
+                }
+                crate::error::RuntimeError::Llm(message) => {
+                    DecisionFailure::ProviderError(0, message)
+                }
+                crate::error::RuntimeError::Config(message) => {
+                    DecisionFailure::SchemaValidation(message)
+                }
+                other => DecisionFailure::Transport(other.to_string()),
+            })?;
 
         self.parse_response(&response.content)
     }
@@ -1012,6 +1052,31 @@ impl DecisionLlmService for DecisionLlmServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::{DecisionAction, DecisionLlmServiceImpl};
+
+    #[test]
+    fn builds_typesafe_questions_with_protocol_shapes() {
+        let response = DecisionLlmServiceImpl::build_typesafe_questions(false);
+        assert_eq!(response["action"]["type"], "choice");
+        assert!(response["action"]["criteria"].get("adjust_delay").is_some());
+        assert_eq!(response["hard_constraints"]["type"], "noul");
+        assert!(response["hard_constraints"]["criteria"]
+            .get("true")
+            .is_some());
+        assert_eq!(response["delay_delta_ms"]["type"], "score");
+        assert_eq!(
+            response["delay_delta_ms"]["criteria"]
+                .as_array()
+                .unwrap()
+                .len(),
+            11
+        );
+
+        let proactive = DecisionLlmServiceImpl::build_typesafe_questions(true);
+        assert!(proactive["action"]["criteria"]
+            .get("suggest_reply")
+            .is_none());
+        assert!(proactive.get("delay_delta_ms").is_none());
+    }
 
     #[test]
     fn parses_jev_choice_answer() {
@@ -1039,5 +1104,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.action, DecisionAction::SuggestReply);
+    }
+
+    #[test]
+    fn maps_typesafe_score_to_delay_delta_milliseconds() {
+        let result = DecisionLlmServiceImpl::parse_response_content(
+            r#"{"answers":{"action":{"type":"choice","choice":"adjust_delay"},"hard_constraints":{"type":"noul","noul":1.0},"delay_delta_ms":{"type":"score","score":7.5}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            result.action,
+            DecisionAction::AdjustDelay { delta_ms: 2500 }
+        );
     }
 }

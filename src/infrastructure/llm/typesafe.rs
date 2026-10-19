@@ -94,6 +94,12 @@ impl LlmProvider for TypeSafeProvider {
             .await
             .map_err(|error| RuntimeError::HttpError(format!("读取 TypeSafe 响应失败: {error}")))?;
         if !status.is_success() {
+            if status.as_u16() == 451 {
+                return Err(RuntimeError::Llm(
+                    "TypeSafe 服务所在区域不可用（HTTP 451），请更换可用网络区域或配置其他官方支持的 System One 入口"
+                        .into(),
+                ));
+            }
             let message = format!("TypeSafe 服务返回错误 {status}");
             return if status.is_server_error() || status.as_u16() == 429 || status.as_u16() == 529 {
                 Err(RuntimeError::HttpError(message))
@@ -130,7 +136,23 @@ impl LlmProvider for TypeSafeProvider {
     }
 
     async fn health_check(&self) -> Result<bool, RuntimeError> {
-        Ok(true)
+        let mut builder = self.client.get(self.endpoint()).timeout(self.timeout);
+        if let Some(key) = &self.api_key {
+            builder = builder.bearer_auth(key);
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| RuntimeError::HttpError(format!("检查 TypeSafe 服务失败: {error}")))?;
+        if response.status().is_success() {
+            Ok(true)
+        } else if response.status().as_u16() == 451 {
+            Err(RuntimeError::Llm(
+                "TypeSafe 服务所在区域不可用（HTTP 451）".into(),
+            ))
+        } else {
+            Ok(false)
+        }
     }
 
     async fn embed(&self, _: Vec<String>) -> Result<Vec<Vec<f32>>, RuntimeError> {
