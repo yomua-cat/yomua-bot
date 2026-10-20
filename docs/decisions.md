@@ -32,3 +32,4 @@
 - 第一轮 AI 伴侣运行时改进采用渐进迁移：先加入默认不含正文的 PromptPlan/PromptTrace、固定 PromptSlot 和明确目标记忆 revision 事务；情绪衰减、主动意图和回复批次延后。影响：上下文装配、记忆仓储、控制处理、SQLite 迁移和阶段性验收。
 - 明确目标记忆的 `replace` 保留旧记录并标记 `superseded`，`append` 创建独立正式记忆，revision 通过 `source_request_id` 幂等；候选审核的拒绝状态为 `rejected`，普通召回排除 candidate/rejected/superseded。影响：记忆状态、审核、检索和恢复任务。
 - 阶段 2B 先建立结构化 `memory_claims` 的来源校验和历史持久边界；claim 的 replace/append/reject 只能由程序验证后的 proposal 调用，模型自动提出 claim 暂不启用。影响：记忆领域模型、SQLite 仓储、迁移和验收测试。
+- 阶段 3 先提供独立的多维情绪衰减纯函数和 Mood 兼容投影，不接入现有默认状态更新链；离线衰减以持久化 `updated_at` 为基准，重复 tick 幂等，时钟回拨保留原状态。影响：情绪领域模型和后续可选后台能力。
