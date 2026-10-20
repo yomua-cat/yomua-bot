@@ -222,7 +222,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let message = format!("OpenAI-compatible 服务返回错误 {status}");
+            let body = resp.text().await.unwrap_or_default();
+            let detail = sanitize_error_detail(&body);
+            let message = if detail.is_empty() {
+                format!("OpenAI-compatible 服务返回错误 {status}")
+            } else {
+                format!("OpenAI-compatible 服务返回错误 {status}: {detail}")
+            };
             if status.is_server_error() || status.as_u16() == 429 {
                 return Err(RuntimeError::HttpError(message));
             }
@@ -299,6 +305,39 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 }
 
+/// 只保留结构化错误说明，避免持久化服务端回显的请求正文。
+fn sanitize_error_detail(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return "服务端返回非结构化错误内容".into();
+    };
+    let detail = value
+        .pointer("/error/message")
+        .or_else(|| value.pointer("/base_resp/status_msg"))
+        .or_else(|| value.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("服务端未提供错误说明");
+    let mut detail = detail
+        .split_whitespace()
+        .map(|part| {
+            if part.starts_with("sk-") || part.starts_with("apikey_") {
+                "[REDACTED]"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if detail.len() > 1000 {
+        detail.truncate(1000);
+        detail.push_str("...");
+    }
+    detail
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +355,27 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn error_detail_keeps_message_without_serializing_echoed_request() {
+        let detail = sanitize_error_detail(
+            r#"{"error":{"message":"invalid parameter"},"request":{"messages":[{"content":"private prompt"}]}}"#,
+        );
+        assert_eq!(detail, "invalid parameter");
+        assert!(!detail.contains("private prompt"));
+    }
+
+    #[test]
+    fn error_detail_redacts_secret_like_words_and_bounds_length() {
+        let detail = sanitize_error_detail(
+            &serde_json::json!({
+                "message": format!("bad key sk-secret {}", "x".repeat(1200))
+            })
+            .to_string(),
+        );
+        assert!(detail.starts_with("bad key [REDACTED]"));
+        assert!(detail.len() <= 1003);
     }
 
     #[test]

@@ -183,14 +183,12 @@ impl OneBotAdapterImpl {
     ) -> Self {
         let (outbound_tx, outbound_rx) = mpsc::channel(128);
         let (event_tx, event_rx) = mpsc::channel(256);
-        let (response_tx, _) = mpsc::channel(64);
         let (shutdown_tx, _) = watch::channel(false);
 
         let shared = ConnectionShared {
             state: Arc::new(Mutex::new(OneBotConnectionState::Disconnected)),
             bus: bus.clone(),
             outbound_tx,
-            response_tx,
             pending: Arc::new(StdMutex::new(HashMap::new())),
             request_id_counter: Arc::new(AtomicU64::new(0)),
             request_timeout_secs: config.action_timeout_secs.max(1),

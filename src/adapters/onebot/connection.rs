@@ -138,8 +138,6 @@ pub struct ConnectionShared {
     pub bus: EventBus,
     /// 出站通道（适配器写入动作 JSON，连接循环读取后发送）。
     pub outbound_tx: mpsc::Sender<String>,
-    /// Action 响应通道（连接循环读取响应并路由，ResponseRouter 接收）。
-    pub response_tx: mpsc::Sender<ActionResponse>,
     /// 待处理请求注册表（request_id → PendingRequest）。
     pub pending: Arc<StdMutex<HashMap<u64, PendingRequest>>>,
     /// 唯一请求 ID 计数器。
@@ -510,9 +508,6 @@ async fn handle_connected_io(
                             IncomingMessage::Response(resp) => {
                                 // 找到 pending 请求并完成它。
                                 shared.complete_request(resp.id, resp.clone());
-                                if shared.response_tx.send(resp).await.is_err() {
-                                    tracing::warn!(target: "adapter", "响应处理通道已关闭");
-                                }
                             }
                         }
                     }
@@ -772,12 +767,10 @@ mod tests {
     fn mismatched_action_does_not_consume_pending_request() {
         let bus = crate::application::event_bus::EventBus::new();
         let (outbound_tx, _outbound_rx) = mpsc::channel(1);
-        let (response_tx, _response_rx) = mpsc::channel(1);
         let shared = ConnectionShared {
             state: Arc::new(Mutex::new(OneBotConnectionState::Connected)),
             bus,
             outbound_tx,
-            response_tx,
             pending: Arc::new(StdMutex::new(HashMap::new())),
             request_id_counter: Arc::new(AtomicU64::new(1)),
             request_timeout_secs: 10,
@@ -969,13 +962,10 @@ mod tests {
         let (outbound_tx_unused, outbound_rx) = mpsc::channel(1);
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (response_tx, _response_rx) = mpsc::channel(8);
-
         let shared = ConnectionShared {
             state: Arc::new(Mutex::new(OneBotConnectionState::Disconnected)),
             bus: bus.clone(),
             outbound_tx: outbound_tx_unused,
-            response_tx,
             pending: Arc::new(StdMutex::new(HashMap::new())),
             request_id_counter: Arc::new(AtomicU64::new(0)),
             request_timeout_secs: 30,
@@ -1033,13 +1023,10 @@ mod tests {
         let (outbound_tx, outbound_rx) = mpsc::channel(1);
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (response_tx, _response_rx) = mpsc::channel(8);
-
         let shared = ConnectionShared {
             state: Arc::new(Mutex::new(OneBotConnectionState::Disconnected)),
             bus: bus.clone(),
             outbound_tx,
-            response_tx,
             pending: Arc::new(StdMutex::new(HashMap::new())),
             request_id_counter: Arc::new(AtomicU64::new(0)),
             request_timeout_secs: 30,
@@ -1098,12 +1085,10 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(1);
         event_tx.send("already-queued".into()).await.unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (response_tx, _response_rx) = mpsc::channel(8);
         let shared = ConnectionShared {
             state: Arc::new(Mutex::new(OneBotConnectionState::Disconnected)),
             bus: bus.clone(),
             outbound_tx,
-            response_tx,
             pending: Arc::new(StdMutex::new(HashMap::new())),
             request_id_counter: Arc::new(AtomicU64::new(0)),
             request_timeout_secs: 10,

@@ -827,6 +827,7 @@ impl ReplyProcessor {
             matches!(
                 task.status,
                 ReplyTaskStatus::Sent
+                    | ReplyTaskStatus::Failed
                     | ReplyTaskStatus::Ignored
                     | ReplyTaskStatus::Cancelled
                     | ReplyTaskStatus::Expired
@@ -1300,7 +1301,27 @@ impl ReplyProcessor {
     ) -> ProcessingOutcome {
         match self.process_owned(event, Some(lease)).await {
             Ok(()) => ProcessingOutcome::Success,
-            Err(e) => Self::classify_outbox_error_for_event(e, event.conversation_id),
+            Err(error) => {
+                let outcome = Self::classify_outbox_error_for_event(error, event.conversation_id);
+                if let ProcessingOutcome::PermanentFailure { error } = &outcome {
+                    if let Err(save_error) = self
+                        .save_task_error_owned(
+                            event,
+                            Some(lease),
+                            ReplyTaskStatus::Failed,
+                            None,
+                            error,
+                        )
+                        .await
+                    {
+                        return Self::classify_outbox_error_for_event(
+                            save_error,
+                            event.conversation_id,
+                        );
+                    }
+                }
+                outcome
+            }
         }
     }
 
@@ -1347,6 +1368,10 @@ impl ReplyProcessor {
             RuntimeError::Storage(crate::error::StorageError::Database(message)) => {
                 !Self::is_transient_database_error(message)
             }
+            // Provider 已明确返回业务层 4xx/协议/配置错误时，继续重试
+            // 只会重复发送同一个无效请求；只有 HttpError 代表可恢复的
+            // 网络、429 或 5xx 路径。
+            RuntimeError::Llm(_) | RuntimeError::Config(_) | RuntimeError::ParseError(_) => true,
             _ => false,
         };
 
@@ -2519,7 +2544,7 @@ mod tests {
             42,
         );
         let retryable = ReplyProcessor::classify_outbox_error_for_event(
-            RuntimeError::Llm("temporary upstream timeout".into()),
+            RuntimeError::HttpError("temporary upstream timeout".into()),
             42,
         );
 
@@ -2547,6 +2572,16 @@ mod tests {
         assert!(locked.is_retryable());
         assert!(schema.is_permanent());
         assert!(connection.is_retryable());
+    }
+
+    #[test]
+    fn provider_protocol_errors_are_permanent_and_not_retried() {
+        let outcome = ReplyProcessor::classify_outbox_error_for_event(
+            RuntimeError::Llm("OpenAI-compatible 服务返回错误 400 Bad Request".into()),
+            1,
+        );
+        assert!(outcome.is_permanent());
+        assert!(!outcome.is_retryable());
     }
 
     #[tokio::test]

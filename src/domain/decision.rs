@@ -974,6 +974,7 @@ The provider receives typed questions and must answer them structurally. Never e
                         "增加 1000 毫秒",
                         "增加 2000 毫秒",
                         "增加 3000 毫秒",
+                        "增加 4000 毫秒",
                         "增加 5000 毫秒"
                     ]
                 }),

@@ -117,6 +117,7 @@ pub enum ReplyTaskStatus {
     Sending,
     Sent,
     Unknown,
+    Failed,
     Cancelled,
     Expired,
     Ignored,
@@ -125,7 +126,12 @@ impl ReplyTaskStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Sent | Self::Unknown | Self::Cancelled | Self::Expired | Self::Ignored
+            Self::Sent
+                | Self::Unknown
+                | Self::Cancelled
+                | Self::Expired
+                | Self::Ignored
+                | Self::Failed
         )
     }
 
@@ -147,6 +153,7 @@ impl std::fmt::Display for ReplyTaskStatus {
                 Self::Sending => "sending",
                 Self::Sent => "sent",
                 Self::Unknown => "unknown",
+                Self::Failed => "failed",
                 Self::Cancelled => "cancelled",
                 Self::Expired => "expired",
                 Self::Ignored => "ignored",
@@ -165,6 +172,8 @@ mod reply_task_status_tests {
         assert!(!ReplyTaskStatus::Sending.can_reuse_content());
         assert!(!ReplyTaskStatus::Unknown.can_reuse_content());
         assert!(!ReplyTaskStatus::Sent.can_reuse_content());
+        assert!(ReplyTaskStatus::Failed.is_terminal());
+        assert_eq!(ReplyTaskStatus::Failed.to_string(), "failed");
     }
 }
 

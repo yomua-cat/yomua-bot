@@ -43,6 +43,8 @@ flowchart TD
 
 [消息接受服务](../src/application/message_acceptance.rs)调用[消息仓储](../src/infrastructure/storage/repository/message_repository.rs)，在同一事务内递增会话序号并写入消息和 Outbox 行。广播事件保留给插件和观察者；普通消息回复只由 Outbox Dispatcher/Processor 链路处理。`EventBus` 是尽力而为的内存广播：没有订阅者时事件直接丢弃，订阅者滞后超过容量时会丢弃旧事件并记录跳过数量；它不承担持久化或可靠消费职责。
 
+OneBot 连接循环独立路由 Action 回执，不等待入站业务处理任务；下游通道积压时，连接循环先将普通事件暂存在内存 FIFO，最多 1024 条，以便继续读取并交付其后的回执。达到上限后会暂停 WebSocket 读取形成背压，因此极端入站积压仍可能延迟回执；该上限避免无界内存增长，压力场景尚未完成真实验收。
+
 [OutboxDispatcher](../src/application/outbox_dispatcher.rs)轮询、领取租约并等待消费者应答；[OutboxProcessor](../src/application/outbox_processor.rs)把 payload 转交[回复处理器](../src/application/reply_processor.rs)。租约、轮询和最大重试次数是代码默认值，当前没有对应 TOML 字段。消费者成功后标记完成，失败可转入等待重试或死信；永久失败事件记录后不会阻塞同一会话后续事件。
 
 这条链路不构成端到端可靠投递保证：控制回复和普通回复都已进入持久回复任务，但 OneBot 超时通常没有平台消息 ID，未知外部回执仍需要人工核查。完成状态只能按实际实现解释，不能据此推断 QQ 用户已收到消息。
@@ -88,6 +90,7 @@ flowchart TD
 - LLM 启用后启动后台认知任务，使用 `cognition` role；插件启用后增加事件桥接、传输和进程监督任务。
 - 主动行为驱动会在已有话题依据、冷却、静默和每日上限通过后，以 SQLite 原子事务预留额度并创建持久回复任务，复用普通回复发送链路；没有已有话题依据时不会发言。主动合成消息不会更新用户关系或记忆。
 - 回复任务的生成领取、生成结果、失败回退、过期/取消/忽略状态和实际发送都绑定当前 Outbox 租约；SQLite 在同一条条件写入中检查租约，失去租约的旧 worker 不能覆盖新状态，过期的 `generating` 任务可由新租约接管。平台网络调用本身仍没有幂等键，租约在网络调用期间失效时依靠 `unknown` 核查流程兜底。
+- 模型明确拒绝请求时，Outbox 将事件标为 `dead_letter`，对应回复任务标为 `failed`；Provider 只记录脱敏的结构化错误说明，避免把同一无效请求重复发送。
 - 入站消息产生的记忆先持久化为带来源的候选；后台维护任务通过 `decision` 路由请求审核模型，模型只提出 `confirm`、`reject` 或 `defer`，SQLite 再验证来源消息、用户、会话、类型和置信度后正式化，审核模型不可用或意见不合规时保持候选。自然语言记忆修改也先持久化为 pending；后台维护任务会限量扫描并重放崩溃遗留请求，失败保留重试信息，成功或拒绝均写回审计状态，不把记忆正文放进普通控制响应。
 - SQLite 使用 WAL、外键约束和连接池。[迁移](../src/infrastructure/storage/migrations.rs)在代码中执行并探测已有表列，没有独立迁移文件或自动回滚机制。
 - 控制关停会发广播信号、停止插件与适配器、等待后台任务，向已接受的控制请求返回关停结果并等待控制服务连接退出，最后关闭存储；超出 `shutdown_timeout_secs` 后取消剩余任务，保留未完成回复供核查，详见[部署运维](deployment.md)。关停超时配置在运行期不热更新，修改后需重启。

@@ -224,6 +224,7 @@ impl OutboxRepository for SqliteOutboxRepository {
             SET status = 'completed',
                 locked_until = NULL,
                 lease_token = NULL,
+                last_error = NULL,
                 processed_at = ?
             WHERE event_uuid = ?
               AND status = 'processing'
@@ -297,6 +298,7 @@ impl OutboxRepository for SqliteOutboxRepository {
         let now_str = now.to_rfc3339();
 
         // P0: 使用 lease_token 进行真正的 ownership fencing
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"
             UPDATE outbox_events
@@ -314,13 +316,37 @@ impl OutboxRepository for SqliteOutboxRepository {
         .bind(&now_str)
         .bind(event_uuid)
         .bind(lease_token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(RepositoryError::OwnershipLost);
         }
+
+        // Outbox 进入终态后，生成任务不能继续显示为 pending/generating，
+        // 否则控制面会把一个已经不会再处理的任务误认为可恢复。
+        sqlx::query(
+            r#"UPDATE reply_tasks
+               SET status = 'failed', error = ?, updated_at = ?
+               WHERE message_id = (
+                   SELECT entity_id FROM outbox_events
+                    WHERE event_uuid = ?
+                      AND entity_type = 'messages'
+                      AND event_type = 'MessageAccepted'
+               )
+                 AND status IN ('pending', 'generating')"#,
+        )
+        .bind(error)
+        .bind(&now_str)
+        .bind(event_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         Ok(())
     }
@@ -543,5 +569,146 @@ impl OutboxRepository for SqliteOutboxRepository {
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SqliteOutboxRepository;
+    use crate::domain::outbox::{OutboxEvent, OutboxStatus};
+    use crate::domain::repository::OutboxRepository;
+    use crate::infrastructure::storage::SqliteStorage;
+    use chrono::Utc;
+
+    #[tokio::test]
+    async fn dead_letter_marks_pending_reply_task_failed() {
+        let storage = SqliteStorage::open_in_memory().await.unwrap();
+        storage.migrate().await.unwrap();
+        let pool = storage.pool().clone();
+        sqlx::query("INSERT INTO characters(name) VALUES ('test')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations(conversation_type, external_id) VALUES ('private', 'test')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO participants(conversation_id, external_id, display_name, role) VALUES (1, 'user', 'user', 'user')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO messages(conversation_id, sender_id, content) VALUES (1, 1, '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO reply_tasks(message_id, character_id, status, updated_at) VALUES (1, 1, 'pending', ?)")
+            .bind(Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        let event_uuid = "failed-reply-MessageAccepted";
+        let repo = SqliteOutboxRepository::new(pool.clone());
+        repo.add_outbox_event(OutboxEvent {
+            id: 0,
+            event_uuid: event_uuid.into(),
+            entity_id: 1,
+            entity_type: "messages".into(),
+            event_type: "MessageAccepted".into(),
+            event_version: 1,
+            payload: "{}".into(),
+            ordering_key: "1".into(),
+            ordering_seq: 1,
+            created_at: now,
+            available_at: now,
+            status: OutboxStatus::Pending,
+            attempts: 0,
+            last_error: None,
+            locked_until: None,
+            processed_at: None,
+            lease_token: None,
+        })
+        .await
+        .unwrap();
+
+        let claimed = repo.claim_next_event(60).await.unwrap().unwrap();
+        repo.mark_dead_letter(
+            event_uuid,
+            claimed.lease_token.as_deref().unwrap(),
+            "permanent failure",
+        )
+        .await
+        .unwrap();
+
+        let task_status: String =
+            sqlx::query_scalar("SELECT status FROM reply_tasks WHERE message_id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(task_status, "failed");
+        let error: String =
+            sqlx::query_scalar("SELECT error FROM reply_tasks WHERE message_id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(error, "permanent failure");
+    }
+
+    #[tokio::test]
+    async fn completion_clears_error_from_successful_retry() {
+        let storage = SqliteStorage::open_in_memory().await.unwrap();
+        storage.migrate().await.unwrap();
+        let pool = storage.pool().clone();
+        let now = Utc::now();
+        let event_uuid = "retry-success-MessageAccepted";
+        let repo = SqliteOutboxRepository::new(pool.clone());
+        repo.add_outbox_event(OutboxEvent {
+            id: 0,
+            event_uuid: event_uuid.into(),
+            entity_id: 1,
+            entity_type: "messages".into(),
+            event_type: "MessageAccepted".into(),
+            event_version: 1,
+            payload: "{}".into(),
+            ordering_key: "1".into(),
+            ordering_seq: 1,
+            created_at: now,
+            available_at: now,
+            status: OutboxStatus::Pending,
+            attempts: 0,
+            last_error: None,
+            locked_until: None,
+            processed_at: None,
+            lease_token: None,
+        })
+        .await
+        .unwrap();
+
+        let first_claim = repo.claim_next_event(60).await.unwrap().unwrap();
+        repo.mark_retry_wait(
+            event_uuid,
+            first_claim.lease_token.as_deref().unwrap(),
+            "temporary 429",
+            Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+        let retry_claim = repo.claim_next_event(60).await.unwrap().unwrap();
+        repo.mark_completed(event_uuid, retry_claim.lease_token.as_deref().unwrap())
+            .await
+            .unwrap();
+
+        let last_error: Option<String> =
+            sqlx::query_scalar("SELECT last_error FROM outbox_events WHERE event_uuid = ?")
+                .bind(event_uuid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last_error, None);
     }
 }
