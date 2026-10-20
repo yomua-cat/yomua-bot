@@ -9,6 +9,7 @@
 //! - `memory` — Memory、MemoryType
 //! - `behavior` — BehaviorDecision、Action、BehaviorEngine
 
+pub mod autonomy;
 pub mod behavior;
 pub mod blacklist;
 pub mod character;

@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 mod storage_tests {
+    use crate::domain::autonomy::*;
     use crate::domain::character::*;
     use crate::domain::conversation::*;
     use crate::domain::memory::*;
@@ -1832,6 +1833,115 @@ mod storage_tests {
             })
             .await;
         assert!(rejected.is_err());
+    }
+
+    #[tokio::test]
+    async fn autonomy_intents_and_reply_batches_are_recoverable_and_fenced() {
+        let storage = setup_storage().await;
+        let character_id: i64 = sqlx::query(
+            "INSERT INTO characters(name, greetings, example_messages, lorebook, metadata, enabled) VALUES ('AutonomyTest', '[]', '[]', '[]', '{}', 1)",
+        )
+        .execute(storage.pool())
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let conversation_id: i64 = sqlx::query(
+            "INSERT INTO conversations(conversation_type, external_id, name) VALUES ('private', 'autonomy-test', '测试会话')",
+        )
+        .execute(storage.pool())
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let repo = crate::infrastructure::storage::repository::SqliteAutonomyRepository::new(
+            storage.pool().clone(),
+        );
+        let now = chrono::DateTime::from_timestamp(1_000, 0).unwrap();
+        let intent_id = repo
+            .insert_autonomy_intent(&AutonomyIntent {
+                id: 0,
+                character_id,
+                conversation_id,
+                status: AutonomyIntentStatus::Pending,
+                not_before: now,
+                cooldown_key: "conversation:autonomy-test".into(),
+                quota_reservation: 1,
+                source_snapshot: serde_json::json!({"reason":"idle"}),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let pending = repo.find_pending_autonomy_intents(now, 10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, intent_id);
+        assert!(repo
+            .update_autonomy_intent_status(
+                intent_id,
+                AutonomyIntentStatus::Pending,
+                AutonomyIntentStatus::Enqueued,
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(!repo
+            .update_autonomy_intent_status(
+                intent_id,
+                AutonomyIntentStatus::Pending,
+                AutonomyIntentStatus::Completed,
+                now,
+            )
+            .await
+            .unwrap());
+
+        let batch = ReplyBatch {
+            id: 0,
+            conversation_id,
+            start_sequence: 10,
+            end_sequence: 12,
+            message_ids: vec![101, 102, 103],
+            trigger_event_uuid: "trigger-autonomy-1".into(),
+            context_hash: "hash-1".into(),
+            status: ReplyBatchStatus::Frozen,
+            lease_token: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let batch_id = repo.insert_reply_batch(&batch).await.unwrap();
+        assert_eq!(repo.insert_reply_batch(&batch).await.unwrap(), batch_id);
+        let loaded = repo
+            .find_reply_batch_by_trigger("trigger-autonomy-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.message_ids, vec![101, 102, 103]);
+        assert!(repo
+            .claim_reply_batch(batch_id, "lease-a", now)
+            .await
+            .unwrap());
+        assert!(!repo
+            .claim_reply_batch(batch_id, "lease-b", now)
+            .await
+            .unwrap());
+        assert!(!repo
+            .update_reply_batch_status_owned(
+                batch_id,
+                "lease-b",
+                ReplyBatchStatus::Processing,
+                ReplyBatchStatus::Completed,
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(repo
+            .update_reply_batch_status_owned(
+                batch_id,
+                "lease-a",
+                ReplyBatchStatus::Processing,
+                ReplyBatchStatus::Completed,
+                now,
+            )
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

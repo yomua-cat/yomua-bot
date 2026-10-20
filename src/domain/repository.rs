@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 
+use crate::domain::autonomy::{AutonomyIntent, AutonomyIntentStatus, ReplyBatch, ReplyBatchStatus};
 use crate::domain::character::{
     BehaviorState, Character, CharacterBinding, CharacterState, ConversationState,
 };
@@ -19,6 +20,69 @@ use crate::domain::memory::{
 use crate::domain::message::Message;
 use crate::domain::relationship::Relationship;
 use crate::error::RepositoryError;
+
+// ---------------------------------------------------------------------------
+// 主动意图与回复批次
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+pub trait AutonomyRepository: Send + Sync {
+    async fn insert_autonomy_intent(
+        &self,
+        _intent: &AutonomyIntent,
+    ) -> Result<i64, RepositoryError> {
+        Err(RepositoryError::NotImplemented("主动意图写入".into()))
+    }
+
+    async fn find_pending_autonomy_intents(
+        &self,
+        _not_before: chrono::DateTime<chrono::Utc>,
+        _limit: i64,
+    ) -> Result<Vec<AutonomyIntent>, RepositoryError> {
+        Err(RepositoryError::NotImplemented("主动意图恢复扫描".into()))
+    }
+
+    async fn update_autonomy_intent_status(
+        &self,
+        _id: i64,
+        _expected: AutonomyIntentStatus,
+        _status: AutonomyIntentStatus,
+        _updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, RepositoryError> {
+        Err(RepositoryError::NotImplemented("主动意图状态更新".into()))
+    }
+
+    async fn insert_reply_batch(&self, _batch: &ReplyBatch) -> Result<i64, RepositoryError> {
+        Err(RepositoryError::NotImplemented("回复批次写入".into()))
+    }
+
+    async fn find_reply_batch_by_trigger(
+        &self,
+        _trigger_event_uuid: &str,
+    ) -> Result<Option<ReplyBatch>, RepositoryError> {
+        Err(RepositoryError::NotImplemented("回复批次查询".into()))
+    }
+
+    async fn claim_reply_batch(
+        &self,
+        _id: i64,
+        _lease_token: &str,
+        _updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, RepositoryError> {
+        Err(RepositoryError::NotImplemented("回复批次领取".into()))
+    }
+
+    async fn update_reply_batch_status_owned(
+        &self,
+        _id: i64,
+        _lease_token: &str,
+        _expected: ReplyBatchStatus,
+        _status: ReplyBatchStatus,
+        _updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, RepositoryError> {
+        Err(RepositoryError::NotImplemented("回复批次状态更新".into()))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 角色

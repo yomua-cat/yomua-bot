@@ -781,6 +781,55 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
     .execute(pool)
     .await
     .map_err(|e| StorageError::Migration(format!("migration 019 claim index failed: {e}")))?;
+
+    // 迁移 020：持久化主动意图和最小回复批次快照。
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS autonomy_intents (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            character_id      INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+            conversation_id   INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            status            TEXT NOT NULL CHECK(status IN ('pending', 'cancelled', 'enqueued', 'completed', 'failed')),
+            not_before        TEXT NOT NULL,
+            cooldown_key      TEXT NOT NULL,
+            quota_reservation INTEGER NOT NULL DEFAULT 0 CHECK(quota_reservation >= 0),
+            source_snapshot   TEXT NOT NULL,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 020 autonomy_intents failed: {e}")))?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_autonomy_intents_pending ON autonomy_intents(status, not_before, id)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 020 intent index failed: {e}")))?;
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS reply_batches (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id     INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            start_sequence      INTEGER NOT NULL,
+            end_sequence        INTEGER NOT NULL,
+            message_ids         TEXT NOT NULL,
+            trigger_event_uuid  TEXT NOT NULL UNIQUE,
+            context_hash        TEXT NOT NULL,
+            status              TEXT NOT NULL CHECK(status IN ('frozen', 'processing', 'completed', 'cancelled')),
+            lease_token         TEXT,
+            created_at          TEXT NOT NULL,
+            updated_at          TEXT NOT NULL
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 020 reply_batches failed: {e}")))?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_reply_batches_conversation ON reply_batches(conversation_id, start_sequence, id)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 020 batch index failed: {e}")))?;
     Ok(())
 }
 

@@ -1,5 +1,6 @@
 //! SQLite 仓储实现。
 
+mod autonomy_repository;
 mod behavior_state_repository;
 mod binding_repository;
 mod blacklist_repository;
@@ -16,6 +17,7 @@ mod relationship_repository;
 mod state_repository;
 pub(crate) mod timestamp;
 
+pub use autonomy_repository::SqliteAutonomyRepository;
 pub use behavior_state_repository::SqliteBehaviorStateRepository;
 pub use binding_repository::SqliteCharacterBindingRepository;
 pub use blacklist_repository::SqliteBlacklistRepository;
