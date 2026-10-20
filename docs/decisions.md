@@ -26,3 +26,8 @@
 - Jev 决策不再保留旧的聊天 JSON 兼容层，直接采用 TypeSafe typed questions 作为唯一决策协议；同一 state 发送 action choice、hard_constraints noul 和普通回复的 delay_delta_ms score，结果保留问题答案、概率、聚合置信度和模型版本。影响：DecisionResult、决策解析、验证器、TypeSafe 请求装配、主动行为和决策文档。来源：2026-10-19 主会话确认。
 - 模型出站代理只在 `runtime.toml` 配置一份，统一应用于 TypeSafe 和 OpenAI-compatible HTTP 客户端；OneBot/NapCat WebSocket 始终直连，代理变化需要重启生效。影响：运行时配置、模型客户端装配、OneBot 网络隔离测试和配置文档。来源：2026-10-19 代理接入会话。
 - LLM 配置只使用 Provider、Model Instance 和 Role 三层结构；移除旧版单 Provider `provider + options` 解析，旧字段作为未知配置拒绝。影响：LLM 配置解析、首次启动模板、部署配置和配置文档。来源：2026-10-19 主会话确认。
+
+## 2026-10-20
+
+- 第一轮 AI 伴侣运行时改进采用渐进迁移：先加入默认不含正文的 PromptPlan/PromptTrace、固定 PromptSlot 和明确目标记忆 revision 事务；情绪衰减、主动意图和回复批次延后。影响：上下文装配、记忆仓储、控制处理、SQLite 迁移和阶段性验收。
+- 明确目标记忆的 `replace` 保留旧记录并标记 `superseded`，`append` 创建独立正式记忆，revision 通过 `source_request_id` 幂等；候选审核的拒绝状态为 `rejected`，普通召回排除 candidate/rejected/superseded。影响：记忆状态、审核、检索和恢复任务。

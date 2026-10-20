@@ -731,6 +731,31 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
             StorageError::Migration(format!("migration 016 legacy mapping cleanup failed: {e}"))
         })?;
     enforce_user_participant_identity(pool).await?;
+
+    // 迁移 018：明确目标记忆修订审计表。
+    // 旧 memories 行通过 COALESCE(status, 'formal') 继续视为正式记忆，
+    // 无需回写大表；source_request_id 唯一约束保证重放幂等。
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS memory_revisions (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            old_memory_id     INTEGER NOT NULL,
+            new_memory_id     INTEGER NOT NULL,
+            operation         TEXT NOT NULL CHECK(operation IN ('replace', 'append')),
+            reason            TEXT NOT NULL,
+            source_request_id TEXT NOT NULL UNIQUE,
+            model_version     TEXT NOT NULL,
+            created_at        TEXT NOT NULL
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 018 memory_revisions failed: {e}")))?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_revisions_old_memory ON memory_revisions(old_memory_id, created_at)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 018 revision index failed: {e}")))?;
     Ok(())
 }
 

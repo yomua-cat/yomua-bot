@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::application::context::{ConversationContext, CurrentTurn};
 use crate::error::RuntimeError;
 use crate::infrastructure::llm::{LlmMessage, LlmRequest, LlmRole};
@@ -103,6 +105,77 @@ pub enum ContextLayer {
     History = 4,
     /// 低优先级（较旧/较低优先级的 Context）
     LowPriority = 5,
+}
+
+/// 提示词中的稳定语义槽位。
+///
+/// 槽位顺序由 `ContextAssembler` 固定，暂不开放外部配置，避免角色卡或
+/// 模型配置在运行时改变程序级约束的优先级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSlot {
+    Identity,
+    CharacterDefinition,
+    DynamicState,
+    Relationship,
+    Lorebook,
+    Memory,
+    History,
+    CurrentTurn,
+    PostHistory,
+}
+
+/// 一个可追踪的提示词 block。
+///
+/// `content` 只在进程内用于兼容现有渲染路径，不参与 trace 序列化；
+/// trace 只保留内容摘要，避免把消息或记忆正文写入日志和审计数据。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptBlock {
+    pub id: String,
+    pub source: String,
+    pub role: LlmRole,
+    pub position: PromptSlot,
+    pub priority: u8,
+    pub estimated_tokens: usize,
+    pub included: bool,
+    pub omission_reason: Option<String>,
+    pub content_digest: String,
+    #[serde(skip)]
+    pub content: String,
+}
+
+/// 一次上下文组装的结构化计划和可审计摘要。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptPlan {
+    pub trace_id: String,
+    pub context_window: usize,
+    pub output_reserve: usize,
+    pub blocks: Vec<PromptBlock>,
+    pub plan_hash: String,
+}
+
+/// PromptPlan 本身就是默认不含正文的 PromptTrace。
+pub type PromptTrace = PromptPlan;
+
+/// 可关联到事件、Outbox attempt 或决策记录的状态变化摘要。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateTransition {
+    pub source_event_id: String,
+    pub before: serde_json::Value,
+    pub delta: serde_json::Value,
+    pub after: serde_json::Value,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    pub reason: String,
+}
+
+fn stable_digest(value: &str) -> String {
+    // FNV-1a 只用于可重复的诊断摘要，不用于安全校验或身份认证。
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// 默认的 output token 保留量（估算值）。
@@ -245,6 +318,7 @@ impl ContextAssembler {
 
         // 3. 构建 system prompt 组件
         let components = Self::build_system_components(ctx);
+        let current_content = current_turn.content.clone();
 
         // 4. 构建 HistoricalTurns（来自 ConversationContext.recent_messages）
         let history = Self::build_history_turns(ctx, current_turn.participant_id);
@@ -274,6 +348,7 @@ impl ContextAssembler {
             .chain(post_history)
             .chain(std::iter::once(current))
             .collect();
+        let original_messages = messages.clone();
         let mut system_tokens = system_components.total_tokens(&*self.token_estimator);
         let current_tokens = self
             .token_estimator
@@ -321,19 +396,297 @@ impl ContextAssembler {
             }
 
             // 使用降级后的 components
+            let system = degraded_components.render();
+            let prompt_plan = self.build_prompt_plan(
+                ctx,
+                context_window,
+                &degraded_components,
+                &components,
+                &original_messages,
+                &messages,
+                &current_content,
+            );
             Ok(AssembledContext {
-                system: degraded_components.render(),
+                system,
                 messages,
                 total_tokens,
                 system_tokens,
+                prompt_plan,
             })
         } else {
+            let system = system_components.render();
+            let prompt_plan = self.build_prompt_plan(
+                ctx,
+                context_window,
+                &system_components,
+                &components,
+                &original_messages,
+                &messages,
+                &current_content,
+            );
             Ok(AssembledContext {
-                system: system_components.render(),
+                system,
                 messages,
                 total_tokens,
                 system_tokens,
+                prompt_plan,
             })
+        }
+    }
+
+    /// 从最终 system 组件和 messages 生成稳定、默认不含正文的提示词计划。
+    #[allow(clippy::too_many_arguments)]
+    fn build_prompt_plan(
+        &self,
+        ctx: &ConversationContext,
+        context_window: usize,
+        final_components: &SystemPromptComponents,
+        original_components: &SystemPromptComponents,
+        original_messages: &[LlmMessage],
+        messages: &[LlmMessage],
+        current_content: &str,
+    ) -> PromptPlan {
+        let mut blocks = Vec::new();
+        let mut push_component = |id: &str,
+                                  source: &str,
+                                  role: LlmRole,
+                                  position: PromptSlot,
+                                  priority: u8,
+                                  original: Option<&String>,
+                                  final_value: Option<&String>| {
+            if let Some(content) = original {
+                blocks.push(PromptBlock {
+                    id: id.to_string(),
+                    source: source.to_string(),
+                    role,
+                    position,
+                    priority,
+                    estimated_tokens: self.token_estimator.estimate_text(content),
+                    included: final_value.is_some(),
+                    omission_reason: final_value
+                        .is_none()
+                        .then(|| "budget_degradation".to_string()),
+                    content_digest: stable_digest(content),
+                    content: content.clone(),
+                });
+            }
+        };
+
+        push_component(
+            "program.hard_constraints",
+            "program",
+            LlmRole::System,
+            PromptSlot::Identity,
+            0,
+            original_components.hard_constraints.as_ref(),
+            final_components.hard_constraints.as_ref(),
+        );
+        push_component(
+            "character.identity",
+            "character",
+            LlmRole::System,
+            PromptSlot::Identity,
+            1,
+            original_components.identity.as_ref(),
+            final_components.identity.as_ref(),
+        );
+        push_component(
+            "character.definition",
+            "character",
+            LlmRole::System,
+            PromptSlot::CharacterDefinition,
+            2,
+            original_components.definition.as_ref(),
+            final_components.definition.as_ref(),
+        );
+        if original_components.state_context.is_some() {
+            let dynamic_content = format!(
+                "energy={:.2};stress={:.2};mood={};activity={}",
+                ctx.character.state.energy,
+                ctx.character.state.stress,
+                ctx.current_mood
+                    .as_ref()
+                    .map(|mood| format!("{:.2}", mood.value))
+                    .unwrap_or_else(|| "none".into()),
+                ctx.character
+                    .state
+                    .current_activity
+                    .as_deref()
+                    .unwrap_or("none")
+            );
+            blocks.push(PromptBlock {
+                id: "state.dynamic".to_string(),
+                source: "state".to_string(),
+                role: LlmRole::System,
+                position: PromptSlot::DynamicState,
+                priority: 3,
+                estimated_tokens: self.token_estimator.estimate_text(&dynamic_content),
+                included: final_components.state_context.is_some(),
+                omission_reason: final_components
+                    .state_context
+                    .is_none()
+                    .then(|| "budget_degradation".to_string()),
+                content_digest: stable_digest(&dynamic_content),
+                content: dynamic_content,
+            });
+        }
+        if let Some(rel) = &ctx.relationship {
+            let relationship_content = format!(
+                "familiarity={:.2};affection={:.2};trust={:.2};respect={:.2};annoyance={:.2};intimacy={:.2}",
+                rel.familiarity,
+                rel.affection,
+                rel.trust,
+                rel.respect,
+                rel.annoyance,
+                rel.intimacy
+            );
+            blocks.push(PromptBlock {
+                id: "relationship.current".to_string(),
+                source: "relationship".to_string(),
+                role: LlmRole::System,
+                position: PromptSlot::Relationship,
+                priority: 4,
+                estimated_tokens: self.token_estimator.estimate_text(&relationship_content),
+                included: final_components.state_context.is_some(),
+                omission_reason: final_components
+                    .state_context
+                    .is_none()
+                    .then(|| "budget_degradation".to_string()),
+                content_digest: stable_digest(&relationship_content),
+                content: relationship_content,
+            });
+        }
+
+        // `derived` 仍由现有渲染器作为一个兼容 block 输出；这里额外记录
+        // lorebook 和 memory 的来源摘要，便于定位预算降级而不改变 wire format。
+        let derived_included = final_components.derived.is_some();
+        if let Some(derived) = original_components.derived.as_ref() {
+            let lorebook_text = if ctx.matching_lorebook.is_empty() {
+                None
+            } else {
+                Some(
+                    ctx.matching_lorebook
+                        .iter()
+                        .map(|entry| entry.content.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            };
+            let memory_text = if ctx.memory.is_empty() {
+                None
+            } else {
+                Some(
+                    ctx.memory
+                        .iter()
+                        .map(|memory| memory.content.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            };
+            for (id, source, slot, priority, content) in [
+                (
+                    "context.lorebook",
+                    "lorebook",
+                    PromptSlot::Lorebook,
+                    5,
+                    lorebook_text.clone(),
+                ),
+                (
+                    "context.memory",
+                    "memory",
+                    PromptSlot::Memory,
+                    6,
+                    memory_text.clone(),
+                ),
+            ] {
+                if let Some(content) = content {
+                    blocks.push(PromptBlock {
+                        id: id.to_string(),
+                        source: source.to_string(),
+                        role: LlmRole::System,
+                        position: slot,
+                        priority,
+                        estimated_tokens: self.token_estimator.estimate_text(&content),
+                        included: derived_included,
+                        omission_reason: (!derived_included)
+                            .then(|| "budget_degradation".to_string()),
+                        content_digest: stable_digest(&content),
+                        content,
+                    });
+                }
+            }
+            if lorebook_text.is_none() && memory_text.is_none() {
+                blocks.push(PromptBlock {
+                    id: "context.derived".to_string(),
+                    source: "derived".to_string(),
+                    role: LlmRole::System,
+                    position: PromptSlot::Memory,
+                    priority: 6,
+                    estimated_tokens: self.token_estimator.estimate_text(derived),
+                    included: derived_included,
+                    omission_reason: (!derived_included).then(|| "budget_degradation".to_string()),
+                    content_digest: stable_digest(derived),
+                    content: derived.clone(),
+                });
+            }
+        }
+
+        let current_index = original_messages.len().saturating_sub(1);
+        let mut final_cursor = 0;
+        for (index, message) in original_messages.iter().enumerate() {
+            let (id, position, priority) = if index == current_index
+                && message.role == LlmRole::User
+                && message.content == current_content
+            {
+                ("current.turn".to_string(), PromptSlot::CurrentTurn, 0)
+            } else if message.role == LlmRole::System {
+                (
+                    "post_history.instructions".to_string(),
+                    PromptSlot::PostHistory,
+                    1,
+                )
+            } else {
+                (format!("history.{index}"), PromptSlot::History, 7)
+            };
+            let included = messages.get(final_cursor).is_some_and(|candidate| {
+                candidate.role == message.role && candidate.content == message.content
+            });
+            if included {
+                final_cursor += 1;
+            }
+            blocks.push(PromptBlock {
+                id,
+                source: match position {
+                    PromptSlot::History => "conversation_history",
+                    PromptSlot::PostHistory => "post_history_instructions",
+                    PromptSlot::CurrentTurn => "current_turn",
+                    _ => "conversation_context",
+                }
+                .to_string(),
+                role: message.role,
+                position,
+                priority,
+                estimated_tokens: self.token_estimator.estimate_message(message),
+                included,
+                omission_reason: (!included).then(|| "budget_degradation".to_string()),
+                content_digest: stable_digest(&message.content),
+                content: message.content.clone(),
+            });
+        }
+
+        let trace_id = uuid::Uuid::new_v4().to_string();
+        let canonical = serde_json::json!({
+            "context_window": context_window,
+            "output_reserve": self.config.output_reservation,
+            "blocks": blocks,
+        });
+        let plan_hash = stable_digest(&canonical.to_string());
+        PromptPlan {
+            trace_id,
+            context_window,
+            output_reserve: self.config.output_reservation,
+            blocks,
+            plan_hash,
         }
     }
 
@@ -654,6 +1007,8 @@ pub struct AssembledContext {
     pub total_tokens: usize,
     /// 估算的 system prompt token 数。
     pub system_tokens: usize,
+    /// 结构化提示词计划；序列化时默认不包含正文。
+    pub prompt_plan: PromptPlan,
 }
 
 /// System Prompt 的结构化组件（用于有序降级）。
@@ -811,8 +1166,9 @@ impl ModelCapabilitiesProvider for ModelCapabilitiesProviderAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::character::{Character, CharacterDefinition, CharacterState};
+    use crate::domain::character::{Character, CharacterDefinition, CharacterState, LorebookEntry};
     use crate::domain::conversation::{Conversation, ConversationType};
+    use crate::domain::memory::{Memory, MemoryType};
     use crate::domain::message::{Message, MessageContent};
     use crate::infrastructure::llm::FixedModelCapabilities;
     use chrono::Utc;
@@ -2137,6 +2493,90 @@ mod tests {
             result.system_tokens > 0,
             "system_tokens 应大于 0，实际: {}",
             result.system_tokens
+        );
+    }
+
+    #[test]
+    fn prompt_plan_is_deterministic_and_trace_hides_content() {
+        let estimator = Arc::new(MockTokenEstimator);
+        let model = Arc::new(MockModelCapabilities {
+            context_window: 10_000,
+        });
+        let assembler = ContextAssembler::new(estimator, model);
+        let mut ctx = test_ctx(vec![]);
+        ctx.matching_lorebook.push(LorebookEntry {
+            keywords: vec!["咖啡".into()],
+            content: "仅供内部的 lorebook 内容".into(),
+            priority: 10,
+            enabled: true,
+        });
+        let mut memory = Memory::new(
+            1,
+            Some(1),
+            MemoryType::Semantic,
+            "跨会话私密记忆正文".into(),
+            0.8,
+        );
+        memory.id = 41;
+        ctx.memory.push(memory);
+        let current = test_current_turn();
+
+        let first = assembler
+            .assemble(&ctx, current.clone())
+            .expect("首次组装应成功");
+        let second = assembler.assemble(&ctx, current).expect("重复组装应成功");
+        assert_eq!(first.prompt_plan.plan_hash, second.prompt_plan.plan_hash);
+        assert_ne!(first.prompt_plan.trace_id, second.prompt_plan.trace_id);
+        let ids: Vec<&str> = first
+            .prompt_plan
+            .blocks
+            .iter()
+            .map(|block| block.id.as_str())
+            .collect();
+        assert!(ids.contains(&"context.lorebook"));
+        assert!(ids.contains(&"context.memory"));
+        assert_eq!(ids.iter().filter(|id| **id == "current.turn").count(), 1);
+        let trace = serde_json::to_string(&first.prompt_plan).expect("trace 应可序列化");
+        assert!(!trace.contains("跨会话私密记忆正文"));
+        assert!(!trace.contains("仅供内部的 lorebook 内容"));
+    }
+
+    #[test]
+    fn prompt_plan_records_budget_omission_reason() {
+        let estimator = Arc::new(MockTokenEstimator);
+        let model = Arc::new(MockModelCapabilities {
+            context_window: 700,
+        });
+        let assembler = ContextAssembler::with_config(
+            estimator,
+            model,
+            ContextAssemblyConfig {
+                degradation_enabled: true,
+                output_reservation: 128,
+                runtime_max_output_tokens: None,
+            },
+        );
+        let mut ctx = test_ctx(vec![]);
+        ctx.memory.push(Memory::new(
+            1,
+            Some(1),
+            MemoryType::Semantic,
+            "很长的记忆内容".repeat(200),
+            0.8,
+        ));
+        let result = assembler
+            .assemble(&ctx, test_current_turn())
+            .expect("降级后仍应能保留当前轮");
+        let memory_block = result
+            .prompt_plan
+            .blocks
+            .iter()
+            .find(|block| block.id == "context.memory")
+            .expect("应记录 memory block");
+        assert!(!memory_block.included);
+        assert_eq!(
+            memory_block.omission_reason.as_deref(),
+            Some("budget_degradation")
         );
     }
 

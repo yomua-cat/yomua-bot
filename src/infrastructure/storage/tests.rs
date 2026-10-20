@@ -1552,6 +1552,175 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn memory_revision_replace_append_is_idempotent_and_auditable() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let mem_repo = crate::infrastructure::storage::repository::SqliteMemoryRepository::new(
+            storage.pool().clone(),
+        );
+        let character_id = char_repo
+            .insert(&Character {
+                id: 0,
+                definition: CharacterDefinition {
+                    name: "RevisionTest".into(),
+                    description: None,
+                    personality: None,
+                    scenario: None,
+                    style: None,
+                    background: None,
+                    greetings: vec![],
+                    example_messages: vec![],
+                    system_prompt: None,
+                    post_history_instructions: None,
+                    lorebook: vec![],
+                    metadata: serde_json::json!({}),
+                },
+                enabled: true,
+                state: CharacterState::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let original = Memory::new(
+            character_id,
+            None,
+            MemoryType::Semantic,
+            "用户喜欢猫".into(),
+            0.8,
+        );
+        let old_id = mem_repo.insert(&original).await.unwrap();
+        let old = mem_repo.find_by_id(old_id).await.unwrap().unwrap();
+        let applied_at = chrono::Utc::now();
+        let request = MemoryRevisionRequest {
+            expected_old: old.clone(),
+            operation: MemoryRevisionOperation::Replace,
+            content: "用户喜欢狗".into(),
+            metadata: serde_json::json!({
+                "edit_request": {"status": "applied", "source_request_id": "revision-1"},
+                "source_message_id": 123,
+            }),
+            reason: "用户明确纠正偏好".into(),
+            source_request_id: "revision-1".into(),
+            model_version: "test-model".into(),
+            applied_at,
+        };
+        let first = mem_repo.apply_revision(&request).await.unwrap();
+        assert!(first.applied);
+        assert_eq!(first.old_memory_id, old_id);
+        let superseded = mem_repo.find_by_id(old_id).await.unwrap().unwrap();
+        assert_eq!(superseded.metadata["status"], "superseded");
+        assert_eq!(superseded.content, "用户喜欢猫");
+        let current = mem_repo
+            .find_by_id(first.new_memory_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.content, "用户喜欢狗");
+        assert_eq!(current.metadata["status"], "formal");
+        assert_eq!(current.metadata["revision"]["old_memory_id"], old_id);
+
+        let replay = mem_repo.apply_revision(&request).await.unwrap();
+        assert!(!replay.applied);
+        assert_eq!(replay.new_memory_id, first.new_memory_id);
+        let revision_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_revisions")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(revision_count, 1);
+
+        let append_request = MemoryRevisionRequest {
+            expected_old: current.clone(),
+            operation: MemoryRevisionOperation::Append,
+            content: "用户也喜欢茶".into(),
+            metadata: serde_json::json!({"edit_request": {"status": "applied"}}),
+            reason: "补充事实".into(),
+            source_request_id: "revision-2".into(),
+            model_version: "test-model".into(),
+            applied_at: chrono::Utc::now(),
+        };
+        let appended = mem_repo.apply_revision(&append_request).await.unwrap();
+        assert!(appended.applied);
+        let still_formal = mem_repo.find_by_id(current.id).await.unwrap().unwrap();
+        assert_eq!(still_formal.metadata["status"], "formal");
+        let visible = mem_repo.find_all(10).await.unwrap();
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().all(|memory| memory.id != old_id));
+    }
+
+    #[tokio::test]
+    async fn memory_revision_rolls_back_when_revision_insert_fails() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let mem_repo = crate::infrastructure::storage::repository::SqliteMemoryRepository::new(
+            storage.pool().clone(),
+        );
+        let character_id = char_repo
+            .insert(&Character {
+                id: 0,
+                definition: CharacterDefinition {
+                    name: "RollbackRevision".into(),
+                    description: None,
+                    personality: None,
+                    scenario: None,
+                    style: None,
+                    background: None,
+                    greetings: vec![],
+                    example_messages: vec![],
+                    system_prompt: None,
+                    post_history_instructions: None,
+                    lorebook: vec![],
+                    metadata: serde_json::json!({}),
+                },
+                enabled: true,
+                state: CharacterState::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let memory = Memory::new(
+            character_id,
+            None,
+            MemoryType::Semantic,
+            "原始事实".into(),
+            0.7,
+        );
+        let old_id = mem_repo.insert(&memory).await.unwrap();
+        let old = mem_repo.find_by_id(old_id).await.unwrap().unwrap();
+        sqlx::query("DROP TABLE memory_revisions")
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        let result = mem_repo
+            .apply_revision(&MemoryRevisionRequest {
+                expected_old: old,
+                operation: MemoryRevisionOperation::Replace,
+                content: "新事实".into(),
+                metadata: serde_json::json!({}),
+                reason: "测试回滚".into(),
+                source_request_id: "rollback-1".into(),
+                model_version: "test-model".into(),
+                applied_at: chrono::Utc::now(),
+            })
+            .await;
+        assert!(result.is_err());
+        let memories: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(memories, 1);
+        assert_eq!(
+            mem_repo.find_by_id(old_id).await.unwrap().unwrap().content,
+            "原始事实"
+        );
+    }
+
+    #[tokio::test]
     async fn pending_memory_edit_requests_survive_restart_scan() {
         let storage = setup_storage().await;
         let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
@@ -2059,7 +2228,7 @@ mod storage_tests {
             .unwrap();
         assert!(rejected);
         let stored = memory_repo.find_by_id(1).await.unwrap().unwrap();
-        assert_eq!(stored.metadata["status"], "candidate");
+        assert_eq!(stored.metadata["status"], "rejected");
         assert_eq!(stored.metadata["verification"], "decision_model_reviewed");
         assert_eq!(stored.metadata["review"]["decision"], "reject");
 

@@ -76,6 +76,46 @@ pub struct MemoryCandidateReview {
     pub reviewed_at: DateTime<Utc>,
 }
 
+/// 受程序约束的记忆修订操作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemoryRevisionOperation {
+    Replace,
+    Append,
+}
+
+impl MemoryRevisionOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Append => "append",
+        }
+    }
+}
+
+/// 一次明确目标记忆的修订请求。
+///
+/// `expected_old` 是模型调用开始前保存的快照，仓储必须在事务内再次校验，
+/// 避免旧模型结果覆盖并发修改。
+#[derive(Debug, Clone)]
+pub struct MemoryRevisionRequest {
+    pub expected_old: Memory,
+    pub operation: MemoryRevisionOperation,
+    pub content: String,
+    pub metadata: serde_json::Value,
+    pub reason: String,
+    pub source_request_id: String,
+    pub model_version: String,
+    pub applied_at: DateTime<Utc>,
+}
+
+/// 记忆修订的持久化结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRevisionResult {
+    pub old_memory_id: i64,
+    pub new_memory_id: i64,
+    pub applied: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateReviewDecision {
     Confirm,

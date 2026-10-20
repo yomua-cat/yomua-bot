@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 
 use crate::domain::memory::{
-    CandidateReviewDecision, Memory, MemoryCandidateReview, MemoryType, SemanticMatchResult,
+    CandidateReviewDecision, Memory, MemoryCandidateReview, MemoryRevisionOperation,
+    MemoryRevisionRequest, MemoryRevisionResult, MemoryType, SemanticMatchResult,
 };
 use crate::domain::repository::MemoryRepository;
 use crate::error::RepositoryError;
@@ -65,10 +66,10 @@ impl MemoryRepository for SqliteMemoryRepository {
             CandidateReviewDecision::Reject => "reject",
             CandidateReviewDecision::Defer => "defer",
         };
-        let status = if matches!(review.decision, CandidateReviewDecision::Confirm) {
-            "formal"
-        } else {
-            "candidate"
+        let status = match review.decision {
+            CandidateReviewDecision::Confirm => "formal",
+            CandidateReviewDecision::Reject => "rejected",
+            CandidateReviewDecision::Defer => "candidate",
         };
         let metadata = serde_json::json!({
             "decision": decision,
@@ -239,7 +240,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         conversation_id: i64,
         limit: i64,
     ) -> Result<Vec<Memory>, RepositoryError> {
-        let rows:Vec<MemoryRow>=sqlx::query_as("SELECT id,character_id,user_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding FROM memories WHERE character_id=? AND COALESCE(json_extract(metadata,'$.status'),'formal') != 'candidate' AND conversation_id=? ORDER BY importance DESC,created_at DESC,id DESC LIMIT ?")
+        let rows:Vec<MemoryRow>=sqlx::query_as("SELECT id,character_id,user_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding FROM memories WHERE character_id=? AND COALESCE(json_extract(metadata,'$.status'),'formal') NOT IN ('candidate','rejected','superseded') AND conversation_id=? ORDER BY importance DESC,created_at DESC,id DESC LIMIT ?")
             .bind(character_id).bind(conversation_id).bind(limit.max(0)).fetch_all(&self.pool).await?;
         rows.into_iter().map(parse_memory_row).collect()
     }
@@ -251,7 +252,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         user_id: Option<i64>,
         limit: i64,
     ) -> Result<Vec<Memory>, RepositoryError> {
-        let base = "SELECT id,character_id,user_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding FROM memories WHERE character_id=? AND COALESCE(json_extract(metadata,'$.status'),'formal') != 'candidate' AND (conversation_id=?";
+        let base = "SELECT id,character_id,user_id,conversation_id,memory_type,content,importance,created_at,last_accessed,metadata,embedding FROM memories WHERE character_id=? AND COALESCE(json_extract(metadata,'$.status'),'formal') NOT IN ('candidate','rejected','superseded') AND (conversation_id=?";
         let rows: Vec<MemoryRow> = match user_id {
             Some(user_id) => sqlx::query_as(&format!(
                 "{base} OR (user_id=? AND COALESCE(json_extract(metadata,'$.shared'),0)=1 AND NOT EXISTS (SELECT 1 FROM memory_sharing_policies policy WHERE policy.character_id=memories.character_id AND policy.user_id=memories.user_id AND policy.status='confirmed'))) ORDER BY importance DESC,created_at DESC,id DESC LIMIT ?"
@@ -295,7 +296,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         );
         builder.push_bind(character_id);
         builder.push(
-            " AND COALESCE(json_extract(metadata,'$.status'),'formal') != 'candidate' AND (conversation_id=",
+            " AND COALESCE(json_extract(metadata,'$.status'),'formal') NOT IN ('candidate','rejected','superseded') AND (conversation_id=",
         );
         builder.push_bind(conversation_id);
         match user_id {
@@ -432,7 +433,7 @@ impl MemoryRepository for SqliteMemoryRepository {
                 r#"SELECT id, character_id, user_id, conversation_id, memory_type, content,
                         importance, created_at, last_accessed, metadata, embedding
                      FROM memories WHERE character_id = ? AND memory_type = ?
-                       AND COALESCE(json_extract(metadata, '$.status'), 'formal') != 'candidate'
+                       AND COALESCE(json_extract(metadata, '$.status'), 'formal') NOT IN ('candidate','rejected','superseded')
                      ORDER BY importance DESC, created_at DESC LIMIT ?"#,
             )
             .bind(character_id)
@@ -445,7 +446,7 @@ impl MemoryRepository for SqliteMemoryRepository {
                 r#"SELECT id, character_id, user_id, conversation_id, memory_type, content,
                         importance, created_at, last_accessed, metadata, embedding
                      FROM memories WHERE character_id = ?
-                       AND COALESCE(json_extract(metadata, '$.status'), 'formal') != 'candidate'
+                  AND COALESCE(json_extract(metadata, '$.status'), 'formal') NOT IN ('candidate','rejected','superseded')
                      ORDER BY importance DESC, created_at DESC LIMIT ?"#,
             )
             .bind(character_id)
@@ -485,7 +486,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         );
         builder.push_bind(character_id);
         builder.push(
-            " AND COALESCE(json_extract(metadata, '$.status'), 'formal') != 'candidate' AND (",
+            " AND COALESCE(json_extract(metadata, '$.status'), 'formal') NOT IN ('candidate','rejected','superseded') AND (",
         );
         let mut first = true;
         for kw in &unique {
@@ -559,6 +560,153 @@ impl MemoryRepository for SqliteMemoryRepository {
         Ok(())
     }
 
+    async fn apply_revision(
+        &self,
+        request: &MemoryRevisionRequest,
+    ) -> Result<MemoryRevisionResult, RepositoryError> {
+        let old = &request.expected_old;
+        let old_metadata = serde_json::to_string(&old.metadata)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut tx = self.pool.begin().await?;
+
+        let existing_revision: Option<(i64, i64, String)> = sqlx::query_as(
+            "SELECT old_memory_id, new_memory_id, operation FROM memory_revisions WHERE source_request_id = ?",
+        )
+        .bind(&request.source_request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((old_memory_id, new_memory_id, _operation)) = existing_revision {
+            tx.commit().await?;
+            return Ok(MemoryRevisionResult {
+                old_memory_id,
+                new_memory_id,
+                applied: false,
+            });
+        }
+
+        let current_matches: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM memories
+                WHERE id = ? AND content = ? AND importance = ?
+                  AND datetime(last_accessed) = datetime(?) AND metadata = ?"#,
+        )
+        .bind(old.id)
+        .bind(&old.content)
+        .bind(old.importance)
+        .bind(old.last_accessed.to_rfc3339())
+        .bind(&old_metadata)
+        .fetch_one(&mut *tx)
+        .await?;
+        if current_matches != 1 {
+            let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM memories WHERE id = ?")
+                .bind(old.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            tx.rollback().await?;
+            return if exists.is_none() {
+                Err(RepositoryError::NotFound(format!(
+                    "memory {} not found",
+                    old.id
+                )))
+            } else {
+                Err(RepositoryError::Internal(
+                    "记忆修订冲突：原记忆已被修改".into(),
+                ))
+            };
+        }
+
+        let mut new_metadata = request.metadata.clone();
+        if !new_metadata.is_object() {
+            new_metadata = serde_json::json!({});
+        }
+        new_metadata["status"] = serde_json::Value::String("formal".into());
+        new_metadata["revision"] = serde_json::json!({
+            "old_memory_id": old.id,
+            "source_request_id": request.source_request_id.clone(),
+            "reason": request.reason.clone(),
+        });
+        let new_metadata_json = serde_json::to_string(&new_metadata)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let inserted = sqlx::query(
+            r#"INSERT INTO memories
+                (character_id, user_id, conversation_id, memory_type, content, importance,
+                 created_at, last_accessed, metadata, embedding)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(old.character_id)
+        .bind(old.user_id)
+        .bind(old.conversation_id)
+        .bind(memory_type_name(old.memory_type))
+        .bind(&request.content)
+        .bind(old.importance)
+        .bind(request.applied_at.to_rfc3339())
+        .bind(request.applied_at.to_rfc3339())
+        .bind(&new_metadata_json)
+        .bind(&old.embedding)
+        .execute(&mut *tx)
+        .await?;
+        let new_memory_id = inserted.last_insert_rowid();
+
+        let mut old_update_metadata = old.metadata.clone();
+        if !old_update_metadata.is_object() {
+            old_update_metadata = serde_json::json!({});
+        }
+        if matches!(request.operation, MemoryRevisionOperation::Replace) {
+            old_update_metadata["status"] = serde_json::Value::String("superseded".into());
+            old_update_metadata["superseded_by"] = serde_json::Value::from(new_memory_id);
+            old_update_metadata["superseded_at"] =
+                serde_json::Value::String(request.applied_at.to_rfc3339());
+        }
+        if let Some(edit_request) = new_metadata.get("edit_request") {
+            old_update_metadata["edit_request"] = edit_request.clone();
+        }
+        old_update_metadata["revision"] = serde_json::json!({
+            "new_memory_id": new_memory_id,
+            "source_request_id": request.source_request_id.clone(),
+            "reason": request.reason.clone(),
+        });
+        let old_update_json = serde_json::to_string(&old_update_metadata)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let updated = sqlx::query(
+            "UPDATE memories SET metadata = ?, last_accessed = ? WHERE id = ? AND content = ? AND importance = ? AND metadata = ?",
+        )
+        .bind(&old_update_json)
+        .bind(request.applied_at.to_rfc3339())
+        .bind(old.id)
+        .bind(&old.content)
+        .bind(old.importance)
+        .bind(&old_metadata)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(RepositoryError::Internal(
+                "记忆修订冲突：无法更新旧记忆".into(),
+            ));
+        }
+
+        sqlx::query(
+            r#"INSERT INTO memory_revisions
+                (old_memory_id, new_memory_id, operation, reason, source_request_id, model_version, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(old.id)
+        .bind(new_memory_id)
+        .bind(request.operation.as_str())
+        .bind(&request.reason)
+        .bind(&request.source_request_id)
+        .bind(&request.model_version)
+        .bind(request.applied_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(MemoryRevisionResult {
+            old_memory_id: old.id,
+            new_memory_id,
+            applied: true,
+        })
+    }
+
     async fn update_if_unchanged(
         &self,
         memory: &Memory,
@@ -621,7 +769,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             r#"SELECT id, character_id, user_id, conversation_id, memory_type, content,
                       importance, created_at, last_accessed, metadata, embedding
                FROM memories
-               WHERE COALESCE(json_extract(metadata, '$.status'), 'formal') != 'candidate'
+               WHERE COALESCE(json_extract(metadata, '$.status'), 'formal') NOT IN ('candidate','rejected','superseded')
                ORDER BY importance DESC, created_at DESC, id DESC
                LIMIT ?"#,
         )
@@ -641,7 +789,7 @@ impl MemoryRepository for SqliteMemoryRepository {
                       importance, created_at, last_accessed, metadata, embedding
                FROM memories
                WHERE conversation_id = ?
-                 AND COALESCE(json_extract(metadata, '$.status'), 'formal') != 'candidate'
+                 AND COALESCE(json_extract(metadata, '$.status'), 'formal') NOT IN ('candidate','rejected','superseded')
                ORDER BY importance DESC, created_at DESC, id DESC
                LIMIT ?"#,
         )
@@ -670,7 +818,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         let mut query = String::from(
             r#"SELECT id, character_id, user_id, conversation_id, memory_type, content,
                       importance, created_at, last_accessed, metadata, embedding
-               FROM memories WHERE COALESCE(json_extract(metadata, '$.status'), 'formal') != 'candidate'"#,
+               FROM memories WHERE COALESCE(json_extract(metadata, '$.status'), 'formal') NOT IN ('candidate','rejected','superseded')"#,
         );
         let mut builder = sqlx::QueryBuilder::new(&query);
 

@@ -12,7 +12,9 @@ use crate::domain::character::{
 };
 use crate::domain::conversation::{Conversation, ConversationType, Participant};
 use crate::domain::emotion::Mood;
-use crate::domain::memory::{Memory, MemoryCandidateReview, SemanticMatchResult};
+use crate::domain::memory::{
+    Memory, MemoryCandidateReview, MemoryRevisionRequest, MemoryRevisionResult, SemanticMatchResult,
+};
 use crate::domain::message::Message;
 use crate::domain::relationship::Relationship;
 use crate::error::RepositoryError;
@@ -844,8 +846,10 @@ pub trait MemoryRepository: Send + Sync {
             .find_by_character_id(character_id, None, i64::MAX)
             .await?;
         items.retain(|m| {
-            m.metadata.get("status").and_then(|value| value.as_str()) != Some("candidate")
-                && m.conversation_id == Some(conversation_id)
+            !matches!(
+                m.metadata.get("status").and_then(|value| value.as_str()),
+                Some("candidate" | "rejected" | "superseded")
+            ) && m.conversation_id == Some(conversation_id)
         });
         items.truncate(limit.max(0) as usize);
         Ok(items)
@@ -941,6 +945,16 @@ pub trait MemoryRepository: Send + Sync {
 
     async fn insert(&self, memory: &Memory) -> Result<i64, RepositoryError>;
     async fn update(&self, memory: &Memory) -> Result<(), RepositoryError>;
+
+    /// 在同一事务内应用明确目标记忆的 replace/append 修订。
+    ///
+    /// 轻量测试仓储可以保留默认实现；生产 SQLite 仓储必须提供事务语义。
+    async fn apply_revision(
+        &self,
+        _request: &MemoryRevisionRequest,
+    ) -> Result<MemoryRevisionResult, RepositoryError> {
+        Err(RepositoryError::NotImplemented("记忆修订事务".into()))
+    }
 
     /// 仅在持久化内容仍与 `expected` 一致时更新记忆。
     ///

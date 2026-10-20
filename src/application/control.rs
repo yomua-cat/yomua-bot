@@ -43,6 +43,7 @@ use crate::application::llm_scheduler::LlmScheduler;
 use crate::application::runtime::CharacterRuntime;
 use crate::domain::character::ConversationState;
 use crate::domain::emotion::Mood;
+use crate::domain::memory::{MemoryRevisionOperation, MemoryRevisionRequest};
 
 use crate::domain::repository::{
     BlacklistRepository, CharacterRepository, CharacterStateRepository, ConversationRepository,
@@ -1706,10 +1707,12 @@ fn handle_memory_update(
         };
 
         let requested_at = chrono::Utc::now().to_rfc3339();
+        let source_request_id = uuid::Uuid::new_v4().to_string();
         memory.metadata["edit_request"] = serde_json::json!({
             "instruction": instruction,
             "status": "pending",
             "requested_at": requested_at,
+            "source_request_id": source_request_id.clone(),
         });
         // 先把请求状态写入数据库，再调用模型。进程在模型调用期间崩溃时，
         // 下次仍能看到这次修改处于 pending，而不是把审计记录留在内存里。
@@ -1754,6 +1757,7 @@ fn handle_memory_update(
                     "instruction": instruction,
                     "status": "failed",
                     "requested_at": requested_at,
+                    "source_request_id": source_request_id.clone(),
                     "error": error.to_string(),
                 });
                 let _ = handle
@@ -1771,6 +1775,7 @@ fn handle_memory_update(
                     "instruction": instruction,
                     "status": "rejected",
                     "requested_at": requested_at,
+                    "source_request_id": source_request_id.clone(),
                     "error": error,
                 });
                 let _ = handle
@@ -1806,21 +1811,25 @@ fn handle_memory_update(
         }
         memory = current;
 
-        let old_content = memory.content.clone();
-        match suggestion.action.as_str() {
-            "replace" => memory.content = suggestion.content.clone(),
-            "append" => {
-                memory.content = format!("{}\n{}", memory.content.trim_end(), suggestion.content)
-            }
-            "no_change" => {}
+        let operation = match suggestion.action.as_str() {
+            "replace" => Some(MemoryRevisionOperation::Replace),
+            "append" => Some(MemoryRevisionOperation::Append),
+            "no_change" => None,
             _ => unreachable!("parse_memory_edit_suggestion 已校验 action"),
-        }
-        if memory.content.chars().count() > 20_000 {
-            memory.content = old_content;
+        };
+        let revised_content = match operation {
+            Some(MemoryRevisionOperation::Replace) => suggestion.content.clone(),
+            Some(MemoryRevisionOperation::Append) => {
+                format!("{}\n{}", memory.content.trim_end(), suggestion.content)
+            }
+            None => memory.content.clone(),
+        };
+        if revised_content.chars().count() > 20_000 {
             memory.metadata["edit_request"] = serde_json::json!({
                 "instruction": instruction,
                 "status": "rejected",
                 "requested_at": requested_at,
+                "source_request_id": source_request_id,
                 "error": "修改后的记忆超过 20000 个字符",
             });
             let _ = handle
@@ -1832,37 +1841,68 @@ fn handle_memory_update(
                 ControlErrorDetail::new("MEMORY_EDIT_REJECTED", "修改后的记忆过长"),
             ));
         }
-        let applied_at = chrono::Utc::now().to_rfc3339();
-        memory.metadata["edit_request"] = serde_json::json!({
+
+        let applied_at = chrono::Utc::now();
+        let mut applied_metadata = memory.metadata.clone();
+        applied_metadata["edit_request"] = serde_json::json!({
             "instruction": instruction,
             "status": "applied",
             "action": suggestion.action,
-            "reason": suggestion.reason,
+            "reason": suggestion.reason.clone(),
             "requested_at": requested_at,
-            "applied_at": applied_at,
-            "model": response.model,
+            "applied_at": applied_at.to_rfc3339(),
+            "model": response.model.clone(),
+            "source_request_id": source_request_id.clone(),
         });
-        memory.metadata["updated_by"] = serde_json::Value::String("llm_memory_edit".to_string());
-        if !handle
-            .memory_repo
-            .update_if_unchanged(&memory, &pending_snapshot)
-            .await?
-        {
-            return Ok(ControlResponse::err(
+        applied_metadata["updated_by"] = serde_json::Value::String("llm_memory_edit".to_string());
+
+        let Some(operation) = operation else {
+            memory.metadata = applied_metadata;
+            if !handle
+                .memory_repo
+                .update_if_unchanged(&memory, &pending_snapshot)
+                .await?
+            {
+                return Ok(ControlResponse::err(
+                    id,
+                    ControlErrorDetail::new(
+                        "MEMORY_EDIT_CONFLICT",
+                        "模型处理期间记忆已被其他请求修改，本次建议未应用",
+                    ),
+                ));
+            }
+            return Ok(ControlResponse::ok(
                 id,
-                ControlErrorDetail::new(
-                    "MEMORY_EDIT_CONFLICT",
-                    "模型处理期间记忆已被其他请求修改，本次建议未应用",
-                ),
+                serde_json::json!({
+                    "memory_id": memory.id,
+                    "updated": true,
+                    "action": "no_change",
+                    "content_changed": false,
+                }),
             ));
-        }
+        };
+
+        let revision = handle
+            .memory_repo
+            .apply_revision(&MemoryRevisionRequest {
+                expected_old: pending_snapshot,
+                operation,
+                content: revised_content,
+                metadata: applied_metadata,
+                reason: suggestion.reason,
+                source_request_id,
+                model_version: response.model,
+                applied_at,
+            })
+            .await?;
         Ok(ControlResponse::ok(
             id,
             serde_json::json!({
-                "memory_id": memory.id,
-                "updated": true,
-                "action": memory.metadata["edit_request"]["action"],
-                "content_changed": old_content != memory.content,
+                "memory_id": revision.new_memory_id,
+                "old_memory_id": revision.old_memory_id,
+                "updated": revision.applied,
+                "action": operation.as_str(),
+                "content_changed": true,
             }),
         ))
     })
@@ -1970,43 +2010,81 @@ pub(crate) async fn replay_pending_memory_edit(
         }
     };
 
-    let mut updated = pending.clone();
-    let old_content = updated.content.clone();
-    match suggestion.action.as_str() {
-        "replace" => updated.content = suggestion.content,
-        "append" => {
-            updated.content = format!("{}\n{}", updated.content.trim_end(), suggestion.content)
-        }
-        "no_change" => {}
+    let source_request_id = request_meta
+        .get("source_request_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "legacy-memory-edit-{}-{}",
+                pending.id,
+                request_meta
+                    .get("requested_at")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+            )
+        });
+    let operation = match suggestion.action.as_str() {
+        "replace" => Some(MemoryRevisionOperation::Replace),
+        "append" => Some(MemoryRevisionOperation::Append),
+        "no_change" => None,
         _ => unreachable!("parse_memory_edit_suggestion 已校验 action"),
-    }
-    if updated.content.chars().count() > 20_000 {
-        updated.content = pending.content.clone();
-        updated.metadata["edit_request"] = serde_json::json!({
+    };
+    let revised_content = match operation {
+        Some(MemoryRevisionOperation::Replace) => suggestion.content.clone(),
+        Some(MemoryRevisionOperation::Append) => {
+            format!("{}\n{}", pending.content.trim_end(), suggestion.content)
+        }
+        None => pending.content.clone(),
+    };
+    if revised_content.chars().count() > 20_000 {
+        let mut rejected = pending.clone();
+        rejected.metadata["edit_request"] = serde_json::json!({
             "instruction": instruction,
             "status": "rejected",
             "requested_at": request_meta["requested_at"],
+            "source_request_id": source_request_id,
             "error": "修改后的记忆超过 20000 个字符",
             "recovered": true,
         });
-        let _ = memory_repo.update_if_unchanged(&updated, pending).await?;
+        let _ = memory_repo.update_if_unchanged(&rejected, pending).await?;
         return Ok(false);
     }
-    updated.metadata["edit_request"] = serde_json::json!({
+    let applied_at = chrono::Utc::now();
+    let mut applied_metadata = pending.metadata.clone();
+    applied_metadata["edit_request"] = serde_json::json!({
         "instruction": instruction,
         "status": "applied",
         "action": suggestion.action,
-        "reason": suggestion.reason,
+        "reason": suggestion.reason.clone(),
         "requested_at": request_meta["requested_at"],
-        "applied_at": chrono::Utc::now().to_rfc3339(),
-        "model": response.model,
+        "applied_at": applied_at.to_rfc3339(),
+        "model": response.model.clone(),
+        "source_request_id": source_request_id.clone(),
         "recovered": true,
     });
-    updated.metadata["updated_by"] = serde_json::Value::String("llm_memory_edit".to_string());
-    if !memory_repo.update_if_unchanged(&updated, pending).await? {
-        return Ok(false);
-    }
-    Ok(old_content != updated.content || suggestion.action == "no_change")
+    applied_metadata["updated_by"] = serde_json::Value::String("llm_memory_edit".to_string());
+    let Some(operation) = operation else {
+        let mut updated = pending.clone();
+        updated.metadata = applied_metadata;
+        if !memory_repo.update_if_unchanged(&updated, pending).await? {
+            return Ok(false);
+        }
+        return Ok(true);
+    };
+    let revision = memory_repo
+        .apply_revision(&MemoryRevisionRequest {
+            expected_old: pending.clone(),
+            operation,
+            content: revised_content,
+            metadata: applied_metadata,
+            reason: suggestion.reason,
+            source_request_id,
+            model_version: response.model,
+            applied_at,
+        })
+        .await?;
+    Ok(revision.applied)
 }
 
 #[derive(Debug, serde::Deserialize)]
