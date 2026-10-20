@@ -24,6 +24,9 @@ pub enum RuntimeError {
     #[error("发送明确失败：{0}")]
     SendRejected(String),
 
+    #[error("发送暂不可用：{0}")]
+    SendUnavailable(String),
+
     #[error("发送结果待核查：{0}")]
     SendUnknown(String),
 

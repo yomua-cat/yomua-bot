@@ -360,7 +360,7 @@ impl OneBotAdapterImpl {
     async fn send_action(&self, request: OutgoingRequest) -> Result<ActionResponse, RuntimeError> {
         // 仅在已连接状态下才能发送。
         if self.shared.state().await != OneBotConnectionState::Connected {
-            return Err(RuntimeError::SendRejected(
+            return Err(RuntimeError::SendUnavailable(
                 "OneBot 未连接，暂时无法发送消息".to_string(),
             ));
         }
@@ -380,7 +380,7 @@ impl OneBotAdapterImpl {
         // 发送到出站 channel。
         if self.shared.outbound_tx.send(text).await.is_err() {
             self.shared.pending.lock().unwrap().remove(&id);
-            return Err(RuntimeError::SendRejected(
+            return Err(RuntimeError::SendUnavailable(
                 "出站通道已关闭，消息未发送".to_string(),
             ));
         }

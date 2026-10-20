@@ -1265,7 +1265,10 @@ impl ReplyProcessor {
                 )));
             }
             Err(e) => {
-                let definitely_not_sent = matches!(e, RuntimeError::SendRejected(_));
+                let definitely_not_sent = matches!(
+                    e,
+                    RuntimeError::SendRejected(_) | RuntimeError::SendUnavailable(_)
+                );
                 if definitely_not_sent {
                     self.save_delivery_owned(
                         event,
@@ -1372,6 +1375,8 @@ impl ReplyProcessor {
             // 只会重复发送同一个无效请求；只有 HttpError 代表可恢复的
             // 网络、429 或 5xx 路径。
             RuntimeError::Llm(_) | RuntimeError::Config(_) | RuntimeError::ParseError(_) => true,
+            RuntimeError::SendUnavailable(_) => false,
+            RuntimeError::SendRejected(_) => true,
             _ => false,
         };
 
@@ -2582,6 +2587,23 @@ mod tests {
         );
         assert!(outcome.is_permanent());
         assert!(!outcome.is_retryable());
+    }
+
+    #[test]
+    fn platform_rejection_is_permanent_but_unavailable_sender_is_retryable() {
+        let rejected = ReplyProcessor::classify_outbox_error_for_event(
+            RuntimeError::SendRejected("OneBot 明确拒绝发送".into()),
+            1,
+        );
+        let unavailable = ReplyProcessor::classify_outbox_error_for_event(
+            RuntimeError::SendUnavailable("OneBot 尚未连接".into()),
+            1,
+        );
+
+        assert!(rejected.is_permanent());
+        assert!(!rejected.is_retryable());
+        assert!(unavailable.is_retryable());
+        assert!(!unavailable.is_permanent());
     }
 
     #[tokio::test]
