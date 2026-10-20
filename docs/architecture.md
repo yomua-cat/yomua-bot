@@ -76,7 +76,7 @@ OneBot 连接循环独立路由 Action 回执，不等待入站业务处理任�
 
 配置路由负责 Provider、模型、输出上限、共享预算和网络/HTTP 可重试备用模型。普通聊天模型返回 JSON 建议；Jev 通过 TypeSafe Provider 发送 `state + choice question`，再由决策服务转换为同一组动作。Pipeline 对建议做语义校验，失败时回到规则决策；编排器应用建议时再次守住硬约束。未绑定、MentionOnly 模式下未提及、静默时段下未提及和主动情境不能被建议回复绕过；规则决策仍保留优先级、认知级别、原因和时间等字段。全部模型失败、输出无效或未触发模型时都使用规则结果。
 
-[ContextBuilder](../src/application/context.rs)加载角色归属的历史、Lorebook、记忆、关系及会话情绪。调用方显式传入全域 `user_id`，participant 只用于本会话消息作者与当前轮身份；跨会话记忆和关系均以该 `user_id` 查询。稳定事实和关系信息默认纳入角色内部上下文，确认禁用策略后由数据库层排除；具体经历仍限于来源会话。[CharacterHistoryProvider](../src/application/character_history.rs)负责历史归属和序号边界。[ContextAssembler](../src/application/context_assembler.rs)估算 token、预留输出空间并按层降级，需要已知的 `context_window`。模型能力从当前 Role 引用的 Model Instance 解析；共享预算和备用模型数配置在对应的 `[roles.*]` 中。
+[ContextBuilder](../src/application/context.rs)加载角色归属的历史、Lorebook、记忆、关系及会话情绪。调用方显式传入全域 `user_id`，participant 只用于本会话消息作者与当前轮身份；跨会话记忆和关系均以该 `user_id` 查询。稳定事实和关系信息默认纳入角色内部上下文，确认禁用策略后由数据库层排除；具体经历仍限于来源会话。[CharacterHistoryProvider](../src/application/character_history.rs)负责历史归属和序号边界。[ContextAssembler](../src/application/context_assembler.rs)估算 token、预留输出空间并按层降级，需要已知的 `context_window`；历史用户标签使用会话内稳定匿名别名，昵称和正文标签会先做安全净化，系统生成的身份标签不包含真实 QQ 号。模型能力从当前 Role 引用的 Model Instance 解析；共享预算和备用模型数配置在对应的 `[roles.*]` 中。
 
 全域用户删除由 `ParticipantRepository` 在 SQLite 事务内执行：删除该用户来源的普通/向量记忆和关系数据，匿名化会话参与者、OneBot 私聊路由、消息/outbox 作者元数据与用户黑名单，再删除 `users` 身份。为保留历史审计与引用，消息行、正文和内部引用关系保留；历史作者显示为“已删除用户”，旧私聊主动发言会关闭。任何步骤失败都会回滚整笔删除。
 

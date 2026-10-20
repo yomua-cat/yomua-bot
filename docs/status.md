@@ -7,8 +7,8 @@
 | 检查 | 结果 | 边界 |
 | --- | --- | --- |
 | `cargo check --locked --all-targets --offline` | 通过 | 当前本机工具链和锁文件 |
-| `cargo test --locked --lib --offline -- --test-threads=1` | 通过 | 523 个通过、0 个失败、15 个插件 Unix socket 测试按标记忽略 |
-| `cargo test --locked --all-targets --offline -- --test-threads=1` | 通过 | 库 523 个、主程序 5 个、ctl 39 个、alpha 集成 8 个、控制集成 84 个通过；15 个插件 Unix socket 测试按标记忽略 |
+| `cargo test --locked --lib --offline -- --test-threads=1` | 通过 | 531 个通过、0 个失败、15 个插件 Unix socket 测试按标记忽略；本轮新增 1 个上下文安全测试 |
+| `cargo test --locked --all-targets --offline -- --test-threads=1` | 通过 | 库 531 个、主程序 5 个、ctl 39 个、alpha 集成 8 个、控制集成 84 个通过；15 个插件 Unix socket 测试按标记忽略 |
 | 插件 Unix socket 测试显式运行 | 通过 | `--ignored` 下 15 个测试全部通过；普通 CI 仍按 `#[ignore]` 标记单独记录 |
 | `cargo fmt --all -- --check` | 通过 | 当前工作树 |
 | `cargo clippy --locked --offline --all-targets --all-features -- -D warnings` | 通过 | 当前工作树，包含测试目标 |
@@ -27,6 +27,7 @@
 - 消息接收入库使用结构化 `AcceptedMessageInput`，在同一事务中分配会话序号、写入消息并创建 Outbox 事件。
 - 回复任务会按当前会话序号读取连续输入；原消息逐条保存，生成期间的新消息进入下一轮。当前批次冻结后会持久化最小 `reply_batches` 快照，只保留消息 ID、序号、事件 UUID 和上下文摘要，不保存完整 prompt。
 - 上下文中只有角色真实发送且归属当前观察角色的消息才使用 `assistant`；当前批次只作为当前输入出现一次。
+- 上下文历史中的系统用户标签使用会话内稳定匿名别名，不因身份标签向模型发送真实 QQ 号；昵称会移除控制字符、替换标签分隔符并限制为 32 个字符，正文、引用文本和当前轮中行首的伪身份标签会被中和。用户主动输入的正文仍按原文处理，关系、记忆和权限逻辑仍使用程序侧的全域用户身份。
 - ctl 客户端、服务端和帮助文本使用统一 canonical 命令定义，支持一段、二段和三段命令；Unix socket 使用版本化结构化 `ControlEnvelope`，bot 不再解析人类 `cmd` 字符串。
 - QQ 管理指令会先保存为 `author_kind=system_command` 的消息并创建 `MessageAccepted` Outbox 事件；Outbox 消费时由 `CommandHandler` 做权限和绑定校验，控制回复复用 `reply_tasks` 的生成、发送、未知和历史落库状态机，不再由适配器直接发送。
 - 记忆候选与正式可见记忆分离；上下文只在来源会话读取会话记忆，跨会话仅读取当前全域用户且明确标记共享的记忆。跨会话记忆只作为角色的内部上下文使用，不向用户透露来源会话；没有用户身份上下文的接口只返回本会话内容。
