@@ -15,7 +15,7 @@ yomua-bot --help
 | --- | --- |
 | `import-card <路径>` | 支持 JSON/PNG；`--config-dir`、`--conversation <外部ID>`、`--group`、`--participant <外部ID>`、`--participant-name`、`--reply-mode natural\|mention\|occasional`、`--proactive` |
 | `list-characters` | `--config-dir`；列出角色 ID 和名称 |
-| `list-bindings` | `--config-dir`；列出已有会话绑定 |
+| `list-bindings` | `--config-dir`；列出已有会话绑定及普通回复限额 |
 | `switch-character <角色名>` | 必须指定 `--conversation <外部ID>`，可加 `--config-dir`、`--group`；会话和角色须已存在 |
 
 `import-card` 默认不绑定、默认私聊、默认 `natural`；指定 `--conversation` 才创建或复用会话并绑定。`--participant` 创建的是人类参与者，不能替代回复链路所需的 Bot 角色参与者。`--proactive` 只启用当前的状态评估能力。
@@ -29,6 +29,8 @@ cargo run --locked --bin yomua-bot -- list-bindings --config-dir /path/to/config
 cargo run --locked --bin yomua-bot -- switch-character 测试角色 \
   --config-dir /path/to/config --conversation 123456 --group
 ```
+
+`list-bindings` 输出的“每用户/分钟”和“每会话/小时”是绑定级普通回复限额；显示“关闭”表示未设置。`@豁免`为“否”时，被 @ 消息默认使用配置倍率（默认 4 倍）后的更宽限额；设为“是”时完全不计入两个窗口。限额命中会把回复任务记为 `ignored`，原因记录为 `rate_limited`。
 
 当前 `switch-character` 按**角色名**查找；`--group` 可解析，但查询会话的实现仍只依据外部 ID，存在群号与用户号冲突风险。
 
@@ -62,7 +64,7 @@ ctl 按命令校验参数：选项只对声明的命令开放，`status --energy
 | `shutdown --confirm` | 发出关停请求并等待确认 |
 | `character list [--limit N] [--offset N]` | 分页列出角色；交互输入可用 `c list` |
 | `character show <id> [--raw]` | 角色详情 |
-| `conversation list [--raw]` | 会话列表；交互输入可用 `ss list` |
+| `conversation list [--raw]` | 会话及角色绑定限额列表；交互输入可用 `ss list` |
 | `character state get <角色ID> [--conversation <ID>] [--raw]` | 全局或会话状态；交互输入可用 `st get` |
 | `character state set [<角色ID>] [--character <ID>] [--conversation <ID>] [--energy N] [--stress N] [--mood N] [--activity 文本] --confirm` | 状态修改；角色 ID 可用位置参数或 `--character`，会话范围 mood 与全局 activity 各有作用域 |
 | `character state refresh [--raw]` | 更新全局状态时间戳 |

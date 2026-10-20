@@ -278,7 +278,41 @@ pub struct CharacterBinding {
     pub switched_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub cross_reply_enabled: bool,
+    #[serde(default)]
+    pub response_rate_limit: ResponseRateLimitPolicy,
     pub created_at: DateTime<Utc>,
+}
+
+/// 普通回复的绑定级限额策略。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponseRateLimitPolicy {
+    /// 同一会话内、同一参与者每分钟最多触发的回复数；None 表示不限制。
+    #[serde(default)]
+    pub per_user_per_minute: Option<u32>,
+    /// 同一会话每小时最多触发的回复数；None 表示不限制。
+    #[serde(default)]
+    pub per_session_per_hour: Option<u32>,
+    /// 被 @ 的消息是否完全豁免限额。
+    #[serde(default)]
+    pub mention_exempt: bool,
+    /// 被 @ 且未豁免时，两个限额使用的倍率。
+    #[serde(default = "default_mention_rate_limit_multiplier")]
+    pub mention_multiplier: u32,
+}
+
+fn default_mention_rate_limit_multiplier() -> u32 {
+    4
+}
+
+impl Default for ResponseRateLimitPolicy {
+    fn default() -> Self {
+        Self {
+            per_user_per_minute: None,
+            per_session_per_hour: None,
+            mention_exempt: false,
+            mention_multiplier: default_mention_rate_limit_multiplier(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

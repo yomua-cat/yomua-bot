@@ -35,10 +35,16 @@ impl CharacterBindingRepository for SqliteCharacterBindingRepository {
             Option<String>,
             String,
             i32,
+            Option<i64>,
+            Option<i64>,
+            i32,
+            i32,
         )> = sqlx::query_as(
             r#"SELECT id, character_id, conversation_id, reply_mode, proactive_enabled,
                     mute_schedule, behavior_overrides, context_policy, switched_at, created_at,
-                    cross_reply_enabled
+                    cross_reply_enabled, user_reply_limit_per_minute,
+                    session_reply_limit_per_hour, mention_rate_limit_exempt,
+                    mention_rate_limit_multiplier
                  FROM conversation_bindings WHERE character_id = ?"#,
         )
         .bind(character_id)
@@ -64,10 +70,16 @@ impl CharacterBindingRepository for SqliteCharacterBindingRepository {
             Option<String>,
             String,
             i32,
+            Option<i64>,
+            Option<i64>,
+            i32,
+            i32,
         )> = sqlx::query_as(
             r#"SELECT id, character_id, conversation_id, reply_mode, proactive_enabled,
                     mute_schedule, behavior_overrides, context_policy, switched_at, created_at,
-                    cross_reply_enabled
+                    cross_reply_enabled, user_reply_limit_per_minute,
+                    session_reply_limit_per_hour, mention_rate_limit_exempt,
+                    mention_rate_limit_multiplier
                  FROM conversation_bindings WHERE conversation_id = ?"#,
         )
         .bind(conversation_id)
@@ -81,7 +93,9 @@ impl CharacterBindingRepository for SqliteCharacterBindingRepository {
         let rows: Vec<BindingRow> = sqlx::query_as(
             r#"SELECT id, character_id, conversation_id, reply_mode, proactive_enabled,
                     mute_schedule, behavior_overrides, context_policy, switched_at, created_at,
-                    cross_reply_enabled
+                    cross_reply_enabled, user_reply_limit_per_minute,
+                    session_reply_limit_per_hour, mention_rate_limit_exempt,
+                    mention_rate_limit_multiplier
                  FROM conversation_bindings"#,
         )
         .fetch_all(&self.pool)
@@ -94,7 +108,9 @@ impl CharacterBindingRepository for SqliteCharacterBindingRepository {
         let rows: Vec<BindingRow> = sqlx::query_as(
             r#"SELECT id, character_id, conversation_id, reply_mode, proactive_enabled,
                     mute_schedule, behavior_overrides, context_policy, switched_at, created_at,
-                    cross_reply_enabled
+                    cross_reply_enabled, user_reply_limit_per_minute,
+                    session_reply_limit_per_hour, mention_rate_limit_exempt,
+                    mention_rate_limit_multiplier
                  FROM conversation_bindings WHERE proactive_enabled = 1"#,
         )
         .fetch_all(&self.pool)
@@ -118,8 +134,10 @@ impl CharacterBindingRepository for SqliteCharacterBindingRepository {
             r#"INSERT INTO conversation_bindings
                 (character_id, conversation_id, reply_mode, proactive_enabled,
                  mute_schedule, behavior_overrides, context_policy, switched_at,
-                 cross_reply_enabled)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                 cross_reply_enabled, user_reply_limit_per_minute,
+                 session_reply_limit_per_hour, mention_rate_limit_exempt,
+                 mention_rate_limit_multiplier)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(binding.character_id)
         .bind(binding.conversation_id)
@@ -130,6 +148,22 @@ impl CharacterBindingRepository for SqliteCharacterBindingRepository {
         .bind(&context_policy)
         .bind(binding.switched_at.map(|t| t.to_rfc3339()))
         .bind(binding.cross_reply_enabled as i32)
+        .bind(
+            binding
+                .response_rate_limit
+                .per_user_per_minute
+                .map(i64::from),
+        )
+        .bind(
+            binding
+                .response_rate_limit
+                .per_session_per_hour
+                .map(i64::from),
+        )
+        .bind(binding.response_rate_limit.mention_exempt as i32)
+        .bind(i64::from(
+            binding.response_rate_limit.mention_multiplier.max(1),
+        ))
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -153,7 +187,9 @@ impl CharacterBindingRepository for SqliteCharacterBindingRepository {
             r#"UPDATE conversation_bindings
                 SET character_id = ?, reply_mode = ?, proactive_enabled = ?,
                     mute_schedule = ?, behavior_overrides = ?, context_policy = ?,
-                    switched_at = ?, cross_reply_enabled = ?
+                    switched_at = ?, cross_reply_enabled = ?,
+                    user_reply_limit_per_minute = ?, session_reply_limit_per_hour = ?,
+                    mention_rate_limit_exempt = ?, mention_rate_limit_multiplier = ?
               WHERE id = ?"#,
         )
         .bind(binding.character_id)
@@ -164,6 +200,22 @@ impl CharacterBindingRepository for SqliteCharacterBindingRepository {
         .bind(&context_policy)
         .bind(binding.switched_at.map(|t| t.to_rfc3339()))
         .bind(binding.cross_reply_enabled as i32)
+        .bind(
+            binding
+                .response_rate_limit
+                .per_user_per_minute
+                .map(i64::from),
+        )
+        .bind(
+            binding
+                .response_rate_limit
+                .per_session_per_hour
+                .map(i64::from),
+        )
+        .bind(binding.response_rate_limit.mention_exempt as i32)
+        .bind(i64::from(
+            binding.response_rate_limit.mention_multiplier.max(1),
+        ))
         .bind(binding.id)
         .execute(&self.pool)
         .await
@@ -194,6 +246,10 @@ type BindingRow = (
     Option<String>,
     String,
     i32,
+    Option<i64>,
+    Option<i64>,
+    i32,
+    i32,
 );
 
 fn parse_binding_row(row: BindingRow) -> Result<CharacterBinding, RepositoryError> {
@@ -209,6 +265,10 @@ fn parse_binding_row(row: BindingRow) -> Result<CharacterBinding, RepositoryErro
         switched_at,
         created_at,
         cross_reply_enabled,
+        user_reply_limit_per_minute,
+        session_reply_limit_per_hour,
+        mention_rate_limit_exempt,
+        mention_rate_limit_multiplier,
     ) = row;
 
     let reply_mode = match reply_mode_str.as_str() {
@@ -245,6 +305,17 @@ fn parse_binding_row(row: BindingRow) -> Result<CharacterBinding, RepositoryErro
         context_policy,
         switched_at,
         cross_reply_enabled: cross_reply_enabled != 0,
+        response_rate_limit: crate::domain::character::ResponseRateLimitPolicy {
+            per_user_per_minute: user_reply_limit_per_minute
+                .and_then(|value| u32::try_from(value).ok()),
+            per_session_per_hour: session_reply_limit_per_hour
+                .and_then(|value| u32::try_from(value).ok()),
+            mention_exempt: mention_rate_limit_exempt != 0,
+            mention_multiplier: u32::try_from(mention_rate_limit_multiplier)
+                .ok()
+                .filter(|value| *value > 0)
+                .unwrap_or(4),
+        },
         created_at,
     })
 }

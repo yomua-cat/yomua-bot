@@ -1184,6 +1184,7 @@ mod tests {
                 context_policy: serde_json::json!({}),
                 switched_at: Some(chrono::Utc::now()),
                 cross_reply_enabled: false,
+                response_rate_limit: Default::default(),
                 created_at: chrono::Utc::now(),
             };
             Self {

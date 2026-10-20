@@ -816,7 +816,7 @@ fn binding_dto(item: &CharacterBinding) -> serde_json::Value {
         ReplyMode::Occasionally => "occasionally",
         ReplyMode::Natural => "natural",
     };
-    serde_json::json!({"id":item.id,"character_id":item.character_id,"conversation_id":item.conversation_id,"reply_mode":reply_mode,"proactive_enabled":item.proactive_enabled,"mute_schedule":item.mute_schedule,"switched_at":item.switched_at,"cross_reply_enabled":item.cross_reply_enabled,"created_at":item.created_at})
+    serde_json::json!({"id":item.id,"character_id":item.character_id,"conversation_id":item.conversation_id,"reply_mode":reply_mode,"proactive_enabled":item.proactive_enabled,"mute_schedule":item.mute_schedule,"switched_at":item.switched_at,"cross_reply_enabled":item.cross_reply_enabled,"response_rate_limit":item.response_rate_limit,"created_at":item.created_at})
 }
 
 fn memory_raw_dto(item: &Memory) -> serde_json::Value {

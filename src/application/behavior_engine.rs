@@ -10,6 +10,7 @@ use chrono::FixedOffset;
 
 use crate::application::clock::Clock;
 use crate::application::config::{parse_timezone_offset, RuntimeConfig};
+use crate::application::rate_limiter::{in_memory_rate_limiter, ResponseRateLimiter};
 use crate::domain::behavior::{BehaviorAction, BehaviorDecision, BehaviorEngine};
 use crate::domain::character::ReplyMode;
 use crate::domain::decision::{DecisionEvaluator, RuleBehaviorEngineOutput, RuleDecisionInput};
@@ -37,6 +38,7 @@ pub struct RuleBehaviorEngine {
     relationship_repo: Arc<dyn RelationshipRepository>,
     state_repo: Arc<dyn CharacterStateRepository>,
     clock: Arc<dyn Clock>,
+    rate_limiter: Arc<dyn ResponseRateLimiter>,
     live_settings: Option<tokio::sync::watch::Receiver<RuntimeConfig>>,
 }
 
@@ -59,8 +61,15 @@ impl RuleBehaviorEngine {
             conversation_state_repo,
             behavior_state_repo,
             clock,
+            rate_limiter: in_memory_rate_limiter(),
             live_settings: None,
         }
+    }
+
+    /// 使用持久化限额实现，生产环境由 SQLite 装配。
+    pub fn with_rate_limiter(mut self, rate_limiter: Arc<dyn ResponseRateLimiter>) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
     }
 
     /// 接入运行时配置，使后续决策读取最新时区设置。
@@ -333,6 +342,21 @@ impl RuleBehaviorEngine {
             input.is_mentioned || (substantive && threshold >= 0.3 && !in_mute && !annoyed);
 
         if should_reply {
+            let allowed = self
+                .rate_limiter
+                .try_reserve(
+                    input.character_id,
+                    input.conversation_id,
+                    input.participant_id,
+                    &binding.response_rate_limit,
+                    input.is_mentioned,
+                    decided_at,
+                )
+                .await
+                .map_err(repo_err)?;
+            if !allowed {
+                return Ok(ignore_decision("rate_limited", decided_at));
+            }
             Ok(BehaviorDecision {
                 action: BehaviorAction::Reply,
                 priority: Priority::Realtime,
@@ -917,6 +941,7 @@ mod tests {
             context_policy: serde_json::json!({}),
             switched_at: None,
             cross_reply_enabled: false,
+            response_rate_limit: Default::default(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -1077,6 +1102,28 @@ mod tests {
                 assert_eq!(d.action, BehaviorAction::Ignore);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn rate_limited_response_is_ignored_before_model_or_generation() {
+        let mut configured = binding(10, ReplyMode::Natural);
+        configured.response_rate_limit.per_user_per_minute = Some(1);
+        configured.response_rate_limit.per_session_per_hour = Some(10);
+        let clock = Arc::new(FakeClock::new());
+        let (engine, _) = build_engine(vec![configured], None, None, None, clock);
+
+        let first = engine
+            .decide_response(1, 10, "第一条消息", false, Some(7))
+            .await
+            .unwrap();
+        assert_eq!(first.action, BehaviorAction::Reply);
+
+        let second = engine
+            .decide_response(1, 10, "第二条消息", false, Some(7))
+            .await
+            .unwrap();
+        assert_eq!(second.action, BehaviorAction::Ignore);
+        assert_eq!(second.reason, "rate_limited");
     }
 
     #[tokio::test]

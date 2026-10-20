@@ -62,7 +62,7 @@ OneBot 连接循环独立路由 Action 回执，不等待入站业务处理任�
 | Participant | Conversation × external_id | 会话内显示名、作者身份和消息归属，不能替代 User |
 | Relationship | Character × User | 关系数值与跨会话交互记录；领域对象保存 `user_id`，会话 `participant_id` 只用于入站解析；交互幂等表同样按 `user_id` 归并 |
 | Memory | Character × 可选 User，可附会话 | 记忆来源和用户归属；稳定事实和关系信息默认可跨会话召回，且只作为角色内部上下文使用，不向用户透露来源会话；确认禁用策略后停止未来跨会话检索，非共享经历留在来源会话，候选记忆仍不可见 |
-| CharacterBinding | Conversation → Character | 回复模式、主动行为、静默时段等绑定设置 |
+| CharacterBinding | Conversation → Character | 回复模式、主动行为、静默时段和普通回复限额等绑定设置 |
 
 [领域模型](../src/domain/character.rs)与[情绪模型](../src/domain/emotion.rs)定义状态。[角色运行时](../src/application/runtime.rs)按需加载并缓存角色，以每角色锁保护状态更新。控制命令直接写仓储时与缓存同步的关系仍需整顿。
 
@@ -70,7 +70,7 @@ OneBot 连接循环独立路由 Action 回执，不等待入站业务处理任�
 
 ## 决策、上下文与模型
 
-[规则行为引擎](../src/application/behavior_engine.rs)从绑定、回复模式、提及、静默时段、状态和关系生成完整 `BehaviorDecision`，并同时返回一次性输入快照。编排器把快照转换为模型 DTO：情境及消息文本、角色/会话 ID、是否绑定与行为配置、关系指标、角色全局状态和会话状态；再与完整规则决策一起发送。决策模型只能返回 `keep`、`suggest_reply`、`suggest_ignore` 或 `adjust_delay`，可附理由和置信度，不能生成回复文本或直接改变状态。
+[规则行为引擎](../src/application/behavior_engine.rs)从绑定、回复模式、提及、静默时段、状态和关系生成完整 `BehaviorDecision`，并同时返回一次性输入快照。规则确认本次将回复后，会在调用决策模型和生成模型前原子预留普通回复限额；命中时动作改为 `Ignore`，原因是 `rate_limited`。限额按绑定内参与者和会话分别统计，SQLite 保留最近事件以跨重启延续滑动窗口。编排器把快照转换为模型 DTO：情境及消息文本、角色/会话 ID、是否绑定与行为配置、关系指标、角色全局状态和会话状态；再与完整规则决策一起发送。决策模型只能返回 `keep`、`suggest_reply`、`suggest_ignore` 或 `adjust_delay`，可附理由和置信度，不能生成回复文本或直接改变状态。
 
 `decision.toml` 启用后，请求经 `DecisionLlmServiceImpl` 以 `llm_role=decision` 交给调度器。明确提及由规则引擎直接处理；未提及消息只有规则结果或关系/状态处于边界时才由启发式触发器调用模型。主动任务先通过规则引擎的主动开关、静默、冷却和意愿门槛，再由同一编排器评估；模型保留后原子预留额度并入队，入队失败会恢复预留前状态，模型否决则不产生主动消息副作用。主动情境只接受 `keep` 或 `suggest_ignore`，不接受回复建议或延迟调整。
 

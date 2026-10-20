@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 mod storage_tests {
+    use crate::application::rate_limiter::ResponseRateLimiter;
     use crate::domain::autonomy::*;
     use crate::domain::character::*;
     use crate::domain::conversation::*;
@@ -9,7 +10,9 @@ mod storage_tests {
     use crate::domain::message::*;
     use crate::domain::relationship::*;
     use crate::domain::repository::*;
+    use crate::infrastructure::storage::SqliteResponseRateLimiter;
     use crate::infrastructure::storage::SqliteStorage;
+    use chrono::TimeZone;
     use std::sync::Arc;
 
     async fn setup_storage() -> SqliteStorage {
@@ -18,6 +21,76 @@ mod storage_tests {
             .expect("failed to open in-memory db");
         storage.migrate().await.expect("failed to run migrations");
         storage
+    }
+
+    #[tokio::test]
+    async fn sqlite_response_rate_limit_survives_new_limiter_instance() {
+        let storage = setup_storage().await;
+        let character_id: i64 = sqlx::query("INSERT INTO characters(name) VALUES ('限额测试角色')")
+            .execute(storage.pool())
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        let conversation_id: i64 = sqlx::query(
+            "INSERT INTO conversations(conversation_type, external_id) VALUES ('private', 'rate-limit-test')",
+        )
+        .execute(storage.pool())
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let policy = ResponseRateLimitPolicy {
+            per_user_per_minute: Some(1),
+            per_session_per_hour: Some(10),
+            ..Default::default()
+        };
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 20, 0, 0, 0).unwrap();
+        let limiter = SqliteResponseRateLimiter::new(storage.pool().clone());
+        assert!(limiter
+            .try_reserve(
+                character_id,
+                conversation_id,
+                Some(101),
+                &policy,
+                false,
+                now,
+            )
+            .await
+            .unwrap());
+
+        let restarted_limiter = SqliteResponseRateLimiter::new(storage.pool().clone());
+        assert!(!restarted_limiter
+            .try_reserve(
+                character_id,
+                conversation_id,
+                Some(101),
+                &policy,
+                false,
+                now + chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap());
+        assert!(restarted_limiter
+            .try_reserve(
+                character_id,
+                conversation_id,
+                Some(102),
+                &policy,
+                false,
+                now + chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap());
+        assert!(restarted_limiter
+            .try_reserve(
+                character_id,
+                conversation_id,
+                Some(101),
+                &policy,
+                false,
+                now + chrono::Duration::seconds(61),
+            )
+            .await
+            .unwrap());
     }
 
     /// 构造测试用消息（C2-3 字段使用默认值）
@@ -4148,6 +4221,12 @@ mod storage_tests {
             context_policy: serde_json::json!({}),
             switched_at: None,
             cross_reply_enabled: false,
+            response_rate_limit: crate::domain::character::ResponseRateLimitPolicy {
+                per_user_per_minute: Some(3),
+                per_session_per_hour: Some(30),
+                mention_exempt: true,
+                mention_multiplier: 6,
+            },
             created_at: chrono::Utc::now(),
         };
         binding_repo.insert(&b1).await.unwrap();
@@ -4161,6 +4240,10 @@ mod storage_tests {
             Some("23:00-07:00"),
             "mute_schedule 应持久化"
         );
+        assert_eq!(all[0].response_rate_limit.per_user_per_minute, Some(3));
+        assert_eq!(all[0].response_rate_limit.per_session_per_hour, Some(30));
+        assert!(all[0].response_rate_limit.mention_exempt);
+        assert_eq!(all[0].response_rate_limit.mention_multiplier, 6);
     }
 
     #[tokio::test]
@@ -4226,6 +4309,7 @@ mod storage_tests {
             context_policy: serde_json::json!({"history": 30}),
             switched_at: Some(switched_at),
             cross_reply_enabled: false,
+            response_rate_limit: Default::default(),
             created_at: chrono::Utc::now(),
         };
         let b1_id = binding_repo.insert(&b1).await.unwrap();
@@ -4260,6 +4344,7 @@ mod storage_tests {
             context_policy: serde_json::json!({}),
             switched_at: None,
             cross_reply_enabled: false,
+            response_rate_limit: Default::default(),
             created_at: chrono::Utc::now(),
         };
         let b2_id = binding_repo.insert(&b2).await.unwrap();

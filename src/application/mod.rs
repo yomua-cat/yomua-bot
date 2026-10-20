@@ -33,6 +33,7 @@ pub mod outbox_processor;
 pub mod outbox_tests;
 pub mod plugin_api;
 pub mod proactive;
+pub mod rate_limiter;
 pub mod relationship_service;
 pub mod reply_processor;
 pub mod runtime;

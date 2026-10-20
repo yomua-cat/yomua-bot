@@ -357,6 +357,7 @@ async fn create_env() -> TestEnv {
         shutdown_result,
         commands: CommandRegistry::builtin(),
         character_repo: character_repo.clone(),
+        binding_repo: binding_repo.clone(),
         state_repo: state_repo.clone(),
         conversation_state_repo: conversation_state_repo.clone(),
         mood_repo: mood_repo.clone(),
@@ -1780,6 +1781,7 @@ async fn test_character_card_reassign_updates_all_fk_children() {
             context_policy: serde_json::json!({}),
             switched_at: None,
             cross_reply_enabled: false,
+            response_rate_limit: Default::default(),
             created_at: chrono::Utc::now(),
         })
         .await
@@ -2249,6 +2251,7 @@ async fn test_character_card_reassign_mid_transaction_rollback() {
             context_policy: serde_json::json!({}),
             switched_at: None,
             cross_reply_enabled: false,
+            response_rate_limit: Default::default(),
             created_at: chrono::Utc::now(),
         })
         .await
@@ -3026,6 +3029,7 @@ async fn test_session_delete_character_isolates_other_character() {
         context_policy: serde_json::json!({}),
         switched_at: None,
         cross_reply_enabled: false,
+        response_rate_limit: Default::default(),
         created_at: chrono::Utc::now(),
     };
     env.binding_repo
@@ -3044,6 +3048,7 @@ async fn test_session_delete_character_isolates_other_character() {
         context_policy: serde_json::json!({}),
         switched_at: None,
         cross_reply_enabled: false,
+        response_rate_limit: Default::default(),
         created_at: chrono::Utc::now(),
     };
     env.binding_repo
@@ -3203,6 +3208,7 @@ async fn test_cascade_delete_removes_dependent_data() {
         context_policy: serde_json::json!({}),
         switched_at: None,
         cross_reply_enabled: false,
+        response_rate_limit: Default::default(),
         created_at: chrono::Utc::now(),
     };
     binding_repo.insert(&binding).await.expect("插入绑定失败");
@@ -3560,6 +3566,7 @@ async fn test_session_delete_character_retains_relationships() {
         context_policy: serde_json::json!({}),
         switched_at: None,
         cross_reply_enabled: false,
+        response_rate_limit: Default::default(),
         created_at: chrono::Utc::now(),
     };
     binding_repo.insert(&binding).await.expect("插入绑定失败");
@@ -3710,6 +3717,7 @@ async fn test_g1_single_binding_constraint_exists() {
         context_policy: serde_json::json!({}),
         switched_at: None,
         cross_reply_enabled: false,
+        response_rate_limit: Default::default(),
         created_at: chrono::Utc::now(),
     };
     binding_repo.insert(&binding1).await.expect("插入绑定1失败");
@@ -3726,6 +3734,7 @@ async fn test_g1_single_binding_constraint_exists() {
         context_policy: serde_json::json!({}),
         switched_at: None,
         cross_reply_enabled: false,
+        response_rate_limit: Default::default(),
         created_at: chrono::Utc::now(),
     };
     let result = binding_repo.insert(&binding2).await;
@@ -3892,6 +3901,7 @@ async fn test_session_delete_character_affects_status() {
         context_policy: serde_json::json!({}),
         switched_at: None,
         cross_reply_enabled: false,
+        response_rate_limit: Default::default(),
         created_at: chrono::Utc::now(),
     };
     env.binding_repo

@@ -1865,8 +1865,14 @@ mod tests {
     }
     #[async_trait]
     impl MessageRepository for MemMessageRepo {
-        async fn find_by_id(&self, _id: i64) -> Result<Option<Message>, RepositoryError> {
-            Ok(None)
+        async fn find_by_id(&self, id: i64) -> Result<Option<Message>, RepositoryError> {
+            Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|message| message.id == id)
+                .cloned())
         }
         async fn find_recent(
             &self,
@@ -2359,6 +2365,7 @@ mod tests {
                 context_policy: serde_json::json!({}),
                 switched_at: None,
                 cross_reply_enabled: false,
+                response_rate_limit: Default::default(),
                 created_at: chrono::Utc::now(),
             }]),
         });
@@ -2619,6 +2626,61 @@ mod tests {
         assert!(mood_repo.moods.lock().unwrap().is_empty());
         assert!(rel_repo.rels.lock().unwrap().is_empty());
         assert!(state_repo.states.lock().unwrap().contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_message_skips_fake_provider_and_is_ignored() {
+        let (processor, adapter, provider, _, _, _, binding_repo, _, _, _, message_repo) =
+            wire(false, true).await;
+        binding_repo
+            .bindings
+            .lock()
+            .unwrap()
+            .first_mut()
+            .expect("测试绑定应存在")
+            .response_rate_limit
+            .per_user_per_minute = Some(0);
+
+        let mut event = received_event(true);
+        event.message_id = 77;
+        message_repo.reply_tasks.lock().unwrap().insert(
+            77,
+            crate::domain::message::ReplyTask {
+                status: ReplyTaskStatus::Pending,
+                content: None,
+                error: None,
+                platform_message_id: None,
+            },
+        );
+        message_repo.messages.lock().unwrap().push(Message {
+            id: 77,
+            conversation_id: 100,
+            sender_id: 66,
+            content: crate::domain::message::MessageContent::Text("你好".to_string()),
+            timestamp: chrono::Utc::now(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            metadata: serde_json::json!({}),
+            active_character_id: Some(1),
+            platform_message_id: None,
+            conversation_sequence: Some(1),
+            occurred_at: Some(chrono::Utc::now()),
+            ingested_at: Some(chrono::Utc::now()),
+        });
+        processor.process(&event).await.expect("限额命中应正常忽略");
+
+        assert_eq!(*provider.calls.lock().unwrap(), 0);
+        assert!(adapter.sent.lock().unwrap().is_empty());
+        assert_eq!(
+            message_repo
+                .reply_tasks
+                .lock()
+                .unwrap()
+                .get(&77)
+                .map(|task| task.status),
+            Some(ReplyTaskStatus::Ignored)
+        );
     }
 
     #[tokio::test]

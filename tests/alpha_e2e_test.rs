@@ -409,6 +409,7 @@ async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
         context_policy: serde_json::json!({}),
         switched_at: None,
         cross_reply_enabled: false,
+        response_rate_limit: Default::default(),
         created_at: chrono::Utc::now(),
     };
     let binding_a_id = binding_repo.insert(&binding_a).await?;
@@ -1191,6 +1192,7 @@ async fn p1_2_cold_start_behavior() {
         context_policy: serde_json::json!({}),
         switched_at: None,
         cross_reply_enabled: false,
+        response_rate_limit: Default::default(),
         created_at: chrono::Utc::now(),
     };
     binding_repo.insert(&binding).await.unwrap();

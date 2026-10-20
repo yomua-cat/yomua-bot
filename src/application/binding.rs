@@ -160,6 +160,7 @@ impl BindingManager {
             context_policy,
             switched_at: None,
             cross_reply_enabled: false,
+            response_rate_limit: Default::default(),
             created_at: Utc::now(),
         };
         self.binding_repo.insert(&binding).await?;

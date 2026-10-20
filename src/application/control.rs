@@ -46,8 +46,9 @@ use crate::domain::emotion::Mood;
 use crate::domain::memory::{MemoryRevisionOperation, MemoryRevisionRequest};
 
 use crate::domain::repository::{
-    BlacklistRepository, CharacterRepository, CharacterStateRepository, ConversationRepository,
-    ConversationStateRepository, MemoryRepository, MessageRepository, MoodRepository,
+    BlacklistRepository, CharacterBindingRepository, CharacterRepository, CharacterStateRepository,
+    ConversationRepository, ConversationStateRepository, MemoryRepository, MessageRepository,
+    MoodRepository,
 };
 use crate::error::RuntimeError;
 use crate::infrastructure::llm::{LlmMessage, LlmRequest, LlmRole};
@@ -209,7 +210,7 @@ impl CommandRegistry {
         );
         registry.register(
             control_schema::CONVERSATION_LIST,
-            "列出所有会话",
+            "列出所有会话及绑定限额",
             handle_conversation_list,
         );
         // 黑名单命令
@@ -911,12 +912,26 @@ fn handle_conversation_list(
             .find_all()
             .await
             .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+        let bindings = handle
+            .binding_repo
+            .find_all()
+            .await
+            .map_err(|e| RuntimeError::Internal(e.to_string()))?;
         let list: Vec<serde_json::Value> = conversations
             .into_iter()
             .map(|c| {
+                let binding = bindings.iter().find(|b| b.conversation_id == c.id);
                 serde_json::json!({
                     "id": c.id,
                     "external_id": c.external_id,
+                    "binding": binding.map(|b| serde_json::json!({
+                        "id": b.id,
+                        "character_id": b.character_id,
+                        "per_user_per_minute": b.response_rate_limit.per_user_per_minute,
+                        "per_session_per_hour": b.response_rate_limit.per_session_per_hour,
+                        "mention_exempt": b.response_rate_limit.mention_exempt,
+                        "mention_multiplier": b.response_rate_limit.mention_multiplier,
+                    })),
                 })
             })
             .collect();
@@ -2810,6 +2825,8 @@ pub struct RuntimeHandle {
     pub commands: CommandRegistry,
     /// 角色仓储（State System：校验角色存在）。
     pub character_repo: Arc<dyn CharacterRepository>,
+    /// 角色绑定仓储（会话列表与绑定限额查询）。
+    pub binding_repo: Arc<dyn CharacterBindingRepository>,
     /// 全局角色状态仓储（State System：Character State）。
     pub state_repo: Arc<dyn CharacterStateRepository>,
     /// 会话级状态仓储（State System：Character × Conversation State）。

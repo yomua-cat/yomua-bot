@@ -173,6 +173,32 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
             .map_err(|e| StorageError::Migration(format!("migration 005 failed: {e}")))?;
     }
 
+    // 迁移 005b：为旧绑定补齐普通回复限额策略字段；默认值保持关闭。
+    for (column, definition) in [
+        ("user_reply_limit_per_minute", "INTEGER"),
+        ("session_reply_limit_per_hour", "INTEGER"),
+        ("mention_rate_limit_exempt", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "mention_rate_limit_multiplier",
+            "INTEGER NOT NULL DEFAULT 4",
+        ),
+    ] {
+        let exists: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM pragma_table_info('conversation_bindings') WHERE name = '{column}'"
+        ))
+        .fetch_one(pool)
+        .await
+        .map_err(|e| StorageError::Migration(format!("migration 005b probe failed: {e}")))?;
+        if exists == 0 {
+            sqlx::query(&format!(
+                "ALTER TABLE conversation_bindings ADD COLUMN {column} {definition}"
+            ))
+            .execute(pool)
+            .await
+            .map_err(|e| StorageError::Migration(format!("migration 005b {column} failed: {e}")))?;
+        }
+    }
+
     // 迁移 006：双范围状态表（Mood / ConversationState / BehaviorState）。
     // 全新库由 MIGRATION_001 直接建好三张表；旧库（残留 `emotion_states` 表，
     // 新 001 不会创建它）在此补齐新表，并把历史 `emotion_states` 与
@@ -830,6 +856,27 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
     .execute(pool)
     .await
     .map_err(|e| StorageError::Migration(format!("migration 020 batch index failed: {e}")))?;
+
+    // 迁移 021：持久化普通回复限额事件，避免重启清空滑动窗口。
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS response_rate_limit_events (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            character_id    INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+            conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            participant_id  INTEGER,
+            scope           TEXT NOT NULL CHECK(scope IN ('user', 'session')),
+            occurred_at     TEXT NOT NULL
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 021 rate limit table failed: {e}")))?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_response_rate_limit_events_window ON response_rate_limit_events(character_id, conversation_id, scope, occurred_at)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 021 rate limit index failed: {e}")))?;
     Ok(())
 }
 
@@ -1197,6 +1244,10 @@ CREATE TABLE IF NOT EXISTS conversation_bindings (
     mute_schedule   TEXT,
     behavior_overrides TEXT NOT NULL DEFAULT '{}',
     context_policy  TEXT NOT NULL DEFAULT '{}',
+    user_reply_limit_per_minute INTEGER,
+    session_reply_limit_per_hour INTEGER,
+    mention_rate_limit_exempt INTEGER NOT NULL DEFAULT 0,
+    mention_rate_limit_multiplier INTEGER NOT NULL DEFAULT 4,
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

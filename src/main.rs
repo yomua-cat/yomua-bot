@@ -53,6 +53,7 @@ use yomua_bot::application::outbox_processor::OutboxProcessor;
 use yomua_bot::application::plugin_api::PluginApi;
 use yomua_bot::application::proactive::ProactiveDriver;
 use yomua_bot::application::proactive::ProactiveReplyScheduler;
+use yomua_bot::application::rate_limiter::ResponseRateLimiter;
 use yomua_bot::application::relationship_service::RelationshipService;
 use yomua_bot::application::reply_processor::{DelayExecutor, ReplyProcessor, TokioDelayExecutor};
 use yomua_bot::application::runtime::CharacterRuntime;
@@ -87,6 +88,7 @@ use yomua_bot::infrastructure::storage::repository::{
     SqliteMessageRepository, SqliteMoodRepository, SqliteOutboxRepository,
     SqliteParticipantRepository, SqlitePluginDataRepository, SqliteRelationshipRepository,
 };
+use yomua_bot::infrastructure::storage::SqliteResponseRateLimiter;
 use yomua_bot::infrastructure::storage::SqliteStorage;
 
 /// 默认的配置文件名。
@@ -504,6 +506,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         shutdown_result: shutdown_result.clone(),
         commands: CommandRegistry::builtin(),
         character_repo: repos.character_repo.clone() as Arc<dyn CharacterRepository>,
+        binding_repo: repos.binding_repo.clone(),
         state_repo: repos.state_repo.clone(),
         conversation_state_repo: repos.conversation_state_repo.clone(),
         mood_repo: repos.mood_repo.clone(),
@@ -843,7 +846,9 @@ async fn run_list_bindings(args: &[String]) -> Result<(), Box<dyn std::error::Er
     let char_by_id: std::collections::HashMap<i64, &yomua_bot::domain::character::Character> =
         characters.iter().map(|c| (c.id, c)).collect();
 
-    println!("绑定ID\t会话外部ID\t会话类型\t角色\t切换时间");
+    println!(
+        "绑定ID\t会话外部ID\t会话类型\t角色\t每用户/分钟\t每会话/小时\t@豁免\t@倍率\t切换时间"
+    );
     for b in bindings {
         let external_id = conv_by_id
             .get(&b.conversation_id)
@@ -865,8 +870,22 @@ async fn run_list_bindings(args: &[String]) -> Result<(), Box<dyn std::error::Er
             .map(|t| t.to_rfc3339())
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "{}\t{external_id}\t{conv_type}\t{name}\t{switched_at}",
-            b.id
+            "{}\t{external_id}\t{conv_type}\t{name}\t{}\t{}\t{}\t{}\t{switched_at}",
+            b.id,
+            b.response_rate_limit
+                .per_user_per_minute
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "关闭".to_string()),
+            b.response_rate_limit
+                .per_session_per_hour
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "关闭".to_string()),
+            if b.response_rate_limit.mention_exempt {
+                "是"
+            } else {
+                "否"
+            },
+            b.response_rate_limit.mention_multiplier,
         );
     }
 
@@ -1002,6 +1021,7 @@ struct Repos {
     blacklist_repo: Arc<dyn BlacklistRepository>,
     outbox_repo: Arc<SqliteOutboxRepository>,
     autonomy_repo: Arc<dyn AutonomyRepository>,
+    rate_limiter: Arc<dyn ResponseRateLimiter>,
 }
 
 /// 从 SQLite 连接池构建所有仓库。
@@ -1033,6 +1053,8 @@ fn build_repos(pool: SqlitePool) -> Repos {
     let outbox_repo = Arc::new(SqliteOutboxRepository::new(pool.clone()));
     let autonomy_repo: Arc<dyn AutonomyRepository> =
         Arc::new(SqliteAutonomyRepository::new(pool.clone()));
+    let rate_limiter: Arc<dyn ResponseRateLimiter> =
+        Arc::new(SqliteResponseRateLimiter::new(pool.clone()));
 
     Repos {
         _pool: pool,
@@ -1051,6 +1073,7 @@ fn build_repos(pool: SqlitePool) -> Repos {
         blacklist_repo,
         outbox_repo,
         autonomy_repo,
+        rate_limiter,
     }
 }
 
@@ -1151,6 +1174,7 @@ fn build_app_layer(
             repos.behavior_state_repo.clone(),
             yomua_bot::application::clock::system_clock(),
         )
+        .with_rate_limiter(repos.rate_limiter.clone())
         .with_live_settings(settings),
     );
 

@@ -915,6 +915,7 @@ mod tests {
             context_policy: serde_json::json!({}),
             switched_at: None,
             cross_reply_enabled: false,
+            response_rate_limit: Default::default(),
             created_at: Utc::now(),
         }
     }
