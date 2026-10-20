@@ -1032,7 +1032,13 @@ impl DecisionLlmService for DecisionLlmServiceImpl {
                 crate::error::RuntimeError::HttpError(message) => {
                     DecisionFailure::Transport(message)
                 }
+                crate::error::RuntimeError::RateLimited { message, .. } => {
+                    DecisionFailure::Transport(message)
+                }
                 crate::error::RuntimeError::Llm(message) => {
+                    DecisionFailure::ProviderError(0, message)
+                }
+                crate::error::RuntimeError::LlmResponseInvalid(message) => {
                     DecisionFailure::ProviderError(0, message)
                 }
                 crate::error::RuntimeError::Config(message) => {

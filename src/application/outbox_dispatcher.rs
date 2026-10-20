@@ -21,6 +21,7 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::application::outbox_processor::DEFAULT_EVENT_PROCESSING_TIMEOUT_SECS;
+use crate::application::reply_processor::EVENT_EXPIRY_SECS;
 use crate::domain::outbox::{OutboxEvent, ProcessingOutcome};
 use crate::domain::repository::OutboxRepository;
 
@@ -32,6 +33,9 @@ const MAX_RETRY_ATTEMPTS: i64 = 3;
 
 /// 重试退避基数（秒）。实际退避时间 = BASE * 2^attempts。
 const RETRY_BACKOFF_BASE_SECS: i64 = 2;
+const LLM_MAX_RETRY_ATTEMPTS: i64 = 5;
+const LLM_RETRY_BACKOFF_BASE_SECS: i64 = 8;
+const MAX_RETRY_AFTER_SECS: i64 = 120;
 
 /// Outbox 调度器配置。
 #[derive(Debug, Clone)]
@@ -44,6 +48,12 @@ pub struct OutboxDispatcherConfig {
     pub poll_interval_ms: u64,
     /// 退避基数（秒）。
     pub backoff_base_secs: i64,
+    /// LLM 类失败的最大重试次数。
+    pub llm_max_retry_attempts: i64,
+    /// LLM 类失败的退避基数（秒）。
+    pub llm_backoff_base_secs: i64,
+    /// Retry-After 允许采用的最大秒数。
+    pub max_retry_after_secs: i64,
     /// 单个事件等待处理结果的绝对截止时间（秒）。
     ///
     /// 续租只延长 ownership，不应让一个卡住的事件永久占用 processing 状态。
@@ -57,6 +67,9 @@ impl Default for OutboxDispatcherConfig {
             max_retry_attempts: MAX_RETRY_ATTEMPTS,
             poll_interval_ms: 100,
             backoff_base_secs: RETRY_BACKOFF_BASE_SECS,
+            llm_max_retry_attempts: LLM_MAX_RETRY_ATTEMPTS,
+            llm_backoff_base_secs: LLM_RETRY_BACKOFF_BASE_SECS,
+            max_retry_after_secs: MAX_RETRY_AFTER_SECS,
             processing_timeout_secs: DEFAULT_EVENT_PROCESSING_TIMEOUT_SECS,
         }
     }
@@ -77,11 +90,36 @@ pub struct OutboxDispatcher {
 }
 
 impl OutboxDispatcher {
-    fn next_retry_at(&self, attempts: i32) -> chrono::DateTime<chrono::Utc> {
+    fn next_retry_at(
+        &self,
+        event: &OutboxEvent,
+        attempts: i32,
+        llm: bool,
+        retry_after_secs: Option<u64>,
+    ) -> chrono::DateTime<chrono::Utc> {
         let exponent = attempts.clamp(0, 30) as u32;
         let factor = 1_i64.checked_shl(exponent).unwrap_or(i64::MAX);
-        let backoff_secs = self.config.backoff_base_secs.max(1).saturating_mul(factor);
-        chrono::Utc::now() + chrono::Duration::seconds(backoff_secs)
+        let base_secs = if llm {
+            self.config.llm_backoff_base_secs
+        } else {
+            self.config.backoff_base_secs
+        };
+        let mut delay_secs = base_secs.max(1).saturating_mul(factor);
+        if llm {
+            if let Some(retry_after_secs) = retry_after_secs {
+                let retry_after_secs = i64::try_from(retry_after_secs).unwrap_or(i64::MAX);
+                delay_secs =
+                    delay_secs.max(retry_after_secs.min(self.config.max_retry_after_secs.max(1)));
+            }
+        }
+        let now = chrono::Utc::now();
+        let desired = now + chrono::Duration::seconds(delay_secs);
+        let expires_at = serde_json::from_str::<serde_json::Value>(&event.payload)
+            .ok()
+            .and_then(|payload| payload.get("ingested_at").cloned())
+            .and_then(|value| serde_json::from_value::<chrono::DateTime<chrono::Utc>>(value).ok())
+            .map(|ingested_at| ingested_at + chrono::Duration::seconds(EVENT_EXPIRY_SECS));
+        expires_at.map_or(desired, |expires_at| desired.min(expires_at))
     }
 
     async fn reschedule_transport_failure(
@@ -91,6 +129,17 @@ impl OutboxDispatcher {
         error: &str,
     ) {
         if event.attempts >= self.config.max_retry_attempts.max(1) as i32 {
+            let conversation_id = serde_json::from_str::<serde_json::Value>(&event.payload)
+                .ok()
+                .and_then(|payload| payload.get("conversation_id").and_then(|v| v.as_i64()));
+            error!(
+                target: "outbox",
+                event_uuid = %event.event_uuid,
+                conversation_id,
+                error_class = "transport_retryable_exhausted",
+                attempts = event.attempts,
+                "传输失败达到最大重试次数，标记 dead_letter"
+            );
             if let Err(mark_error) = self
                 .repo
                 .mark_dead_letter(&event.event_uuid, lease_token, error)
@@ -112,7 +161,7 @@ impl OutboxDispatcher {
                 &event.event_uuid,
                 lease_token,
                 error,
-                self.next_retry_at(event.attempts),
+                self.next_retry_at(event, event.attempts, false, None),
             )
             .await
         {
@@ -315,6 +364,7 @@ impl OutboxDispatcher {
                     &ordering_key,
                     ordering_seq,
                     &lease_token,
+                    conversation_id,
                     outcome,
                 )
                 .await;
@@ -352,6 +402,7 @@ impl OutboxDispatcher {
         ordering_key: &str,
         ordering_seq: i64,
         lease_token: &str,
+        conversation_id: Option<i64>,
         outcome: ProcessingOutcome,
     ) {
         match outcome {
@@ -391,6 +442,8 @@ impl OutboxDispatcher {
                         error!(
                             target: "outbox",
                             event_uuid = %event_uuid,
+                            conversation_id,
+                            error_class = "retryable_exhausted",
                             attempts = event.attempts,
                             "超过最大重试次数，标记为 dead_letter"
                         );
@@ -425,7 +478,14 @@ impl OutboxDispatcher {
                     .flatten()
                     .map(|e| e.attempts)
                     .unwrap_or(1);
-                let next_available = self.next_retry_at(attempts);
+                let event = self.repo.find_by_uuid(event_uuid).await.ok().flatten();
+                let next_available = event.as_ref().map_or_else(
+                    || {
+                        chrono::Utc::now()
+                            + chrono::Duration::seconds(self.config.backoff_base_secs.max(1))
+                    },
+                    |event| self.next_retry_at(event, attempts, false, None),
+                );
 
                 if let Err(e) = self
                     .repo
@@ -435,12 +495,70 @@ impl OutboxDispatcher {
                     error!(target: "outbox", event_uuid = %event_uuid, error = %e, "标记 retry_wait 失败");
                 }
             }
+            ProcessingOutcome::RetryableLlmFailure {
+                error,
+                retry_after_secs,
+            } => {
+                warn!(
+                    target: "outbox",
+                    event_uuid = %event_uuid,
+                    ordering_key = %ordering_key,
+                    ordering_seq,
+                    conversation_id,
+                    error = %error,
+                    retry_after_secs,
+                    "LLM 事件处理失败，准备重试"
+                );
+
+                if let Ok(Some(event)) = self.repo.find_by_uuid(event_uuid).await {
+                    if event.attempts >= self.config.llm_max_retry_attempts.max(1) as i32 {
+                        error!(
+                            target: "outbox",
+                            event_uuid = %event_uuid,
+                            conversation_id,
+                            error_class = "llm_retryable_exhausted",
+                            attempts = event.attempts,
+                            "超过 LLM 最大重试次数，标记为 dead_letter"
+                        );
+                        let marked = if let Err(mark_error) = self
+                            .repo
+                            .mark_dead_letter(event_uuid, lease_token, &error)
+                            .await
+                        {
+                            error!(target: "outbox", event_uuid = %event_uuid, error = %mark_error, "标记 dead_letter 失败");
+                            false
+                        } else {
+                            true
+                        };
+                        if marked {
+                            let mut seqs = self.active_seqs.write().await;
+                            let current = seqs.get(ordering_key).copied().unwrap_or(0);
+                            if ordering_seq > current {
+                                seqs.insert(ordering_key.to_string(), ordering_seq);
+                            }
+                        }
+                        return;
+                    }
+
+                    let next_available =
+                        self.next_retry_at(&event, event.attempts, true, retry_after_secs);
+                    if let Err(mark_error) = self
+                        .repo
+                        .mark_retry_wait(event_uuid, lease_token, &error, next_available)
+                        .await
+                    {
+                        error!(target: "outbox", event_uuid = %event_uuid, error = %mark_error, "标记 retry_wait 失败");
+                    }
+                }
+            }
             ProcessingOutcome::PermanentFailure { error } => {
                 error!(
                     target: "outbox",
                     event_uuid = %event_uuid,
                     ordering_key = %ordering_key,
                     ordering_seq,
+                    conversation_id,
+                    error_class = "permanent",
                     error = %error,
                     "事件永久失败，标记为 dead_letter"
                 );
@@ -532,6 +650,32 @@ impl OutboxDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::outbox_tests::MemOutboxRepo;
+    use crate::domain::repository::OutboxRepository;
+    use chrono::Utc;
+
+    fn test_event(event_uuid: &str) -> OutboxEvent {
+        let now = Utc::now();
+        OutboxEvent {
+            id: 1,
+            event_uuid: event_uuid.into(),
+            entity_id: 1,
+            entity_type: "messages".into(),
+            event_type: "MessageAccepted".into(),
+            event_version: 1,
+            payload: serde_json::json!({"conversation_id": 9, "ingested_at": now}).to_string(),
+            ordering_key: "9".into(),
+            ordering_seq: 1,
+            created_at: now,
+            available_at: now,
+            status: crate::domain::outbox::OutboxStatus::Pending,
+            attempts: 0,
+            last_error: None,
+            locked_until: None,
+            processed_at: None,
+            lease_token: None,
+        }
+    }
 
     #[test]
     fn test_default_config() {
@@ -540,9 +684,81 @@ mod tests {
         assert_eq!(config.max_retry_attempts, MAX_RETRY_ATTEMPTS);
         assert_eq!(config.poll_interval_ms, 100);
         assert_eq!(config.backoff_base_secs, RETRY_BACKOFF_BASE_SECS);
+        assert_eq!(config.llm_max_retry_attempts, LLM_MAX_RETRY_ATTEMPTS);
+        assert_eq!(config.llm_backoff_base_secs, LLM_RETRY_BACKOFF_BASE_SECS);
+        assert_eq!(config.max_retry_after_secs, MAX_RETRY_AFTER_SECS);
         assert_eq!(
             config.processing_timeout_secs,
             DEFAULT_EVENT_PROCESSING_TIMEOUT_SECS
         );
+    }
+
+    #[tokio::test]
+    async fn retryable_outcomes_retry_and_rate_limit_honors_retry_after() {
+        let repo = Arc::new(MemOutboxRepo::new());
+        repo.add_outbox_event(test_event("retryable-test"))
+            .await
+            .unwrap();
+        let event = repo.claim_next_event(30).await.unwrap().unwrap();
+        let token = event.lease_token.clone().unwrap();
+        let dispatcher = OutboxDispatcher::new(repo.clone(), OutboxDispatcherConfig::default());
+        let before = Utc::now();
+
+        dispatcher
+            .handle_outcome(
+                &event.event_uuid,
+                &event.ordering_key,
+                event.ordering_seq,
+                &token,
+                Some(9),
+                ProcessingOutcome::RetryableLlmFailure {
+                    error: "429".into(),
+                    retry_after_secs: Some(37),
+                },
+            )
+            .await;
+
+        let stored = repo.find_by_uuid(&event.event_uuid).await.unwrap().unwrap();
+        assert_eq!(
+            stored.status,
+            crate::domain::outbox::OutboxStatus::RetryWait
+        );
+        assert_eq!(stored.attempts, 1);
+        assert!(stored.available_at >= before + chrono::Duration::seconds(37));
+    }
+
+    #[tokio::test]
+    async fn four_xx_permanent_failure_is_attempted_once() {
+        let repo = Arc::new(MemOutboxRepo::new());
+        repo.add_outbox_event(test_event("permanent-test"))
+            .await
+            .unwrap();
+        let event = repo.claim_next_event(30).await.unwrap().unwrap();
+        let token = event.lease_token.clone().unwrap();
+        let dispatcher = OutboxDispatcher::new(repo.clone(), OutboxDispatcherConfig::default());
+        let outcome =
+            crate::application::reply_processor::ReplyProcessor::classify_outbox_error_for_event(
+                crate::error::RuntimeError::Llm("服务返回 400".into()),
+                9,
+            );
+        assert!(outcome.is_permanent());
+
+        dispatcher
+            .handle_outcome(
+                &event.event_uuid,
+                &event.ordering_key,
+                event.ordering_seq,
+                &token,
+                Some(9),
+                outcome,
+            )
+            .await;
+
+        let stored = repo.find_by_uuid(&event.event_uuid).await.unwrap().unwrap();
+        assert_eq!(
+            stored.status,
+            crate::domain::outbox::OutboxStatus::DeadLetter
+        );
+        assert_eq!(stored.attempts, 1);
     }
 }

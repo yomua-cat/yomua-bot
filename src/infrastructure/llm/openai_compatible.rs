@@ -111,17 +111,19 @@ impl OpenAiCompatibleProvider {
         let choices = raw
             .get("choices")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| RuntimeError::Llm("响应缺少 choices".to_string()))?;
+            .ok_or_else(|| RuntimeError::LlmResponseInvalid("响应缺少 choices".to_string()))?;
 
         let first = choices
             .first()
-            .ok_or_else(|| RuntimeError::Llm("响应 choices 为空".to_string()))?;
+            .ok_or_else(|| RuntimeError::LlmResponseInvalid("响应 choices 为空".to_string()))?;
 
         let content = first
             .get("message")
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_str())
-            .ok_or_else(|| RuntimeError::Llm("响应缺少 message.content".to_string()))?
+            .ok_or_else(|| {
+                RuntimeError::LlmResponseInvalid("响应缺少 message.content".to_string())
+            })?
             .to_string();
 
         let truncated = first
@@ -222,6 +224,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            let retry_after_secs = if status.as_u16() == 429 {
+                resp.headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_retry_after_secs)
+            } else {
+                None
+            };
             let body = resp.text().await.unwrap_or_default();
             let detail = sanitize_error_detail(&body);
             let message = if detail.is_empty() {
@@ -229,7 +239,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
             } else {
                 format!("OpenAI-compatible 服务返回错误 {status}: {detail}")
             };
-            if status.is_server_error() || status.as_u16() == 429 {
+            if status.as_u16() == 429 {
+                return Err(RuntimeError::RateLimited {
+                    message,
+                    retry_after_secs,
+                });
+            }
+            if status.is_server_error() {
                 return Err(RuntimeError::HttpError(message));
             }
             return Err(RuntimeError::Llm(message));
@@ -238,7 +254,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|_| RuntimeError::Llm("解析响应 JSON 失败".into()))?;
+            .map_err(|_| RuntimeError::LlmResponseInvalid("解析响应 JSON 失败".into()))?;
 
         self.parse_response(&body)
     }
@@ -336,6 +352,10 @@ fn sanitize_error_detail(body: &str) -> String {
         detail.push_str("...");
     }
     detail
+}
+
+fn parse_retry_after_secs(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
 }
 
 #[cfg(test)]
@@ -477,7 +497,87 @@ mod tests {
     fn parse_response_errors_on_missing_choices() {
         let p = provider();
         let raw = serde_json::json!({});
-        assert!(p.parse_response(&raw).is_err());
+        assert!(matches!(
+            p.parse_response(&raw),
+            Err(RuntimeError::LlmResponseInvalid(message)) if message == "响应缺少 choices"
+        ));
+    }
+
+    #[test]
+    fn parse_response_errors_on_empty_choices_and_missing_content() {
+        let p = provider();
+        assert!(matches!(
+            p.parse_response(&serde_json::json!({"choices": []})),
+            Err(RuntimeError::LlmResponseInvalid(message)) if message == "响应 choices 为空"
+        ));
+        assert!(matches!(
+            p.parse_response(&serde_json::json!({"choices": [{"message": {}}]})),
+            Err(RuntimeError::LlmResponseInvalid(message)) if message == "响应缺少 message.content"
+        ));
+    }
+
+    #[test]
+    fn parses_retry_after_seconds() {
+        assert_eq!(parse_retry_after_secs(" 42 "), Some(42));
+        assert_eq!(parse_retry_after_secs("not-a-number"), None);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_response_preserves_retry_after() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 37\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+        });
+        let provider = OpenAiCompatibleProvider::new(
+            OpenAiCompatibleConfig {
+                base_url: "http://openai-compatible.invalid/v1".into(),
+                api_key: None,
+                model: "test-model".into(),
+                embedding_model: None,
+                timeout: Duration::from_secs(2),
+            },
+            Some(&format!("http://{address}")),
+        )
+        .unwrap();
+        let request = LlmRequest {
+            system: None,
+            messages: vec![LlmMessage {
+                role: LlmRole::User,
+                content: "test".into(),
+            }],
+            model: None,
+            temperature: None,
+            max_tokens: None,
+            priority: 0,
+            metadata: serde_json::json!({}),
+        };
+
+        let error = provider.generate(request).await.unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::RateLimited {
+                retry_after_secs: Some(37),
+                ..
+            }
+        ));
+        server.await.unwrap();
     }
 
     #[tokio::test]

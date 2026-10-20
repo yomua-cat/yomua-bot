@@ -34,3 +34,4 @@
 - 阶段 2B 先建立结构化 `memory_claims` 的来源校验和历史持久边界；claim 的 replace/append/reject 只能由程序验证后的 proposal 调用，模型自动提出 claim 暂不启用。影响：记忆领域模型、SQLite 仓储、迁移和验收测试。
 - 阶段 3 先提供独立的多维情绪衰减纯函数和 Mood 兼容投影，不接入现有默认状态更新链；离线衰减以持久化 `updated_at` 为基准，重复 tick 幂等，时钟回拨保留原状态。影响：情绪领域模型和后续可选后台能力。
 - 阶段 4 先持久化主动意图和最小回复批次快照，状态更新使用条件写入和批次 lease token；暂不改变主动决策、Outbox 或平台发送协议。影响：主动行为恢复、回复批次和 SQLite 仓储。
+- LLM 明确 4xx 业务拒绝保持永久失败；空 choices、缺少 `message.content`、响应 JSON 解析失败和 429/5xx 等供应商暂态响应进入 LLM 专用重试。429 的 `Retry-After` 受 120 秒上限和事件过期时间约束，死信只记录结构化日志，不自动向用户发送错误消息。影响：OpenAI-compatible Provider、ReplyProcessor、OutboxDispatcher、Outbox 状态和验收测试。来源：2026-10-20 任务 2。

@@ -22,6 +22,11 @@ pub enum ProcessingOutcome {
     Success,
     /// 可重试的失败。
     RetryableFailure { error: String },
+    /// LLM 失败，可使用更长的重试策略；可选的延迟来自 Retry-After。
+    RetryableLlmFailure {
+        error: String,
+        retry_after_secs: Option<u64>,
+    },
     /// 永久性失败。
     PermanentFailure { error: String },
 }
@@ -34,7 +39,11 @@ impl ProcessingOutcome {
 
     /// 判断是否为可重试失败。
     pub fn is_retryable(&self) -> bool {
-        matches!(self, ProcessingOutcome::RetryableFailure { .. })
+        matches!(
+            self,
+            ProcessingOutcome::RetryableFailure { .. }
+                | ProcessingOutcome::RetryableLlmFailure { .. }
+        )
     }
 
     /// 判断是否为永久性失败。
@@ -48,6 +57,13 @@ impl std::fmt::Display for ProcessingOutcome {
         match self {
             ProcessingOutcome::Success => write!(f, "Success"),
             ProcessingOutcome::RetryableFailure { error } => write!(f, "RetryableFailure({error})"),
+            ProcessingOutcome::RetryableLlmFailure {
+                error,
+                retry_after_secs,
+            } => write!(
+                f,
+                "RetryableLlmFailure({error}, retry_after={retry_after_secs:?})"
+            ),
             ProcessingOutcome::PermanentFailure { error } => write!(f, "PermanentFailure({error})"),
         }
     }

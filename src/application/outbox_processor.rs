@@ -92,7 +92,8 @@ impl OutboxProcessor {
                         .await;
                         let final_state = match &outcome {
                             ProcessingOutcome::Success => "success",
-                            ProcessingOutcome::RetryableFailure { .. } => "retryable_failure",
+                            ProcessingOutcome::RetryableFailure { .. }
+                            | ProcessingOutcome::RetryableLlmFailure { .. } => "retryable_failure",
                             ProcessingOutcome::PermanentFailure { .. } => "permanent_failure",
                         };
                         info!(

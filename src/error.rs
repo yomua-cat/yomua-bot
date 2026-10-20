@@ -33,6 +33,15 @@ pub enum RuntimeError {
     #[error("LLM 错误：{0}")]
     Llm(String),
 
+    #[error("LLM 响应内容无效：{0}")]
+    LlmResponseInvalid(String),
+
+    #[error("LLM 请求被限流：{message}")]
+    RateLimited {
+        message: String,
+        retry_after_secs: Option<u64>,
+    },
+
     #[error("HTTP 错误：{0}")]
     HttpError(String),
 

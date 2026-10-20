@@ -350,7 +350,12 @@ impl DefaultLlmScheduler {
 }
 
 fn is_retryable_provider_error(error: &RuntimeError) -> bool {
-    matches!(error, RuntimeError::HttpError(_))
+    matches!(
+        error,
+        RuntimeError::HttpError(_)
+            | RuntimeError::RateLimited { .. }
+            | RuntimeError::LlmResponseInvalid(_)
+    )
 }
 
 #[async_trait::async_trait]

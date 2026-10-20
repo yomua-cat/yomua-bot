@@ -42,6 +42,9 @@ const NORMAL_BATCH_WAIT_MS: u64 = 1_500;
 const MENTION_BATCH_WAIT_MS: u64 = 500;
 const MAX_BATCH_MESSAGES: usize = 20;
 
+/// 回复任务从入站开始允许的最长存活时间；重试退避不能把下一次尝试推到更晚。
+pub(crate) const EVENT_EXPIRY_SECS: i64 = 120;
+
 fn combine_batch_contents(contents: impl IntoIterator<Item = String>) -> String {
     contents
         .into_iter()
@@ -116,7 +119,7 @@ struct FrozenBatch {
 
 impl ReplyProcessor {
     fn event_expired(event: &MessageReceivedEvent) -> bool {
-        event.message_id > 0 && (Utc::now() - event.ingested_at).num_seconds() > 120
+        event.message_id > 0 && (Utc::now() - event.ingested_at).num_seconds() > EVENT_EXPIRY_SECS
     }
 
     /// 在回复任务开始时冻结一轮连续输入。
@@ -1457,40 +1460,99 @@ impl ReplyProcessor {
             return ProcessingOutcome::Success;
         }
         let error_text = error.to_string();
-        let is_permanent = match &error {
-            RuntimeError::Repository(crate::error::RepositoryError::Database(message)) => {
-                !Self::is_transient_database_error(message)
+        let (outcome, error_class) = match error {
+            RuntimeError::LlmResponseInvalid(_) => (
+                ProcessingOutcome::RetryableLlmFailure {
+                    error: error_text.clone(),
+                    retry_after_secs: None,
+                },
+                "llm_response_invalid",
+            ),
+            RuntimeError::RateLimited {
+                retry_after_secs, ..
+            } => (
+                ProcessingOutcome::RetryableLlmFailure {
+                    error: error_text.clone(),
+                    retry_after_secs,
+                },
+                "llm_rate_limited",
+            ),
+            RuntimeError::HttpError(_) => (
+                ProcessingOutcome::RetryableLlmFailure {
+                    error: error_text.clone(),
+                    retry_after_secs: None,
+                },
+                "llm_transport",
+            ),
+            RuntimeError::Repository(crate::error::RepositoryError::Database(message))
+                if Self::is_transient_database_error(&message) =>
+            {
+                (
+                    ProcessingOutcome::RetryableFailure {
+                        error: error_text.clone(),
+                    },
+                    "database_transient",
+                )
             }
-            RuntimeError::Storage(crate::error::StorageError::Connection(_)) => false,
-            RuntimeError::Storage(crate::error::StorageError::Database(message)) => {
-                !Self::is_transient_database_error(message)
+            RuntimeError::Storage(crate::error::StorageError::Connection(_)) => (
+                ProcessingOutcome::RetryableFailure {
+                    error: error_text.clone(),
+                },
+                "storage_connection",
+            ),
+            RuntimeError::Storage(crate::error::StorageError::Database(message))
+                if Self::is_transient_database_error(&message) =>
+            {
+                (
+                    ProcessingOutcome::RetryableFailure {
+                        error: error_text.clone(),
+                    },
+                    "database_transient",
+                )
             }
-            // Provider 已明确返回业务层 4xx/协议/配置错误时，继续重试
-            // 只会重复发送同一个无效请求；只有 HttpError 代表可恢复的
-            // 网络、429 或 5xx 路径。
-            RuntimeError::Llm(_) | RuntimeError::Config(_) | RuntimeError::ParseError(_) => true,
-            RuntimeError::SendUnavailable(_) => false,
-            RuntimeError::SendRejected(_) => true,
-            _ => false,
+            RuntimeError::Llm(_)
+            | RuntimeError::Config(_)
+            | RuntimeError::ParseError(_)
+            | RuntimeError::SendRejected(_)
+            | RuntimeError::Repository(_)
+            | RuntimeError::Storage(_)
+            | RuntimeError::Domain(_)
+            | RuntimeError::Adapter(_)
+            | RuntimeError::Plugin(_)
+            | RuntimeError::SendUnknown(_)
+            | RuntimeError::Internal(_)
+            | RuntimeError::UserInput(_, _) => (
+                ProcessingOutcome::PermanentFailure {
+                    error: error_text.clone(),
+                },
+                "permanent",
+            ),
+            _ => (
+                ProcessingOutcome::RetryableFailure {
+                    error: error_text.clone(),
+                },
+                "transient",
+            ),
         };
 
-        if is_permanent {
+        if outcome.is_permanent() {
             tracing::error!(
                 target: "outbox",
                 conversation_id,
-                error = %error,
+                error_class,
+                error = %error_text,
                 "永久性错误"
             );
-            ProcessingOutcome::PermanentFailure { error: error_text }
         } else {
             tracing::warn!(
                 target: "outbox",
                 conversation_id,
-                error = %error,
+                error_class,
+                error = %error_text,
                 "可重试错误"
             );
-            ProcessingOutcome::RetryableFailure { error: error_text }
         }
+        outcome
     }
 
     /// 识别 SQLite/连接层明确表示“稍后重试”的错误。
@@ -2698,6 +2760,44 @@ mod tests {
         assert!(!rejected.is_retryable());
         assert!(unavailable.is_retryable());
         assert!(!unavailable.is_permanent());
+    }
+
+    #[test]
+    fn invalid_llm_response_is_retryable_but_4xx_is_permanent() {
+        let invalid = ReplyProcessor::classify_outbox_error_for_event(
+            RuntimeError::LlmResponseInvalid("响应 choices 为空".into()),
+            7,
+        );
+        let rejected = ReplyProcessor::classify_outbox_error_for_event(
+            RuntimeError::Llm("OpenAI-compatible 服务返回错误 400 Bad Request".into()),
+            7,
+        );
+
+        assert!(invalid.is_retryable());
+        assert!(matches!(
+            invalid,
+            ProcessingOutcome::RetryableLlmFailure { .. }
+        ));
+        assert!(rejected.is_permanent());
+    }
+
+    #[test]
+    fn rate_limit_preserves_retry_after_for_outbox() {
+        let outcome = ReplyProcessor::classify_outbox_error_for_event(
+            RuntimeError::RateLimited {
+                message: "429 Too Many Requests".into(),
+                retry_after_secs: Some(37),
+            },
+            7,
+        );
+
+        assert_eq!(
+            outcome,
+            ProcessingOutcome::RetryableLlmFailure {
+                error: "LLM 请求被限流：429 Too Many Requests".into(),
+                retry_after_secs: Some(37),
+            }
+        );
     }
 
     #[tokio::test]
