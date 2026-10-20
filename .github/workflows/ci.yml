@@ -31,6 +31,24 @@ jobs:
       - name: 构建库、二进制及示例
         run: cargo build --locked --lib --bins --examples
 
+  minimum-rust-build:
+    name: 必过 / Rust 1.88 最低版本构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+          rustc --version
+          cargo --version
+      - name: 构建库、二进制及示例
+        run: cargo build --locked --lib --bins --examples
+
   unit-tests:
     name: 必过 / 库和二进制测试
     runs-on: ubuntu-latest
@@ -86,10 +104,9 @@ jobs:
           PYTHON
 
   diagnostics:
-    name: 非阻断 / ${{ matrix.name }}
+    name: 必过 / ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -127,12 +144,12 @@ jobs:
             verdict="失败"
           fi
           {
-            echo "### 非阻断检查：$CHECK_NAME"
+            echo "### 必过检查：$CHECK_NAME"
             echo
             echo "结果：$verdict，退出码：$result。"
             echo
             echo "命令：\`$CHECK_COMMAND\`"
             echo
-            echo "此作业暂不阻断整体工作流；失败仍须修复，不能作为完整检查通过的依据。"
+            echo "该检查失败将阻断整体工作流。"
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$result"
