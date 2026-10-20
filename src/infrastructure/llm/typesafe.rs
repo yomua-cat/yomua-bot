@@ -99,7 +99,18 @@ impl LlmProvider for TypeSafeProvider {
                         .into(),
                 ));
             }
-            let message = format!("TypeSafe 服务返回错误 {status}");
+            // 422 等客户端错误通常包含协议字段级诊断；保留脱敏后的短文本，便于定位请求形状问题。
+            // 不记录请求体、Authorization 或完整响应，避免泄漏敏感数据。
+            let detail = raw
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(512)
+                .collect::<String>();
+            let message = if detail.is_empty() {
+                format!("TypeSafe 服务返回错误 {status}")
+            } else {
+                format!("TypeSafe 服务返回错误 {status}: {detail}")
+            };
             return if status.is_server_error() || status.as_u16() == 429 || status.as_u16() == 529 {
                 Err(RuntimeError::HttpError(message))
             } else {

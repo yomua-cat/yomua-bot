@@ -8,7 +8,7 @@
 //! 支持首次启动自动生成模板文件、配置校验与热重载。
 
 use chrono::FixedOffset;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::adapters::onebot::OneBotConfig;
 use crate::error::RuntimeError;
@@ -30,6 +30,7 @@ pub struct RuntimeConfig {
     pub plugins_dir: Option<String>,
 
     /// 管理员用户外部 ID 列表（如 QQ 号）。为 None 时无人可执行系统指令。
+    #[serde(deserialize_with = "deserialize_admin_users")]
     pub admin_users: Option<Vec<String>>,
 
     /// 事件总线广播通道容量（默认 256）。
@@ -46,6 +47,31 @@ pub struct RuntimeConfig {
 
     /// 所有模型 Provider 共用的可选 HTTP(S) 出站代理。
     pub proxy: Option<String>,
+}
+
+/// 管理员 ID 允许 TOML 中使用数字或字符串，加载后统一成字符串。
+/// QQ 号在业务层本来就是外部 ID，统一字符串可避免不同适配器的类型差异。
+fn deserialize_admin_users<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum AdminUserId {
+        String(String),
+        Integer(i64),
+    }
+
+    let values = Option::<Vec<AdminUserId>>::deserialize(deserializer)?;
+    Ok(values.map(|items| {
+        items
+            .into_iter()
+            .map(|item| match item {
+                AdminUserId::String(value) => value,
+                AdminUserId::Integer(value) => value.to_string(),
+            })
+            .collect()
+    }))
 }
 
 impl Default for RuntimeConfig {
@@ -1017,6 +1043,22 @@ mod tests {
         assert_eq!(
             cfg.admin_users,
             Some(vec!["10001".to_string(), "10002".to_string()])
+        );
+    }
+
+    #[test]
+    fn runtime_config_admin_users_accepts_numeric_ids() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        fs::write(
+            &path,
+            "data_dir = \"/tmp/runtime-data\"\nlog_level = \"info\"\nshutdown_timeout_secs = 10\nadmin_users = [2528797331, \"10002\"]\n",
+        )
+        .unwrap();
+        let cfg = load_runtime(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            cfg.admin_users,
+            Some(vec!["2528797331".to_string(), "10002".to_string()])
         );
     }
 
