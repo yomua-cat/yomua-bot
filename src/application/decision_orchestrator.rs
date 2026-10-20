@@ -182,7 +182,7 @@ impl DecisionOrchestrator {
     /// 将经过验证的 DecisionResult 应用到规则决策。
     ///
     /// 这是纯动作变换，不依赖编排器中的 evaluator、trigger 或 pipeline，
-    /// 因此真实探针和回放工具可以复用与生产路径相同的最终动作规则。
+    /// 因此回放工具可以复用与生产路径相同的最终动作规则。
     pub fn apply_override(
         result: DecisionResult,
         built_in: BuiltInDecision,

@@ -18,19 +18,6 @@
 
 处理器会把 Outbox 顶层的 `event_uuid` 写入 `MessageReceivedEvent.metadata`，因此回复生成和 LLM 调度日志可以沿同一 UUID 关联；同时保留 `conversation_id`、`message_id` 和时间作为交叉核对字段。真实网络、外部服务和 QQ 送达结果仍须人工验收，日志本身不能证明用户端已收到消息。
 
-## 单次决策模型探针
-
-可以在不启动 QQ、OneBot、插件或数据库的情况下，单独验证一次 Jev 决策链：
-
-```bash
-cargo run --example decision_probe -- --config-dir config --mode response
-cargo run --example decision_probe -- --config-dir config --mode proactive
-```
-
-探针读取 `runtime.toml` 中的可选 `proxy` 和 `decision.toml` 中的 TypeSafe Provider，复用真实的请求构造、调度、typed question 解析、验证器和最终动作覆盖逻辑。`enabled = false` 不会阻止探针运行，因为探针本身就是显式的单次验收入口。输出只包含模型版本、问题类型、答案摘要、概率、置信度、校验结果和最终动作，不输出 API Key、代理凭据、原始请求或原始响应。
-
-探针返回 `request=success` 且 `validation=passed`，才表示本次请求完整走通。`request=failed` 时会显示脱敏的失败类别并明确回退到规则动作；HTTP 能连接但服务在答案前拒绝请求时，仍不能据此证明 Jev 的响应解析已经通过。
-
 ## 已有证据
 
 - 模型出站代理测试：TypeSafe 和 OpenAI-compatible mock HTTP 服务均确认启用代理时收到绝对目标 URI；TypeSafe 直连测试确认未配置代理时直接访问模型服务；不可达代理错误摘要不含代理凭据。
@@ -101,7 +88,6 @@ cargo run --example decision_probe -- --config-dir config --mode proactive
 - 记忆候选会由后台 `decision` 模型审核，程序仍校验来源消息、用户、会话、类型和置信度；模型不可用或意见不合规时保留候选。自然语言修改请求具备后台恢复；矛盾记忆的系统化修订仍未完成。当前 ctl 提供摘要查询、显式原文读取、删除、修改请求登记，以及跨会话隐私策略的请求、确认和取消。
 - 世界书暂不参与上下文组装。
 - 决策模型通过独立 `decision.toml` 接入，支持主模型、备用链、调用次数和本次 token 预算；具体开源模型、部署位置和价格仍需填写后按真实摘要测量。
-- 决策模型可用 `examples/decision_probe.rs` 单独执行一次真实请求；探针不会启动主运行时或发送 QQ 消息。
 - 当前 8GB M2 的桌面负载不适合常驻本地决策模型；后续应优先采用远程或局域网 sidecar，本地实验限制为单模型、短上下文、单并发和关闭缓存。
 - 严格 Clippy 已通过；向量记忆接口明确为可选能力，当前对话不默认调用；消息/认知层装配已完成结构化整理。
 - 常驻任务的统一关停和配置热重载仍需真实进程级验收；插件连接失败、握手、订阅和清理的 socket 测试已在本机显式通过。
