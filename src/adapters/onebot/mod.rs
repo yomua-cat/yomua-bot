@@ -243,6 +243,7 @@ impl OneBotAdapter for OneBotAdapterImpl {
             .ok_or_else(|| RuntimeError::Adapter("入站通道已被占用".to_string()))?;
 
         let shutdown_rx = self.shutdown_tx.subscribe();
+        let processor_shutdown_rx = self.shutdown_tx.subscribe();
         let connector = Arc::clone(&self.connector);
         let shared = self.shared.clone();
         let event_tx = self.event_tx.clone();
@@ -266,6 +267,7 @@ impl OneBotAdapter for OneBotAdapterImpl {
             acceptance_service: self.acceptance_service.clone(),
             binding_manager: self.binding_manager.clone(),
             blacklist_repo: self.blacklist_repo.clone(),
+            shutdown_rx: processor_shutdown_rx,
         };
         let processor_task = tokio::spawn(async move { processor.run().await });
         self.tasks
@@ -424,13 +426,25 @@ struct InboundProcessor {
     acceptance_service: Arc<MessageAcceptanceService>,
     binding_manager: Arc<BindingManager>,
     blacklist_repo: Option<Arc<dyn BlacklistRepository>>,
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 impl InboundProcessor {
     async fn run(mut self) {
-        while let Some(raw) = self.event_rx.recv().await {
-            // 通道发送方全部关闭 → 结束。
-            self.handle_raw(&raw).await;
+        loop {
+            tokio::select! {
+                changed = self.shutdown_rx.changed() => {
+                    if changed.is_err() || *self.shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                raw = self.event_rx.recv() => {
+                    match raw {
+                        Some(raw) => self.handle_raw(&raw).await,
+                        None => break,
+                    }
+                }
+            }
         }
     }
 
@@ -887,6 +901,7 @@ mod tests {
             acceptance_service: Arc::new(acceptance_service),
             binding_manager: Arc::new(binding_manager),
             blacklist_repo: None,
+            shutdown_rx: watch::channel(false).1,
         }
     }
 
@@ -1397,5 +1412,19 @@ mod tests {
             "未 @ 的群聊指令应发布 MessageAccepted，实际 {:?}",
             events[0]
         );
+    }
+
+    #[tokio::test]
+    async fn inbound_processor_stops_when_adapter_shutdown_is_signaled() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut processor = processor();
+        processor.shutdown_rx = shutdown_rx;
+        let task = tokio::spawn(processor.run());
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("入站处理器应在关停信号后及时退出")
+            .expect("入站处理器任务不应 panic");
     }
 }
