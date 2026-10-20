@@ -9,6 +9,7 @@
 //! - [`connection`] —— WebSocket 传输、断线重连与指数退避
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -37,6 +38,9 @@ pub use conversion::{
     build_get_message_request, build_group_send_request, build_private_send_request, OneBotEvent,
     OutgoingRequest,
 };
+
+const MAX_INBOUND_RETRIES: usize = 3;
+const INBOUND_RETRY_BASE_DELAY_MS: u64 = 100;
 
 /// OneBot 适配器配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -447,11 +451,21 @@ impl InboundProcessor {
     }
 
     async fn handle_raw(&self, raw: &str) {
+        if let Err(error) = retry_inbound_operation(|| self.handle_raw_once(raw)).await {
+            tracing::error!(
+                target: "adapter",
+                error = %error,
+                "入站消息处理失败，达到重试上限或错误不可重试"
+            );
+        }
+    }
+
+    async fn handle_raw_once(&self, raw: &str) -> Result<(), RuntimeError> {
         let event: OneBotEvent = match serde_json::from_str(raw) {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(target: "adapter", error = %e, "无法解析 OneBot JSON");
-                return;
+                return Ok(());
             }
         };
 
@@ -460,27 +474,26 @@ impl InboundProcessor {
             Ok(i) => i,
             Err(_) if !is_message_event(&event) => {
                 tracing::debug!(target: "adapter", event = %event.post_type, "忽略非消息事件");
-                return;
+                return Ok(());
             }
             Err(e) => {
                 tracing::debug!(target: "adapter", error = %e, "忽略无法转换的入站事件");
-                return;
+                return Ok(());
             }
         };
 
         // self_id 来自平台事件本身，比本地可选配置更可靠。自身回声只记录平台
         // 对账信息，不进入命令、关系、记忆或回复链路；assistant 历史由出站路径落库。
         if inbound.is_self_echo {
-            if let Ok(Some(conversation_id)) = self
+            if let Some(conversation_id) = self
                 .conversation_manager
                 .find_existing_conversation(
                     inbound.conversation_type,
                     &inbound.external_conversation_id,
                 )
-                .await
+                .await?
             {
-                if let Err(error) = self
-                    .acceptance_service
+                self.acceptance_service
                     .record_platform_echo(
                         conversation_id,
                         inbound.platform_message_id,
@@ -492,17 +505,14 @@ impl InboundProcessor {
                             "reply_to_platform_message_id": inbound.reply_to,
                         }),
                     )
-                    .await
-                {
-                    tracing::warn!(target = "adapter", %error, "记录平台回声失败");
-                }
+                    .await?;
             }
             tracing::debug!(
                 target: "adapter",
                 platform_message_id = inbound.platform_message_id,
                 "忽略 OneBot 自身回声事件"
             );
-            return;
+            return Ok(());
         }
 
         // 黑名单必须在 resolve 之前检查。resolve 会按需创建会话和参与者，
@@ -513,14 +523,11 @@ impl InboundProcessor {
                 .await
             {
                 Ok(blocked) => blocked,
-                Err(error) => {
-                    tracing::warn!(target: "adapter", %error, "查询用户黑名单失败，拒绝本条入站消息");
-                    return;
-                }
+                Err(error) => return Err(RuntimeError::Repository(error)),
             };
             if user_blocked {
                 tracing::info!(target: "adapter", sender_id = %inbound.external_sender_id, "用户处于黑名单，忽略入站消息");
-                return;
+                return Ok(());
             }
             if inbound.conversation_type == crate::domain::conversation::ConversationType::Group {
                 let group_blocked = match blacklist_repo
@@ -528,14 +535,11 @@ impl InboundProcessor {
                     .await
                 {
                     Ok(blocked) => blocked,
-                    Err(error) => {
-                        tracing::warn!(target: "adapter", %error, "查询群组黑名单失败，拒绝本条入站消息");
-                        return;
-                    }
+                    Err(error) => return Err(RuntimeError::Repository(error)),
                 };
                 if group_blocked {
                     tracing::info!(target: "adapter", group_id = %inbound.external_conversation_id, "群组处于黑名单，忽略入站消息");
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -558,32 +562,28 @@ impl InboundProcessor {
                     inbound.conversation_type,
                     &inbound.external_conversation_id,
                 )
-                .await
-                .ok()
-                .flatten()
+                .await?
             else {
                 tracing::debug!(target: "adapter", "忽略未绑定会话中的管理指令");
-                return;
+                return Ok(());
             };
             let Some(sender_id) = self
                 .conversation_manager
                 .find_existing_participant(conversation_id, &inbound.external_sender_id)
-                .await
-                .ok()
-                .flatten()
+                .await?
             else {
                 tracing::debug!(target: "adapter", conversation_id, "忽略未知参与者的管理指令");
-                return;
+                return Ok(());
             };
             let Some(binding) = self
                 .binding_manager
                 .by_conversation(conversation_id)
-                .await
-                .ok()
-                .and_then(|bindings| bindings.into_iter().next())
+                .await?
+                .into_iter()
+                .next()
             else {
                 tracing::debug!(target: "adapter", conversation_id, "忽略未绑定会话中的管理指令");
-                return;
+                return Ok(());
             };
             let timestamp = chrono::DateTime::from_timestamp(inbound.unix_time, 0)
                 .unwrap_or_else(chrono::Utc::now);
@@ -610,11 +610,9 @@ impl InboundProcessor {
                     sequence,
                     "管理指令已持久化并进入 Outbox"
                 ),
-                Err(error) => {
-                    tracing::error!(target: "adapter", conversation_id, %error, "管理指令持久化失败")
-                }
+                Err(error) => return Err(error),
             }
-            return;
+            return Ok(());
         }
 
         // 解析外部 ID → 核心 ID。普通消息允许按需创建会话和参与者。
@@ -629,10 +627,7 @@ impl InboundProcessor {
             .await
         {
             Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!(target: "adapter", error = %e, "解析会话/参与者失败");
-                return;
-            }
+            Err(e) => return Err(e),
         };
         let sender_user_id = match self
             .conversation_manager
@@ -642,27 +637,16 @@ impl InboundProcessor {
             Ok(Some(user_id)) => user_id,
             Ok(None) => {
                 tracing::error!(target: "adapter", sender_id, "用户参与者缺少全域用户身份，拒绝持久化消息");
-                return;
+                return Ok(());
             }
-            Err(error) => {
-                tracing::error!(target: "adapter", sender_id, %error, "读取全域用户身份失败，拒绝持久化消息");
-                return;
-            }
+            Err(error) => return Err(error),
         };
 
         // C2-4: 通过 BindingManager 确定 active character
         // 与 ReplyProcessor 行为一致：无绑定时会话不处理（不落库、不进角色上下文）
         let bindings = match self.binding_manager.by_conversation(conversation_id).await {
             Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    target: "adapter",
-                    error = %e,
-                    conversation_id,
-                    "查询绑定失败，忽略消息"
-                );
-                return;
-            }
+            Err(e) => return Err(e),
         };
 
         if bindings.is_empty() {
@@ -671,7 +655,7 @@ impl InboundProcessor {
                 conversation_id,
                 "该会话未绑定角色，忽略消息（与 ReplyProcessor 行为一致）"
             );
-            return;
+            return Ok(());
         }
 
         // 取 switched_at 最新的绑定（与 switch_character 逻辑一致）
@@ -698,19 +682,7 @@ impl InboundProcessor {
 
         let (message_id, conversation_sequence) = match acceptance_result {
             Ok(result) => result,
-            Err(e) => {
-                // Acceptance 失败是严重的——消息未被持久化但入站已接收
-                // 记录错误并继续（不能 silence drop）
-                tracing::error!(
-                    target: "adapter",
-                    error = %e,
-                    conversation_id,
-                    sender_id,
-                    character_id,
-                    "MessageAcceptanceService.accept() 失败，消息未持久化"
-                );
-                return;
-            }
+            Err(e) => return Err(e),
         };
 
         tracing::debug!(
@@ -731,7 +703,71 @@ impl InboundProcessor {
             conversation_sequence,
             "C2-4: 入站消息已通过 Acceptance；canonical MessageAccepted 事件由事务入口发布"
         );
+        Ok(())
     }
+}
+
+fn inbound_retry_delay(retry: usize) -> Duration {
+    let multiplier = 1u64 << retry.min(4);
+    Duration::from_millis(
+        INBOUND_RETRY_BASE_DELAY_MS
+            .saturating_mul(multiplier)
+            .min(2_000),
+    )
+}
+
+async fn retry_inbound_operation<F, Fut>(mut operation: F) -> Result<(), RuntimeError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), RuntimeError>>,
+{
+    for retry in 0..=MAX_INBOUND_RETRIES {
+        match operation().await {
+            Ok(()) => return Ok(()),
+            Err(error) if is_retryable_inbound_error(&error) && retry < MAX_INBOUND_RETRIES => {
+                let delay = inbound_retry_delay(retry);
+                tracing::warn!(
+                    target: "adapter",
+                    retry = retry + 1,
+                    max_retries = MAX_INBOUND_RETRIES,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %error,
+                    "入站消息处理暂时失败，保持顺序并准备重试"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("入站重试循环必须返回")
+}
+
+fn is_retryable_inbound_error(error: &RuntimeError) -> bool {
+    match error {
+        RuntimeError::Repository(crate::error::RepositoryError::Database(message))
+        | RuntimeError::Storage(crate::error::StorageError::Database(message)) => {
+            is_transient_database_error(message)
+        }
+        RuntimeError::Storage(crate::error::StorageError::Connection(_)) => true,
+        _ => false,
+    }
+}
+
+fn is_transient_database_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "database is locked",
+        "database table is locked",
+        "busy",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection refused",
+        "connection closed",
+        "pool timed out",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 fn is_message_event(event: &OneBotEvent) -> bool {
@@ -763,6 +799,7 @@ mod tests {
     };
     use crate::error::RepositoryError;
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
 
     // ---- 内存仓储：会话与参与者（供 ConversationManager 解析外部 ID）----
@@ -1424,5 +1461,78 @@ mod tests {
             .await
             .expect("入站处理器应在关停信号后及时退出")
             .expect("入站处理器任务不应 panic");
+    }
+
+    #[tokio::test]
+    async fn transient_inbound_failure_retries_in_order_until_success() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let attempts_for_operation = attempts.clone();
+        let seen_for_operation = seen.clone();
+
+        retry_inbound_operation(|| {
+            let attempts = attempts_for_operation.clone();
+            let seen = seen_for_operation.clone();
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                seen.lock().unwrap().push(attempt);
+                if attempt < 3 {
+                    Err(RuntimeError::Repository(RepositoryError::Database(
+                        "database is locked".into(),
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn transient_inbound_failure_stops_after_finite_retries() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_operation = attempts.clone();
+
+        let result = retry_inbound_operation(|| {
+            let attempts = attempts_for_operation.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(RuntimeError::Repository(RepositoryError::Database(
+                    "database is locked".into(),
+                )))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            MAX_INBOUND_RETRIES + 1,
+            "应执行初次尝试加有限次重试"
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_inbound_failure_is_not_retried() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_operation = attempts.clone();
+
+        let result = retry_inbound_operation(|| {
+            let attempts = attempts_for_operation.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(RuntimeError::Repository(RepositoryError::NotFound(
+                    "会话不存在".into(),
+                )))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

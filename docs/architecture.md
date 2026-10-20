@@ -43,7 +43,7 @@ flowchart TD
 
 [消息接受服务](../src/application/message_acceptance.rs)调用[消息仓储](../src/infrastructure/storage/repository/message_repository.rs)，在同一事务内递增会话序号并写入消息和 Outbox 行。广播事件保留给插件和观察者；普通消息回复只由 Outbox Dispatcher/Processor 链路处理。`EventBus` 是尽力而为的内存广播：没有订阅者时事件直接丢弃，订阅者滞后超过容量时会丢弃旧事件并记录跳过数量；它不承担持久化或可靠消费职责。
 
-OneBot 连接循环独立路由 Action 回执，不等待入站业务处理任务；下游通道积压时，连接循环先将普通事件暂存在内存 FIFO，最多 1024 条，以便继续读取并交付其后的回执。达到上限后会暂停 WebSocket 读取形成背压，因此极端入站积压仍可能延迟回执；该上限避免无界内存增长，压力场景尚未完成真实验收。
+OneBot 连接循环独立路由 Action 回执，不等待入站业务处理任务；下游通道积压时，连接循环先将普通事件暂存在内存 FIFO，最多 1024 条，以便继续读取并交付其后的回执。达到上限后会暂停 WebSocket 读取形成背压，因此极端入站积压仍可能延迟回执；该上限避免无界内存增长，压力场景尚未完成真实验收。入站处理器对数据库、仓储连接和 SQLite 锁等暂时性错误最多重试 3 次，使用递增短延迟，并在重试期间保持后续消息不被处理；永久错误、解析错误和业务性忽略不会重试。
 
 [OutboxDispatcher](../src/application/outbox_dispatcher.rs)轮询、领取租约并等待消费者应答；[OutboxProcessor](../src/application/outbox_processor.rs)把 payload 转交[回复处理器](../src/application/reply_processor.rs)。租约、轮询和最大重试次数是代码默认值，当前没有对应 TOML 字段。消费者成功后标记完成，失败可转入等待重试或死信；永久失败事件记录后不会阻塞同一会话后续事件。
 

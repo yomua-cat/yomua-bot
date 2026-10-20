@@ -7,7 +7,7 @@
 | 检查 | 结果 | 边界 |
 | --- | --- | --- |
 | `cargo check --locked --all-targets --offline` | 通过 | 当前本机工具链和锁文件 |
-| `cargo test --locked --lib --offline -- --test-threads=1` | 通过 | 506 个通过、0 个失败、15 个插件 Unix socket 测试按标记忽略 |
+| `cargo test --locked --lib --offline -- --test-threads=1` | 通过 | 509 个通过、0 个失败、15 个插件 Unix socket 测试按标记忽略 |
 | 插件 Unix socket 测试显式运行 | 通过 | `--ignored` 下 15 个测试全部通过；普通 CI 仍按 `#[ignore]` 标记单独记录 |
 | `cargo fmt --all -- --check` | 通过 | 当前工作树 |
 | `cargo clippy --locked --offline --all-targets --all-features -- -D warnings` | 通过 | 当前工作树，包含测试目标 |
@@ -22,6 +22,7 @@
 
 - 入站消息保存作者类型、平台用户身份、观察角色、提及、引用、绑定版本和来源 metadata；适配器只负责接受，插件事件由事务提交后的 `MessageAccepted` 唯一发布，并在插件协议中归一为一条 `message.received` 通知。
 - OneBot 连接在下游入站队列积压时继续读取 WebSocket 并独立完成 Action 回执；最多暂存 1024 条入站事件，达到上限后会施加读取背压，极端积压下的回执时延尚未通过压力测试。
+- 入站处理对数据库锁、连接和仓储暂时错误最多重试 3 次，重试期间保持消息顺序；解析错误、未绑定、黑名单命中和其他业务性拒绝不会重试。进程崩溃前仍留在内存中的事件无法恢复，尚未接入入站事件持久化队列。
 - 消息接收入库使用结构化 `AcceptedMessageInput`，在同一事务中分配会话序号、写入消息并创建 Outbox 事件。
 - 回复任务会按当前会话序号读取连续输入；原消息逐条保存，生成期间的新消息进入下一轮。当前批次在任务处理中冻结，但没有独立持久化的批次实体。
 - 上下文中只有角色真实发送且归属当前观察角色的消息才使用 `assistant`；当前批次只作为当前输入出现一次。
