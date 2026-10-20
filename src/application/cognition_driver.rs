@@ -15,7 +15,6 @@ use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 
-use crate::application::character_history::CharacterHistoryProvider;
 use crate::application::clock::Clock;
 use crate::application::llm_scheduler::{EmbeddingScheduler, LlmScheduler};
 use crate::domain::character::CharacterBinding;
@@ -59,7 +58,6 @@ pub struct CognitionDriver {
     binding_repo: Arc<dyn CharacterBindingRepository>,
     message_repo: Arc<dyn MessageRepository>,
     character_repo: Arc<dyn crate::domain::repository::CharacterRepository>,
-    character_history: Arc<dyn CharacterHistoryProvider>,
     clock: Arc<dyn Clock>,
     /// 每次 tick 的间隔。
     tick_interval: Duration,
@@ -83,7 +81,6 @@ impl CognitionDriver {
         binding_repo: Arc<dyn CharacterBindingRepository>,
         message_repo: Arc<dyn MessageRepository>,
         character_repo: Arc<dyn crate::domain::repository::CharacterRepository>,
-        character_history: Arc<dyn CharacterHistoryProvider>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
@@ -93,7 +90,6 @@ impl CognitionDriver {
             binding_repo,
             message_repo,
             character_repo,
-            character_history,
             clock,
             tick_interval: DEFAULT_TICK_INTERVAL,
             cooldown: DEFAULT_COOLDOWN,
@@ -112,7 +108,6 @@ impl CognitionDriver {
         binding_repo: Arc<dyn CharacterBindingRepository>,
         message_repo: Arc<dyn MessageRepository>,
         character_repo: Arc<dyn crate::domain::repository::CharacterRepository>,
-        character_history: Arc<dyn CharacterHistoryProvider>,
         clock: Arc<dyn Clock>,
         tick_interval: Duration,
         cooldown: Duration,
@@ -125,7 +120,6 @@ impl CognitionDriver {
             binding_repo,
             message_repo,
             character_repo,
-            character_history,
             clock,
             tick_interval,
             cooldown,
@@ -290,27 +284,14 @@ impl CognitionDriver {
                 {
                     Ok(messages) => messages,
                     Err(crate::error::RepositoryError::NotImplemented(_)) => {
-                        if watermark == 0 {
-                            // 只有初始水位为 0 时，历史接口的“最近消息”语义不会
-                            // 把消息 ID 错当成会话序号；后续水位必须明确跳过。
-                            self.character_history
-                                .get_recent(
-                                    binding.conversation_id,
-                                    binding.character_id,
-                                    COGNITION_CANDIDATE_LIMIT as usize,
-                                    None,
-                                )
-                                .await?
-                        } else {
-                            tracing::warn!(
-                                target: "runtime",
-                                character_id = binding.character_id,
-                                conversation_id = binding.conversation_id,
-                                watermark,
-                                "消息仓储不支持按消息 ID 查询认知批次，跳过本轮"
-                            );
-                            return Ok(());
-                        }
+                        tracing::warn!(
+                            target: "runtime",
+                            character_id = binding.character_id,
+                            conversation_id = binding.conversation_id,
+                            watermark,
+                            "消息仓储不支持按消息 ID 查询认知批次，跳过本轮"
+                        );
+                        return Ok(());
                     }
                     Err(error) => return Err(RuntimeError::Repository(error)),
                 }
@@ -962,11 +943,6 @@ mod tests {
             binding_repo.clone(),
             msg_repo.clone(),
             char_repo,
-            Arc::new(
-                crate::application::character_history::RepositoryCharacterHistoryProvider::new(
-                    msg_repo.clone(),
-                ),
-            ),
             Arc::new(clock.clone()),
             Duration::from_secs(300),
             Duration::from_secs(600),
@@ -1006,11 +982,6 @@ mod tests {
             binding_repo.clone(),
             msg_repo.clone(),
             char_repo,
-            Arc::new(
-                crate::application::character_history::RepositoryCharacterHistoryProvider::new(
-                    msg_repo.clone(),
-                ),
-            ),
             Arc::new(clock.clone()),
             Duration::from_secs(300),
             Duration::from_secs(600),
@@ -1048,11 +1019,6 @@ mod tests {
             binding_repo.clone(),
             msg_repo.clone(),
             char_repo,
-            Arc::new(
-                crate::application::character_history::RepositoryCharacterHistoryProvider::new(
-                    msg_repo.clone(),
-                ),
-            ),
             Arc::new(clock.clone()),
             Duration::from_secs(300),
             Duration::from_secs(600), // 10 分钟冷却
@@ -1091,11 +1057,6 @@ mod tests {
             binding_repo.clone(),
             msg_repo.clone(),
             char_repo,
-            Arc::new(
-                crate::application::character_history::RepositoryCharacterHistoryProvider::new(
-                    msg_repo.clone(),
-                ),
-            ),
             Arc::new(clock.clone()),
             Duration::from_secs(300),
             Duration::from_secs(600),
@@ -1120,11 +1081,6 @@ mod tests {
             Arc::new(FakeCharacterRepo {
                 characters: Mutex::new(HashMap::new()),
             }),
-            Arc::new(
-                crate::application::character_history::RepositoryCharacterHistoryProvider::new(
-                    Arc::new(FakeMessageRepo::new()),
-                ),
-            ),
             Arc::new(clock),
             Duration::from_secs(300),
             Duration::from_secs(600),

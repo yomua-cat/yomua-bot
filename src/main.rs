@@ -1320,11 +1320,6 @@ fn spawn_background_tasks(
             repos.binding_repo.clone(),
             repos.message_repo.clone(),
             repos.character_repo.clone() as Arc<dyn CharacterRepository>,
-            Arc::new(
-                yomua_bot::application::character_history::RepositoryCharacterHistoryProvider::new(
-                    repos.message_repo.clone(),
-                ),
-            ),
             yomua_bot::application::clock::system_clock(),
         ));
         tasks.cognition = Some(cognition_driver.clone());
