@@ -756,6 +756,31 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
     .execute(pool)
     .await
     .map_err(|e| StorageError::Migration(format!("migration 018 revision index failed: {e}")))?;
+
+    // 迁移 019：结构化 claim 历史。旧 claim 永远保留，current 只表示当前有效投影。
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS memory_claims (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            claim_key         TEXT NOT NULL,
+            subject_user_id   INTEGER NOT NULL,
+            predicate         TEXT NOT NULL,
+            value             TEXT NOT NULL,
+            source_memory_id  INTEGER NOT NULL,
+            valid_from        TEXT NOT NULL,
+            valid_to          TEXT,
+            current           INTEGER NOT NULL DEFAULT 1 CHECK(current IN (0, 1)),
+            created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 019 memory_claims failed: {e}")))?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_claims_current ON memory_claims(claim_key, subject_user_id, current)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 019 claim index failed: {e}")))?;
     Ok(())
 }
 

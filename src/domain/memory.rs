@@ -116,6 +116,57 @@ pub struct MemoryRevisionResult {
     pub applied: bool,
 }
 
+/// 结构化事实声明。每一行都保留来源记忆，不覆盖或删除历史 claim。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryClaim {
+    pub id: i64,
+    pub claim_key: String,
+    pub subject_user_id: i64,
+    pub predicate: String,
+    pub value: String,
+    pub source_memory_id: i64,
+    pub valid_from: DateTime<Utc>,
+    pub valid_to: Option<DateTime<Utc>>,
+    pub current: bool,
+}
+
+/// Claim 更新动作。模型只能提出动作，仓储负责校验和执行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemoryClaimOperation {
+    Replace,
+    Append,
+    Reject,
+}
+
+impl MemoryClaimOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Append => "append",
+            Self::Reject => "reject",
+        }
+    }
+}
+
+/// 待验证的 claim 建议。该类型不代表已经写入数据库。
+#[derive(Debug, Clone)]
+pub struct MemoryClaimProposal {
+    pub source_memory_id: i64,
+    pub claim_key: String,
+    pub subject_user_id: i64,
+    pub predicate: String,
+    pub value: String,
+    pub operation: MemoryClaimOperation,
+    pub proposed_at: DateTime<Utc>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryClaimResult {
+    pub claim_id: Option<i64>,
+    pub changed: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateReviewDecision {
     Confirm,

@@ -1721,6 +1721,120 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn memory_claims_validate_source_and_preserve_replace_history() {
+        let storage = setup_storage().await;
+        let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+            storage.pool().clone(),
+        );
+        let mem_repo = crate::infrastructure::storage::repository::SqliteMemoryRepository::new(
+            storage.pool().clone(),
+        );
+        let character_id = char_repo
+            .insert(&Character {
+                id: 0,
+                definition: CharacterDefinition {
+                    name: "ClaimTest".into(),
+                    description: None,
+                    personality: None,
+                    scenario: None,
+                    style: None,
+                    background: None,
+                    greetings: vec![],
+                    example_messages: vec![],
+                    system_prompt: None,
+                    post_history_instructions: None,
+                    lorebook: vec![],
+                    metadata: serde_json::json!({}),
+                },
+                enabled: true,
+                state: CharacterState::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let user_id: i64 =
+            sqlx::query("INSERT INTO users(platform, external_id) VALUES ('test', 'claim-user')")
+                .execute(storage.pool())
+                .await
+                .unwrap()
+                .last_insert_rowid();
+        let mut source = Memory::new(
+            character_id,
+            None,
+            MemoryType::Semantic,
+            "用户喜欢猫".into(),
+            0.9,
+        );
+        source.user_id = Some(user_id);
+        source.metadata = serde_json::json!({"status":"formal"});
+        let source_id = mem_repo.insert(&source).await.unwrap();
+
+        let first = mem_repo
+            .apply_claim_proposal(&MemoryClaimProposal {
+                source_memory_id: source_id,
+                claim_key: "user.preference.pet".into(),
+                subject_user_id: user_id,
+                predicate: "likes".into(),
+                value: "猫".into(),
+                operation: MemoryClaimOperation::Append,
+                proposed_at: chrono::Utc::now(),
+                reason: "来源记忆明确陈述".into(),
+            })
+            .await
+            .unwrap();
+        assert!(first.changed);
+        let current = mem_repo
+            .find_current_claims("user.preference.pet", user_id)
+            .await
+            .unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].value, "猫");
+
+        let second = mem_repo
+            .apply_claim_proposal(&MemoryClaimProposal {
+                source_memory_id: source_id,
+                claim_key: "user.preference.pet".into(),
+                subject_user_id: user_id,
+                predicate: "likes".into(),
+                value: "狗".into(),
+                operation: MemoryClaimOperation::Replace,
+                proposed_at: chrono::Utc::now(),
+                reason: "用户明确更新偏好".into(),
+            })
+            .await
+            .unwrap();
+        assert!(second.changed);
+        let current = mem_repo
+            .find_current_claims("user.preference.pet", user_id)
+            .await
+            .unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].value, "狗");
+        let history: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_claims WHERE claim_key='user.preference.pet'",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(history, 2);
+
+        let rejected = mem_repo
+            .apply_claim_proposal(&MemoryClaimProposal {
+                source_memory_id: source_id,
+                claim_key: "user.preference.pet".into(),
+                subject_user_id: user_id + 1,
+                predicate: "likes".into(),
+                value: "鸟".into(),
+                operation: MemoryClaimOperation::Append,
+                proposed_at: chrono::Utc::now(),
+                reason: "错误用户".into(),
+            })
+            .await;
+        assert!(rejected.is_err());
+    }
+
+    #[tokio::test]
     async fn pending_memory_edit_requests_survive_restart_scan() {
         let storage = setup_storage().await;
         let char_repo = crate::infrastructure::storage::repository::SqliteCharacterRepository::new(

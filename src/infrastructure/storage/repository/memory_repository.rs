@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 
 use crate::domain::memory::{
-    CandidateReviewDecision, Memory, MemoryCandidateReview, MemoryRevisionOperation,
-    MemoryRevisionRequest, MemoryRevisionResult, MemoryType, SemanticMatchResult,
+    CandidateReviewDecision, Memory, MemoryCandidateReview, MemoryClaim, MemoryClaimOperation,
+    MemoryClaimProposal, MemoryClaimResult, MemoryRevisionOperation, MemoryRevisionRequest,
+    MemoryRevisionResult, MemoryType, SemanticMatchResult,
 };
 use crate::domain::repository::MemoryRepository;
 use crate::error::RepositoryError;
@@ -707,6 +708,97 @@ impl MemoryRepository for SqliteMemoryRepository {
         })
     }
 
+    async fn apply_claim_proposal(
+        &self,
+        proposal: &MemoryClaimProposal,
+    ) -> Result<MemoryClaimResult, RepositoryError> {
+        validate_claim_proposal(proposal)?;
+        let mut tx = self.pool.begin().await?;
+        let source: Option<(String, String, Option<i64>)> = sqlx::query_as(
+            r#"SELECT memory_type,
+                      COALESCE(json_extract(metadata, '$.status'), 'formal'),
+                      user_id
+                 FROM memories WHERE id = ?"#,
+        )
+        .bind(proposal.source_memory_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((memory_type, status, user_id)) = source else {
+            return Err(RepositoryError::NotFound(format!(
+                "memory {} not found",
+                proposal.source_memory_id
+            )));
+        };
+        if !matches!(memory_type.as_str(), "semantic" | "relationship")
+            || status != "formal"
+            || user_id != Some(proposal.subject_user_id)
+        {
+            return Err(RepositoryError::Internal(
+                "claim 来源记忆未通过类型、状态或用户归属校验".into(),
+            ));
+        }
+
+        if matches!(proposal.operation, MemoryClaimOperation::Reject) {
+            tx.commit().await?;
+            return Ok(MemoryClaimResult {
+                claim_id: None,
+                changed: false,
+            });
+        }
+
+        if matches!(proposal.operation, MemoryClaimOperation::Replace) {
+            sqlx::query(
+                r#"UPDATE memory_claims
+                      SET current = 0, valid_to = ?
+                    WHERE claim_key = ? AND subject_user_id = ? AND current = 1"#,
+            )
+            .bind(proposal.proposed_at.to_rfc3339())
+            .bind(&proposal.claim_key)
+            .bind(proposal.subject_user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let result = sqlx::query(
+            r#"INSERT INTO memory_claims
+                (claim_key, subject_user_id, predicate, value, source_memory_id, valid_from, current)
+             VALUES (?, ?, ?, ?, ?, ?, 1)"#,
+        )
+        .bind(&proposal.claim_key)
+        .bind(proposal.subject_user_id)
+        .bind(&proposal.predicate)
+        .bind(&proposal.value)
+        .bind(proposal.source_memory_id)
+        .bind(proposal.proposed_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        let claim_id = result.last_insert_rowid();
+        tx.commit().await?;
+        Ok(MemoryClaimResult {
+            claim_id: Some(claim_id),
+            changed: true,
+        })
+    }
+
+    async fn find_current_claims(
+        &self,
+        claim_key: &str,
+        subject_user_id: i64,
+    ) -> Result<Vec<MemoryClaim>, RepositoryError> {
+        let rows: Vec<ClaimRow> = sqlx::query_as(
+            r#"SELECT id, claim_key, subject_user_id, predicate, value,
+                      source_memory_id, valid_from, valid_to, current
+                 FROM memory_claims
+                WHERE claim_key = ? AND subject_user_id = ? AND current = 1
+                ORDER BY id ASC"#,
+        )
+        .bind(claim_key)
+        .bind(subject_user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(parse_claim_row).collect()
+    }
+
     async fn update_if_unchanged(
         &self,
         memory: &Memory,
@@ -976,6 +1068,65 @@ type MemoryRow = (
     String,
     Option<String>,
 );
+
+type ClaimRow = (
+    i64,
+    String,
+    i64,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    i64,
+);
+
+fn validate_claim_proposal(proposal: &MemoryClaimProposal) -> Result<(), RepositoryError> {
+    if proposal.source_memory_id <= 0 || proposal.subject_user_id <= 0 {
+        return Err(RepositoryError::Internal("claim 来源或用户 ID 无效".into()));
+    }
+    if proposal.claim_key.trim().is_empty() || proposal.claim_key.chars().count() > 128 {
+        return Err(RepositoryError::Internal("claim_key 长度无效".into()));
+    }
+    if proposal.predicate.trim().is_empty() || proposal.predicate.chars().count() > 128 {
+        return Err(RepositoryError::Internal("claim predicate 长度无效".into()));
+    }
+    if proposal.value.trim().is_empty() || proposal.value.chars().count() > 2_000 {
+        return Err(RepositoryError::Internal("claim value 长度无效".into()));
+    }
+    if proposal.reason.chars().count() > 500 {
+        return Err(RepositoryError::Internal("claim reason 长度无效".into()));
+    }
+    Ok(())
+}
+
+fn parse_claim_row(row: ClaimRow) -> Result<MemoryClaim, RepositoryError> {
+    let (
+        id,
+        claim_key,
+        subject_user_id,
+        predicate,
+        value,
+        source_memory_id,
+        valid_from,
+        valid_to,
+        current,
+    ) = row;
+    Ok(MemoryClaim {
+        id,
+        claim_key,
+        subject_user_id,
+        predicate,
+        value,
+        source_memory_id,
+        valid_from: super::timestamp::parse_timestamp(&valid_from)?,
+        valid_to: valid_to
+            .as_deref()
+            .map(super::timestamp::parse_timestamp)
+            .transpose()?,
+        current: current != 0,
+    })
+}
 
 fn memory_type_name(memory_type: MemoryType) -> &'static str {
     match memory_type {

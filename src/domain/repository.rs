@@ -13,7 +13,8 @@ use crate::domain::character::{
 use crate::domain::conversation::{Conversation, ConversationType, Participant};
 use crate::domain::emotion::Mood;
 use crate::domain::memory::{
-    Memory, MemoryCandidateReview, MemoryRevisionRequest, MemoryRevisionResult, SemanticMatchResult,
+    Memory, MemoryCandidateReview, MemoryClaim, MemoryClaimProposal, MemoryClaimResult,
+    MemoryRevisionRequest, MemoryRevisionResult, SemanticMatchResult,
 };
 use crate::domain::message::Message;
 use crate::domain::relationship::Relationship;
@@ -954,6 +955,23 @@ pub trait MemoryRepository: Send + Sync {
         _request: &MemoryRevisionRequest,
     ) -> Result<MemoryRevisionResult, RepositoryError> {
         Err(RepositoryError::NotImplemented("记忆修订事务".into()))
+    }
+
+    /// 应用经过程序校验的结构化 claim 建议。
+    async fn apply_claim_proposal(
+        &self,
+        _proposal: &MemoryClaimProposal,
+    ) -> Result<MemoryClaimResult, RepositoryError> {
+        Err(RepositoryError::NotImplemented("记忆 claim 事务".into()))
+    }
+
+    /// 读取当前有效 claim；默认仓储不提供结构化 claim 查询。
+    async fn find_current_claims(
+        &self,
+        _claim_key: &str,
+        _subject_user_id: i64,
+    ) -> Result<Vec<MemoryClaim>, RepositoryError> {
+        Ok(Vec::new())
     }
 
     /// 仅在持久化内容仍与 `expected` 一致时更新记忆。
