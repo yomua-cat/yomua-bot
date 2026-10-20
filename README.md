@@ -107,6 +107,16 @@ cargo run --locked --bin yomua-bot -- import-card /path/to/card.json \
 
 没有可引用的性能基准数据，这里只陈述事实：核心用 Rust 写成，存储用 SQLite，异步层基于 tokio。
 
+## 参考项目与致谢
+
+感谢以下开源项目公开分享设计思想和工程实践。本项目仅将它们作为架构、数据建模和测试方法的研究参考：
+
+- [`companion-emergence`](https://github.com/hanamorix/companion-emergence/tree/10856ab9a9f6ba26e740f2b5196a1e2c7dc6b636)（MIT）：参考情绪状态、记忆关联与压缩、人格演化、状态衰减和离线行为等方向；相关设计规格见[框架重建设计](https://github.com/hanamorix/companion-emergence/blob/10856ab9a9f6ba26e740f2b5196a1e2c7dc6b636/docs/source-spec/2026-04-21-framework-rebuild-design.md)。
+- [`SillyTavern`](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/default/content/presets/openai/Default.json)（AGPL-3.0）：参考角色定义、提示词顺序、示例对话、上下文预算、Prompt Manager 和 World Info 的组织方式，另见其[Prompt Manager 文档](https://docs.sillytavern.app/usage/prompts/prompt-manager/)与[World Info 文档](https://docs.sillytavern.app/usage/core-concepts/worldinfo/)。
+- [`eros-engine`](https://github.com/etherfunlab/eros-engine/tree/9715af2ce7d8524ca5ce8771059d436c31951977)（AGPL-3.0-only）：参考行为决策、关系状态更新、记忆流水线、流式处理和模型路由等架构方向，另见其[模型配置文档](https://github.com/etherfunlab/eros-engine/blob/9715af2ce7d8524ca5ce8771059d436c31951977/docs/model-config.md)。
+
+本项目未复制上述项目的源码、默认 prompt、角色卡、第三方素材或供应商实现。`SillyTavern` 和 `eros-engine` 仅用于架构研究；如未来拟复用其中的具体实现，将另行进行许可证兼容性评估。
+
 ## 参与与许可
 
 - 问题反馈：[Issue 模板](.github/ISSUE_TEMPLATE)
