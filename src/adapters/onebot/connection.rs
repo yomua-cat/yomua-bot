@@ -23,6 +23,8 @@ use super::{OneBotConfig, OneBotConnectionState};
 use crate::application::event_bus::EventBus;
 use crate::domain::event::{AdapterConnectedEvent, AdapterDisconnectedEvent, CoreEvent};
 
+const MAX_PENDING_INBOUND_EVENTS: usize = 1024;
+
 /// Action 请求的完整信息，包含唯一 ID 和响应接收端。
 #[derive(Debug)]
 pub struct PendingRequest {
@@ -450,8 +452,13 @@ async fn handle_connected_io(
 ) {
     let mut heartbeat = tokio::time::interval(Duration::from_secs(heartbeat_interval_secs.max(1)));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pending_events = std::collections::VecDeque::new();
+    let mut peer_closed = false;
 
     loop {
+        if peer_closed && pending_events.is_empty() {
+            break;
+        }
         tokio::select! {
             // 关停信号。
             _ = shutdown.changed() => {
@@ -479,16 +486,26 @@ async fn handle_connected_io(
                 }
             }
 
+            // 下游处理器繁忙时保留入站顺序，但继续读取 WebSocket，确保后续
+            // action 回执仍能完成 pending 请求。缓冲有上限，避免无限占用内存。
+            result = event_tx.send(pending_events.front().cloned().unwrap_or_default()),
+                if !pending_events.is_empty() => {
+                match result {
+                    Ok(()) => { pending_events.pop_front(); }
+                    Err(_) => {
+                        tracing::warn!(target: "adapter", "事件处理通道已关闭");
+                        break;
+                    }
+                }
+            }
+
             // 入站：读取 WebSocket 帧并路由到对应处理器。
-            read = transport.read_text() => {
+            read = transport.read_text(), if !peer_closed && pending_events.len() < MAX_PENDING_INBOUND_EVENTS => {
                 match read {
                     Ok(Some(text)) => {
                         match classify_incoming_message(&text) {
                             IncomingMessage::Event(raw) => {
-                                if event_tx.send(raw).await.is_err() {
-                                    tracing::warn!(target: "adapter", "事件处理通道已关闭");
-                                    break;
-                                }
+                                pending_events.push_back(raw);
                             }
                             IncomingMessage::Response(resp) => {
                                 // 找到 pending 请求并完成它。
@@ -501,11 +518,11 @@ async fn handle_connected_io(
                     }
                     Ok(None) => {
                         tracing::warn!(target: "adapter", "对端关闭了连接");
-                        break;
+                        peer_closed = true;
                     }
                     Err(e) => {
                         tracing::warn!(target: "adapter", error = %e, "读取错误，连接断开");
-                        break;
+                        peer_closed = true;
                     }
                 }
             }
@@ -1062,5 +1079,78 @@ mod tests {
         );
 
         shutdown_tx.send(true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn action_response_is_completed_while_inbound_queue_is_full() {
+        let bus = crate::application::event_bus::EventBus::new();
+        let _observer = bus.subscribe();
+        let script = vec![
+            Script::Messages(vec![
+                r#"{"post_type":"message","message":"first"}"#.into(),
+                r#"{"post_type":"message","message":"second"}"#.into(),
+                r#"{"echo":"0","action":"send_private_msg","status":"ok","retcode":0}"#.into(),
+            ]),
+            Script::Hold,
+        ];
+        let (connector, _) = ScriptedConnector::new(script);
+        let (outbound_tx, outbound_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx.send("already-queued".into()).await.unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (response_tx, _response_rx) = mpsc::channel(8);
+        let shared = ConnectionShared {
+            state: Arc::new(Mutex::new(OneBotConnectionState::Disconnected)),
+            bus: bus.clone(),
+            outbound_tx,
+            response_tx,
+            pending: Arc::new(StdMutex::new(HashMap::new())),
+            request_id_counter: Arc::new(AtomicU64::new(0)),
+            request_timeout_secs: 10,
+        };
+        let (request_id, mut response_rx) = shared.insert_pending("send_private_msg".into());
+        assert_eq!(request_id, 0);
+
+        let connection = tokio::spawn(run_connection_loop(
+            Arc::new(connector),
+            shared.clone(),
+            outbound_rx,
+            event_tx,
+            test_config(),
+            shutdown_rx,
+        ));
+
+        let response = tokio::time::timeout(Duration::from_secs(1), &mut response_rx)
+            .await
+            .expect("入站队列积压不应阻塞 action 回执")
+            .expect("pending 请求应收到回执");
+        assert!(response.is_ok());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("队列中原有事件应可读取")
+                .as_deref(),
+            Some("already-queued")
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("积压的第一条消息应继续转发")
+                .as_deref(),
+            Some(r#"{"post_type":"message","message":"first"}"#)
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("积压的第二条消息应继续转发")
+                .as_deref(),
+            Some(r#"{"post_type":"message","message":"second"}"#)
+        );
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), connection)
+            .await
+            .expect("连接循环应响应关停")
+            .unwrap();
     }
 }
