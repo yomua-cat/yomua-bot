@@ -403,6 +403,25 @@ impl OutboxRepository for SqliteOutboxRepository {
         // attempts 统计成功领取 processing 的次数，恢复不能把它清零。
         // 达到上限的任务必须在本事务中进入 dead_letter，否则同一 ordering_key
         // 会被永久卡住，后续事件也无法继续。
+        // 先记录本次将被终止的消息实体。达到尝试上限时不能只改变
+        // outbox 状态，否则对应 reply_task 会永久停在 generating/sending。
+        let dead_letter_entities: Vec<i64> = sqlx::query_scalar(
+            r#"
+            SELECT entity_id
+            FROM outbox_events
+            WHERE status = 'processing'
+              AND locked_until <= ?
+              AND attempts >= ?
+              AND entity_type = 'messages'
+              AND event_type = 'MessageAccepted'
+            "#,
+        )
+        .bind(&now)
+        .bind(max_attempts)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
         let dead_lettered = sqlx::query(
             r#"
             UPDATE outbox_events
@@ -422,6 +441,27 @@ impl OutboxRepository for SqliteOutboxRepository {
         .execute(&mut *tx)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        for message_id in dead_letter_entities {
+            // 发送阶段已经可能产生平台副作用，结果只能标记为 unknown；
+            // 其余尚未发送的状态标记为 failed，避免控制面显示假进行中。
+            sqlx::query(
+                r#"UPDATE reply_tasks
+                   SET status = CASE WHEN status = 'sending' THEN 'unknown' ELSE 'failed' END,
+                       error = CASE
+                           WHEN status = 'sending' THEN 'Outbox 租约过期且达到最大尝试次数，发送结果未知，需要核查'
+                           ELSE 'Outbox 租约过期且达到最大尝试次数，任务失败'
+                       END,
+                       updated_at = ?
+                   WHERE message_id = ?
+                     AND status IN ('pending', 'generating', 'generated', 'sending')"#,
+            )
+            .bind(&now)
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
 
         let pending = sqlx::query(
             r#"
@@ -657,6 +697,85 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(error, "permanent failure");
+    }
+
+    #[tokio::test]
+    async fn expired_max_attempt_marks_sending_unknown_and_generating_failed() {
+        let storage = SqliteStorage::open_in_memory().await.unwrap();
+        storage.migrate().await.unwrap();
+        let pool = storage.pool().clone();
+        sqlx::query("INSERT INTO characters(name) VALUES ('test')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations(conversation_type, external_id) VALUES ('private', 'test')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO participants(conversation_id, external_id, display_name, role) VALUES (1, 'user', 'user', 'user')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            sqlx::query(
+                "INSERT INTO messages(conversation_id, sender_id, content) VALUES (1, 1, '{}')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("INSERT INTO reply_tasks(message_id, character_id, status, content, updated_at) VALUES (1, 1, 'sending', '已生成', ?), (2, 1, 'generating', NULL, ?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let repo = SqliteOutboxRepository::new(pool.clone());
+        for (event_uuid, message_id, ordering_key, ordering_seq) in [
+            ("expired-sending", 1_i64, "1", 1_i64),
+            ("expired-generating", 2_i64, "2", 1_i64),
+        ] {
+            repo.add_outbox_event(OutboxEvent {
+                id: 0,
+                event_uuid: event_uuid.into(),
+                entity_id: message_id,
+                entity_type: "messages".into(),
+                event_type: "MessageAccepted".into(),
+                event_version: 1,
+                payload: "{}".into(),
+                ordering_key: ordering_key.into(),
+                ordering_seq,
+                created_at: Utc::now(),
+                available_at: Utc::now(),
+                status: OutboxStatus::Pending,
+                attempts: 0,
+                last_error: None,
+                locked_until: None,
+                processed_at: None,
+                lease_token: None,
+            })
+            .await
+            .unwrap();
+            repo.claim_next_event(60).await.unwrap();
+            repo.force_expire_lease(event_uuid).await.unwrap();
+        }
+
+        let recovered = repo.recover_expired_processing_with_limit(1).await.unwrap();
+        assert_eq!(recovered, 2);
+
+        let statuses: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT message_id, status, error FROM reply_tasks ORDER BY message_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(statuses[0].1, "unknown");
+        assert!(statuses[0].2.contains("发送结果未知"));
+        assert_eq!(statuses[1].1, "failed");
+        assert!(statuses[1].2.contains("任务失败"));
     }
 
     #[tokio::test]
