@@ -4351,13 +4351,29 @@ async fn test_memory_update_applies_validated_model_suggestion() {
     .unwrap();
     assert_eq!(resp["ok"], true, "合法模型建议应通过控制链路生效: {resp}");
     assert_eq!(resp["data"]["updated"], true);
-    let updated = env
+    assert_eq!(resp["data"]["old_memory_id"], mem_id);
+    let new_memory_id = resp["data"]["memory_id"]
+        .as_i64()
+        .expect("响应应返回新记忆 ID");
+    assert_ne!(new_memory_id, mem_id, "replace 应创建新的当前记忆记录");
+    let old = env
         .memory_repo
         .find_by_id(mem_id)
         .await
-        .expect("查询更新后的记忆失败")
-        .expect("更新后的记忆应存在");
+        .expect("查询旧记忆失败")
+        .expect("旧记忆应保留用于审计");
+    assert_eq!(old.content, "candidate fact");
+    assert_eq!(old.metadata["status"], "superseded");
+    assert_eq!(old.metadata["superseded_by"], new_memory_id);
+
+    let updated = env
+        .memory_repo
+        .find_by_id(new_memory_id)
+        .await
+        .expect("查询新记忆失败")
+        .expect("新记忆应存在");
     assert_eq!(updated.content, "用户确认喜欢猫");
+    assert_eq!(updated.metadata["status"], "formal");
     assert_eq!(updated.metadata["edit_request"]["status"], "applied");
     assert_eq!(updated.metadata["edit_request"]["action"], "replace");
 }

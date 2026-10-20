@@ -27,14 +27,14 @@
 - `cargo check --locked --all-targets --offline`：通过。
 - `cargo test --locked --all-targets --no-run --offline`：通过编译检查。
 - `cargo fmt --all -- --check`：通过。
-- `cargo test --locked --all-targets`：库 461 个、主程序 5 个、ctl 39 个、alpha 集成 8 个、控制集成 84 个通过；15 个插件 Unix socket 测试按 `#[ignore]` 标记跳过。
+- `cargo test --locked --all-targets --offline -- --test-threads=1`：库 523 个、主程序 5 个、ctl 39 个、alpha 集成 8 个、控制集成 84 个通过；15 个插件 Unix socket 测试按 `#[ignore]` 标记跳过。
 - `cargo test --locked --lib infrastructure::plugin::transport::tests --offline -- --ignored --test-threads=1`：15 个插件 Unix socket 测试全部通过。
 - 临时 Unix socket 模拟服务配合真实 `yomua-bot-ctl status --raw`：通过，确认发送的是版本化 `ControlEnvelope`，不含旧 `cmd` 字段。
 - CLI 解析测试：覆盖一段、二段、三段命令、短别名归一化和危险命令确认。
 - SQLite 存储测试：覆盖平台消息去重、稳定用户关系、角色归属历史和记忆可见范围。
 - 配置模板验证：首次启动在临时目录生成 `runtime.toml`、`onebot.toml`、`llm.toml`、`decision.toml`；可选 OneBot 字段留空时仍可解析，真实配置密钥未参与验证。
 
-本次核查的基线为：库 458 个通过、主程序 5 个、ctl 39 个、alpha 集成 8 个、控制集成 84 个；另有 15 个插件 Unix socket 测试在普通全目标测试中按 `#[ignore]` 标记跳过，并在本次使用 `--ignored --test-threads=1` 显式运行通过。
+本次核查的基线为：库 523 个通过、主程序 5 个、ctl 39 个、alpha 集成 8 个、控制集成 84 个；另有 15 个插件 Unix socket 测试在普通全目标测试中按 `#[ignore]` 标记跳过，并在本次使用 `--ignored --test-threads=1` 显式运行通过。
 
 ## 已实现的重点行为
 
@@ -83,7 +83,7 @@
 
 ## 当前限制和未完成项
 
-- 连续消息在回复任务边界冻结：普通消息等待 1.5 秒，@ 消息等待 0.5 秒；从当前消息的会话序号之后读取候选，避免旧历史挤出新消息；原消息逐条保存，生成期间新消息留给下一轮。当前没有独立持久化的批次实体，仍需用真实 OneBot 流量验证时序和体验。
+- 连续消息在回复任务边界冻结：普通消息等待 1.5 秒，@ 消息等待 0.5 秒；从当前消息的会话序号之后读取候选，避免旧历史挤出新消息；原消息逐条保存，生成期间新消息留给下一轮。当前会持久化只含消息 ID、序号、事件 UUID 和上下文摘要的最小批次快照，仍需用真实 OneBot 流量验证时序和体验。
 - `unknown` 发送结果记录为终态并等待核查。先执行 `reply unknown list`；有平台消息 ID 时再执行 `reply unknown check <消息ID>`。平台明确返回未找到时会自动重新排队；没有平台消息 ID 或查询失败都不能当作未发送证明，此时才使用 `reply unknown retry <消息ID> --confirm`。
 - 记忆候选会由后台 `decision` 模型审核，程序仍校验来源消息、用户、会话、类型和置信度；模型不可用或意见不合规时保留候选。自然语言修改请求具备后台恢复；矛盾记忆的系统化修订仍未完成。当前 ctl 提供摘要查询、显式原文读取、删除、修改请求登记，以及跨会话隐私策略的请求、确认和取消。
 - 世界书暂不参与上下文组装。
