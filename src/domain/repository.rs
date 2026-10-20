@@ -344,6 +344,21 @@ pub trait MessageRepository: Send + Sync {
     ) -> Result<Vec<Message>, RepositoryError> {
         Err(RepositoryError::NotImplemented("认知消息批次".into()))
     }
+    /// 按本地消息 ID 查询认知进度之后的消息。
+    ///
+    /// `cognition_progress.last_message_id` 使用的是 `messages.id`，不能与会话序号
+    /// 混用。默认实现返回未实现，调用方会安全跳过本轮而不是误读历史。
+    async fn find_messages_after_id(
+        &self,
+        _character_id: i64,
+        _conversation_id: i64,
+        _after_message_id: i64,
+        _limit: i64,
+    ) -> Result<Vec<Message>, RepositoryError> {
+        Err(RepositoryError::NotImplemented(
+            "按消息 ID 查询认知批次".into(),
+        ))
+    }
     async fn owns_outbox_lease(
         &self,
         _message_id: i64,

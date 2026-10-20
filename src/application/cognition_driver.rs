@@ -278,14 +278,42 @@ impl CognitionDriver {
         {
             Ok(messages) => messages,
             Err(crate::error::RepositoryError::NotImplemented(_)) => {
-                self.character_history
-                    .get_recent(
-                        binding.conversation_id,
+                match self
+                    .message_repo
+                    .find_messages_after_id(
                         binding.character_id,
-                        20,
-                        Some(watermark),
+                        binding.conversation_id,
+                        watermark,
+                        COGNITION_CANDIDATE_LIMIT,
                     )
-                    .await?
+                    .await
+                {
+                    Ok(messages) => messages,
+                    Err(crate::error::RepositoryError::NotImplemented(_)) => {
+                        if watermark == 0 {
+                            // 只有初始水位为 0 时，历史接口的“最近消息”语义不会
+                            // 把消息 ID 错当成会话序号；后续水位必须明确跳过。
+                            self.character_history
+                                .get_recent(
+                                    binding.conversation_id,
+                                    binding.character_id,
+                                    COGNITION_CANDIDATE_LIMIT as usize,
+                                    None,
+                                )
+                                .await?
+                        } else {
+                            tracing::warn!(
+                                target: "runtime",
+                                character_id = binding.character_id,
+                                conversation_id = binding.conversation_id,
+                                watermark,
+                                "消息仓储不支持按消息 ID 查询认知批次，跳过本轮"
+                            );
+                            return Ok(());
+                        }
+                    }
+                    Err(error) => return Err(RuntimeError::Repository(error)),
+                }
             }
             Err(e) => return Err(RuntimeError::Repository(e)),
         };

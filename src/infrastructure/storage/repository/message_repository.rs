@@ -150,6 +150,16 @@ impl MessageRepository for SqliteMessageRepository {
         .bind(character_id).bind(conversation_id).bind(after_message_id).bind(limit.max(0)).fetch_all(&self.pool).await?;
         rows.into_iter().map(parse_message_row).collect()
     }
+    async fn find_messages_after_id(
+        &self,
+        character_id: i64,
+        conversation_id: i64,
+        after_message_id: i64,
+        limit: i64,
+    ) -> Result<Vec<Message>, RepositoryError> {
+        self.find_cognition_batch(character_id, conversation_id, after_message_id, limit)
+            .await
+    }
     async fn owns_outbox_lease(
         &self,
         message_id: i64,

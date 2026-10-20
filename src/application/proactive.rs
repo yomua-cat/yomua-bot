@@ -216,14 +216,32 @@ impl ProactiveDriver {
             if !reserved {
                 return Ok(());
             }
-            scheduler
+            if let Err(error) = scheduler
                 .enqueue_proactive(
                     binding.character_id,
                     binding.conversation_id,
                     &decision.reason,
                 )
                 .await
-                .map_err(|e| DomainError::Internal(e.to_string()))?;
+            {
+                // 额度预留发生在入队前，用于防止并发 tick 重复排队；入队失败时
+                // 必须恢复预留前状态，否则会出现“没有发出消息却消耗主动额度”。
+                let restored = behavior_state.clone().unwrap_or_default();
+                if let Err(rollback_error) = self
+                    .behavior_state_repo
+                    .upsert(binding.character_id, binding.conversation_id, &restored)
+                    .await
+                {
+                    tracing::error!(
+                        target: "runtime",
+                        character_id = binding.character_id,
+                        conversation_id = binding.conversation_id,
+                        error = %rollback_error,
+                        "主动任务入队失败且额度回滚失败"
+                    );
+                }
+                return Err(DomainError::Internal(error.to_string()));
+            }
         } else {
             return Ok(());
         }
@@ -339,6 +357,20 @@ mod tests {
         ) -> Result<(), crate::error::RuntimeError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    struct FailingReplyScheduler;
+
+    #[async_trait]
+    impl ProactiveReplyScheduler for FailingReplyScheduler {
+        async fn enqueue_proactive(
+            &self,
+            _: i64,
+            _: i64,
+            _: &str,
+        ) -> Result<(), crate::error::RuntimeError> {
+            Err(crate::error::RuntimeError::Internal("测试入队失败".into()))
         }
     }
 
@@ -811,5 +843,34 @@ mod tests {
 
         assert_eq!(scheduler.0.load(Ordering::SeqCst), 1);
         assert_eq!(h.behavior_state_repo.states.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_failure_rolls_back_proactive_quota() {
+        let mut h = harness(true, None, true);
+        h.state_repo
+            .states
+            .lock()
+            .unwrap()
+            .insert(2, crate::domain::character::CharacterState::default());
+        h.conversation_state_repo.states.lock().unwrap().insert(
+            (2, 20),
+            crate::domain::character::ConversationState::default(),
+        );
+        h.driver = h
+            .driver
+            .with_reply_scheduler(Arc::new(FailingReplyScheduler));
+        replace_decision_result(&mut h, DecisionResult::keep());
+
+        h.driver.tick().await;
+
+        let states = h.behavior_state_repo.states.lock().unwrap();
+        let state = states.get(&(2, 20)).expect("回滚后允许保留空行为状态记录");
+        assert!(
+            state.last_proactive_at.is_none()
+                && state.proactive_count == 0
+                && state.proactive_count_date.is_none(),
+            "主动任务入队失败后不得消耗冷却和每日额度"
+        );
     }
 }
