@@ -64,10 +64,10 @@ use yomua_bot::domain::decision::{
     NoOpTrigger,
 };
 use yomua_bot::domain::repository::{
-    BehaviorStateRepository, BlacklistRepository, CharacterBindingRepository, CharacterRepository,
-    CharacterStateRepository, ConversationRepository, ConversationStateRepository,
-    MemoryRepository, MessageRepository, MoodRepository, ParticipantRepository,
-    PluginDataRepository, RelationshipRepository,
+    AutonomyRepository, BehaviorStateRepository, BlacklistRepository, CharacterBindingRepository,
+    CharacterRepository, CharacterStateRepository, ConversationRepository,
+    ConversationStateRepository, MemoryRepository, MessageRepository, MoodRepository,
+    ParticipantRepository, PluginDataRepository, RelationshipRepository,
 };
 use yomua_bot::error::RuntimeError;
 use yomua_bot::infrastructure::llm::openai_compatible::{
@@ -81,11 +81,11 @@ use yomua_bot::infrastructure::plugin::event_bridge::EventBridge;
 use yomua_bot::infrastructure::plugin::registry::PluginRegistry;
 use yomua_bot::infrastructure::plugin::supervisor::{PluginSupervisor, SupervisorConfig};
 use yomua_bot::infrastructure::storage::repository::{
-    SqliteBehaviorStateRepository, SqliteBlacklistRepository, SqliteCharacterBindingRepository,
-    SqliteCharacterRepository, SqliteCharacterStateRepository, SqliteConversationRepository,
-    SqliteConversationStateRepository, SqliteMemoryRepository, SqliteMessageRepository,
-    SqliteMoodRepository, SqliteOutboxRepository, SqliteParticipantRepository,
-    SqlitePluginDataRepository, SqliteRelationshipRepository,
+    SqliteAutonomyRepository, SqliteBehaviorStateRepository, SqliteBlacklistRepository,
+    SqliteCharacterBindingRepository, SqliteCharacterRepository, SqliteCharacterStateRepository,
+    SqliteConversationRepository, SqliteConversationStateRepository, SqliteMemoryRepository,
+    SqliteMessageRepository, SqliteMoodRepository, SqliteOutboxRepository,
+    SqliteParticipantRepository, SqlitePluginDataRepository, SqliteRelationshipRepository,
 };
 use yomua_bot::infrastructure::storage::SqliteStorage;
 
@@ -413,7 +413,8 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
             repos.participant_repo.clone(),
             onebot_cfg.bot_self_id,
         )
-        .with_message_repository(repos.message_repo.clone()),
+        .with_message_repository(repos.message_repo.clone())
+        .with_autonomy_repository(repos.autonomy_repo.clone()),
     );
 
     // 系统指令处理器：由 Outbox 消费系统指令消息，执行换角色并通过可靠回复链路返回结果。
@@ -1000,6 +1001,7 @@ struct Repos {
     plugin_data_repo: Arc<dyn PluginDataRepository>,
     blacklist_repo: Arc<dyn BlacklistRepository>,
     outbox_repo: Arc<SqliteOutboxRepository>,
+    autonomy_repo: Arc<dyn AutonomyRepository>,
 }
 
 /// 从 SQLite 连接池构建所有仓库。
@@ -1029,6 +1031,8 @@ fn build_repos(pool: SqlitePool) -> Repos {
     let blacklist_repo: Arc<dyn BlacklistRepository> =
         Arc::new(SqliteBlacklistRepository::new(pool.clone()));
     let outbox_repo = Arc::new(SqliteOutboxRepository::new(pool.clone()));
+    let autonomy_repo: Arc<dyn AutonomyRepository> =
+        Arc::new(SqliteAutonomyRepository::new(pool.clone()));
 
     Repos {
         _pool: pool,
@@ -1046,6 +1050,7 @@ fn build_repos(pool: SqlitePool) -> Repos {
         plugin_data_repo,
         blacklist_repo,
         outbox_repo,
+        autonomy_repo,
     }
 }
 
@@ -1303,6 +1308,7 @@ fn spawn_background_tasks(
         yomua_bot::application::clock::system_clock(),
     )
     .with_reply_scheduler(proactive_scheduler)
+    .with_autonomy_repository(repos.autonomy_repo.clone())
     .with_live_settings(settings);
     let proactive_shutdown = shutdown_rx.clone();
     tasks

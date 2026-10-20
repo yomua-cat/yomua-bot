@@ -12,12 +12,14 @@ use crate::application::clock::Clock;
 use crate::application::config::{parse_timezone_offset, RuntimeConfig};
 use crate::application::decision_orchestrator::DecisionOrchestrator;
 use crate::application::event_bus::EventBus;
+use crate::domain::autonomy::{AutonomyIntent, AutonomyIntentStatus};
 use crate::domain::behavior::BehaviorAction;
 use crate::domain::character::CharacterBinding;
 use crate::domain::event::{BehaviorDecidedEvent, CoreEvent};
 use crate::domain::mute::{is_within_window, parse_mute_schedule};
 use crate::domain::repository::{
-    BehaviorStateRepository, CharacterBindingRepository, CharacterStateRepository,
+    AutonomyRepository, BehaviorStateRepository, CharacterBindingRepository,
+    CharacterStateRepository,
 };
 use crate::error::DomainError;
 
@@ -53,6 +55,7 @@ pub struct ProactiveDriver {
     reply_scheduler: Option<Arc<dyn ProactiveReplyScheduler>>,
     daily_limit: u32,
     live_settings: Option<tokio::sync::watch::Receiver<RuntimeConfig>>,
+    autonomy_repo: Option<Arc<dyn AutonomyRepository>>,
 }
 
 impl ProactiveDriver {
@@ -78,6 +81,7 @@ impl ProactiveDriver {
             reply_scheduler: None,
             daily_limit: 10,
             live_settings: None,
+            autonomy_repo: None,
         }
     }
 
@@ -93,6 +97,12 @@ impl ProactiveDriver {
         settings: tokio::sync::watch::Receiver<RuntimeConfig>,
     ) -> Self {
         self.live_settings = Some(settings);
+        self
+    }
+
+    /// 装配主动意图持久化仓储；未装配时保留现有行为。
+    pub fn with_autonomy_repository(mut self, repo: Arc<dyn AutonomyRepository>) -> Self {
+        self.autonomy_repo = Some(repo);
         self
     }
 
@@ -216,6 +226,52 @@ impl ProactiveDriver {
             if !reserved {
                 return Ok(());
             }
+
+            // 只有成功预留主动额度后才建立 pending 意图，避免冷却/额度拒绝
+            // 在恢复扫描中产生一条并未获得执行资格的假任务。
+            let intent_id = if let Some(repo) = &self.autonomy_repo {
+                let intent = AutonomyIntent {
+                    id: 0,
+                    character_id: binding.character_id,
+                    conversation_id: binding.conversation_id,
+                    status: AutonomyIntentStatus::Pending,
+                    not_before: now,
+                    cooldown_key: format!(
+                        "character:{}:conversation:{}",
+                        binding.character_id, binding.conversation_id
+                    ),
+                    quota_reservation: 1,
+                    source_snapshot: serde_json::json!({
+                        "binding_id": binding.id,
+                        "binding_version": binding.switched_at,
+                        "reason": decision.reason.clone(),
+                    }),
+                    created_at: now,
+                    updated_at: now,
+                };
+                match repo.insert_autonomy_intent(&intent).await {
+                    Ok(id) => Some(id),
+                    Err(error) => {
+                        let restored = behavior_state.clone().unwrap_or_default();
+                        if let Err(rollback_error) = self
+                            .behavior_state_repo
+                            .upsert(binding.character_id, binding.conversation_id, &restored)
+                            .await
+                        {
+                            tracing::error!(
+                                target: "runtime",
+                                character_id = binding.character_id,
+                                conversation_id = binding.conversation_id,
+                                error = %rollback_error,
+                                "主动意图落库失败且额度回滚失败"
+                            );
+                        }
+                        return Err(DomainError::Internal(format!("主动意图落库失败: {error}")));
+                    }
+                }
+            } else {
+                None
+            };
             if let Err(error) = scheduler
                 .enqueue_proactive(
                     binding.character_id,
@@ -240,7 +296,35 @@ impl ProactiveDriver {
                         "主动任务入队失败且额度回滚失败"
                     );
                 }
+                if let (Some(repo), Some(intent_id)) =
+                    (&self.autonomy_repo, intent_id.as_ref().copied())
+                {
+                    let _ = repo
+                        .update_autonomy_intent_status(
+                            intent_id,
+                            AutonomyIntentStatus::Pending,
+                            AutonomyIntentStatus::Failed,
+                            now,
+                        )
+                        .await;
+                }
                 return Err(DomainError::Internal(error.to_string()));
+            }
+            if let (Some(repo), Some(intent_id)) =
+                (&self.autonomy_repo, intent_id.as_ref().copied())
+            {
+                let updated = repo
+                    .update_autonomy_intent_status(
+                        intent_id,
+                        AutonomyIntentStatus::Pending,
+                        AutonomyIntentStatus::Enqueued,
+                        now,
+                    )
+                    .await
+                    .map_err(|e| DomainError::Internal(format!("主动意图状态更新失败: {e}")))?;
+                if !updated {
+                    return Err(DomainError::Internal("主动意图状态已被并发修改".into()));
+                }
             }
         } else {
             return Ok(());
@@ -287,6 +371,7 @@ mod tests {
         DecisionEvaluator, DecisionLlmPipeline, DecisionLlmService, LlmAssistance,
         LlmAssistanceTrigger, NoOpTrigger,
     };
+    use crate::domain::autonomy::{AutonomyIntent, AutonomyIntentStatus};
     use crate::domain::character::{BehaviorState, CharacterBinding, ConversationState, ReplyMode};
     use crate::domain::decision::{
         BuiltInDecision, DecisionAction, DecisionContext, DecisionFailure, DecisionResult,
@@ -295,8 +380,9 @@ mod tests {
     use crate::domain::emotion::Mood;
     use crate::domain::relationship::Relationship;
     use crate::domain::repository::{
-        BehaviorStateRepository, CharacterBindingRepository, CharacterStateRepository,
-        ConversationStateRepository, MoodRepository, RelationshipRepository,
+        AutonomyRepository, BehaviorStateRepository, CharacterBindingRepository,
+        CharacterStateRepository, ConversationStateRepository, MoodRepository,
+        RelationshipRepository,
     };
     use crate::error::RepositoryError;
     use async_trait::async_trait;
@@ -371,6 +457,64 @@ mod tests {
             _: &str,
         ) -> Result<(), crate::error::RuntimeError> {
             Err(crate::error::RuntimeError::Internal("测试入队失败".into()))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAutonomyRepo {
+        intents: Mutex<Vec<AutonomyIntent>>,
+    }
+
+    #[async_trait]
+    impl AutonomyRepository for RecordingAutonomyRepo {
+        async fn insert_autonomy_intent(
+            &self,
+            intent: &AutonomyIntent,
+        ) -> Result<i64, RepositoryError> {
+            let mut intents = self.intents.lock().unwrap();
+            let id = intents.len() as i64 + 1;
+            let mut stored = intent.clone();
+            stored.id = id;
+            intents.push(stored);
+            Ok(id)
+        }
+
+        async fn find_pending_autonomy_intents(
+            &self,
+            not_before: DateTime<Utc>,
+            limit: i64,
+        ) -> Result<Vec<AutonomyIntent>, RepositoryError> {
+            Ok(self
+                .intents
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|intent| {
+                    intent.status == AutonomyIntentStatus::Pending
+                        && intent.not_before <= not_before
+                })
+                .take(limit.max(0) as usize)
+                .cloned()
+                .collect())
+        }
+
+        async fn update_autonomy_intent_status(
+            &self,
+            id: i64,
+            expected: AutonomyIntentStatus,
+            status: AutonomyIntentStatus,
+            updated_at: DateTime<Utc>,
+        ) -> Result<bool, RepositoryError> {
+            let mut intents = self.intents.lock().unwrap();
+            let Some(intent) = intents.iter_mut().find(|intent| intent.id == id) else {
+                return Ok(false);
+            };
+            if intent.status != expected {
+                return Ok(false);
+            }
+            intent.status = status;
+            intent.updated_at = updated_at;
+            Ok(true)
         }
     }
 
@@ -836,13 +980,20 @@ mod tests {
             crate::domain::character::ConversationState::default(),
         );
         let scheduler = Arc::new(CountingReplyScheduler::default());
-        h.driver = h.driver.with_reply_scheduler(scheduler.clone());
+        let autonomy_repo = Arc::new(RecordingAutonomyRepo::default());
+        h.driver = h
+            .driver
+            .with_reply_scheduler(scheduler.clone())
+            .with_autonomy_repository(autonomy_repo.clone());
         replace_decision_result(&mut h, DecisionResult::keep());
 
         h.driver.tick().await;
 
         assert_eq!(scheduler.0.load(Ordering::SeqCst), 1);
         assert_eq!(h.behavior_state_repo.states.lock().unwrap().len(), 1);
+        let intents = autonomy_repo.intents.lock().unwrap();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].status, AutonomyIntentStatus::Enqueued);
     }
 
     #[tokio::test]
@@ -872,5 +1023,37 @@ mod tests {
                 && state.proactive_count_date.is_none(),
             "主动任务入队失败后不得消耗冷却和每日额度"
         );
+    }
+
+    #[tokio::test]
+    async fn quota_rejection_does_not_leave_pending_autonomy_intent() {
+        let mut h = harness(true, None, true);
+        h.state_repo
+            .states
+            .lock()
+            .unwrap()
+            .insert(2, crate::domain::character::CharacterState::default());
+        h.conversation_state_repo.states.lock().unwrap().insert(
+            (2, 20),
+            crate::domain::character::ConversationState::default(),
+        );
+        h.behavior_state_repo.states.lock().unwrap().insert(
+            (2, 20),
+            BehaviorState {
+                proactive_count: 10,
+                proactive_count_date: Some(h.clock.now().date_naive()),
+                ..BehaviorState::default()
+            },
+        );
+        h.driver = h
+            .driver
+            .with_reply_scheduler(Arc::new(CountingReplyScheduler::default()));
+        let autonomy_repo = Arc::new(RecordingAutonomyRepo::default());
+        h.driver = h.driver.with_autonomy_repository(autonomy_repo.clone());
+        replace_decision_result(&mut h, DecisionResult::keep());
+
+        h.driver.tick().await;
+
+        assert!(autonomy_repo.intents.lock().unwrap().is_empty());
     }
 }

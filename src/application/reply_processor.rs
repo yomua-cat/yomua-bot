@@ -21,13 +21,14 @@ use crate::application::memory_service::{MemoryExtractionInput, MemoryService};
 use crate::application::mood_service::MoodService;
 use crate::application::relationship_service::RelationshipService;
 use crate::application::runtime::CharacterRuntime;
+use crate::domain::autonomy::{ReplyBatch, ReplyBatchStatus};
 use crate::domain::behavior::BehaviorAction;
 use crate::domain::conversation::ParticipantRole;
 use crate::domain::event::{
     BehaviorDecidedEvent, CoreEvent, MessageReceivedEvent, ResponseGeneratedEvent, ResponseSource,
 };
 use crate::domain::outbox::ProcessingOutcome;
-use crate::domain::repository::ParticipantRepository;
+use crate::domain::repository::{AutonomyRepository, ParticipantRepository};
 use crate::error::RuntimeError;
 
 const ASSISTANT_HISTORY_REPAIR_PREFIX: &str = "消息已发送但 assistant 历史落库失败";
@@ -48,6 +49,16 @@ fn combine_batch_contents(contents: impl IntoIterator<Item = String>) -> String 
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn stable_context_hash(content: &str) -> String {
+    // 与 PromptPlan 使用同一稳定摘要算法；这里只保存诊断摘要，不用于认证。
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in content.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// 把行为引擎给出的延迟截断到安全上限。
@@ -92,11 +103,15 @@ pub struct ReplyProcessor {
     /// 在单 Bot 部署中从 OneBotConfig 传入；在多 Bot 场景下由各 Bot 独立持有。
     bot_self_id: Option<i64>,
     message_repo: Option<Arc<dyn crate::domain::repository::MessageRepository>>,
+    autonomy_repo: Option<Arc<dyn AutonomyRepository>>,
 }
 
 struct FrozenBatch {
     content: String,
     additional_messages: Vec<crate::domain::message::Message>,
+    message_ids: Vec<i64>,
+    start_sequence: i64,
+    end_sequence: i64,
 }
 
 impl ReplyProcessor {
@@ -117,6 +132,12 @@ impl ReplyProcessor {
             return Ok(FrozenBatch {
                 content: event.content.clone(),
                 additional_messages: Vec::new(),
+                message_ids: (event.message_id > 0)
+                    .then_some(event.message_id)
+                    .into_iter()
+                    .collect(),
+                start_sequence: event.conversation_sequence,
+                end_sequence: event.conversation_sequence,
             });
         };
         let wait_ms = if event.is_mentioned {
@@ -169,6 +190,11 @@ impl ReplyProcessor {
         }
         if event.message_id == 0 {
             let mut combined = vec![event.content.clone()];
+            let message_ids: Vec<i64> = batch
+                .iter()
+                .map(|message| message.id)
+                .filter(|id| *id > 0)
+                .collect();
             let mut additional_messages = Vec::new();
             for message in batch {
                 self.mark_task_ignored_if_pending(message.id, event.character_id)
@@ -181,12 +207,21 @@ impl ReplyProcessor {
             return Ok(FrozenBatch {
                 content: combine_batch_contents(combined),
                 additional_messages,
+                message_ids,
+                start_sequence: event.conversation_sequence,
+                end_sequence: event.conversation_sequence,
             });
         }
         if batch.is_empty() {
             return Ok(FrozenBatch {
                 content: event.content.clone(),
                 additional_messages: Vec::new(),
+                message_ids: (event.message_id > 0)
+                    .then_some(event.message_id)
+                    .into_iter()
+                    .collect(),
+                start_sequence: event.conversation_sequence,
+                end_sequence: event.conversation_sequence,
             });
         }
 
@@ -210,6 +245,15 @@ impl ReplyProcessor {
                 combined
             },
             additional_messages,
+            message_ids: std::iter::once(event.message_id)
+                .chain(batch.iter().map(|message| message.id))
+                .filter(|id| *id > 0)
+                .collect(),
+            start_sequence: event.conversation_sequence,
+            end_sequence: batch
+                .last()
+                .and_then(|message| message.conversation_sequence)
+                .unwrap_or(event.conversation_sequence),
         })
     }
 
@@ -254,6 +298,7 @@ impl ReplyProcessor {
             participant_repo,
             bot_self_id,
             message_repo: None,
+            autonomy_repo: None,
         }
     }
 
@@ -297,6 +342,54 @@ impl ReplyProcessor {
     ) -> Self {
         self.message_repo = Some(repo);
         self
+    }
+
+    /// 装配主动意图与回复批次的持久化仓储。
+    pub fn with_autonomy_repository(mut self, repo: Arc<dyn AutonomyRepository>) -> Self {
+        self.autonomy_repo = Some(repo);
+        self
+    }
+
+    async fn persist_frozen_batch(
+        &self,
+        event: &MessageReceivedEvent,
+        batch: &FrozenBatch,
+    ) -> Result<(), RuntimeError> {
+        let Some(repo) = &self.autonomy_repo else {
+            return Ok(());
+        };
+        if batch.message_ids.is_empty() {
+            return Ok(());
+        }
+        let trigger_event_uuid = event
+            .metadata
+            .get("event_uuid")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "message-{}-{}",
+                    event.message_id, event.conversation_sequence
+                )
+            });
+        let context_hash = stable_context_hash(&batch.content);
+        let now = Utc::now();
+        repo.insert_reply_batch(&ReplyBatch {
+            id: 0,
+            conversation_id: event.conversation_id,
+            start_sequence: batch.start_sequence,
+            end_sequence: batch.end_sequence,
+            message_ids: batch.message_ids.clone(),
+            trigger_event_uuid,
+            context_hash,
+            status: ReplyBatchStatus::Frozen,
+            lease_token: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .map_err(RuntimeError::Repository)?;
+        Ok(())
     }
 
     /// 发送控制指令的结果。
@@ -1010,6 +1103,7 @@ impl ReplyProcessor {
         }
         self.ensure_event_still_owned(event, lease).await?;
         let frozen_batch = self.freeze_batch(event).await?;
+        self.persist_frozen_batch(event, &frozen_batch).await?;
         for message in &frozen_batch.additional_messages {
             self.ensure_event_still_owned(event, lease).await?;
             let stable_user_key = message
