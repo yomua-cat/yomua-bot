@@ -146,6 +146,25 @@ impl MemoryRepository for SqliteMemoryRepository {
         Ok(exists != 0)
     }
 
+    async fn count_candidates_for_user_since(
+        &self,
+        user_id: i64,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<i64, RepositoryError> {
+        let count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+                 FROM memories
+                WHERE user_id = ?
+                  AND created_at >= ?
+                  AND json_extract(metadata, '$.candidate_created_at') IS NOT NULL"#,
+        )
+        .bind(user_id)
+        .bind(since.to_rfc3339())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
     async fn insert_candidate_once(&self, memory: &Memory) -> Result<Option<i64>, RepositoryError> {
         let Some(source_message_id) = memory
             .metadata

@@ -2391,6 +2391,18 @@ mod storage_tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+        let day_start = occurred_at
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        assert_eq!(
+            memory_repo
+                .count_candidates_for_user_since(user_id, day_start)
+                .await
+                .unwrap(),
+            1
+        );
         let stored_user_id: i64 = sqlx::query_scalar(
             "SELECT user_id FROM memories WHERE character_id=? AND json_extract(metadata, '$.source_message_id')=9001",
         )

@@ -861,6 +861,17 @@ pub trait MemoryRepository: Send + Sync {
         Ok(false)
     }
 
+    /// 统计指定全域用户在时间窗口内已生成的候选记忆数量。
+    ///
+    /// 默认实现返回 0，供不支持候选统计的轻量测试仓储使用。
+    async fn count_candidates_for_user_since(
+        &self,
+        _user_id: i64,
+        _since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<i64, RepositoryError> {
+        Ok(0)
+    }
+
     /// 带来源的候选记忆幂等插入。已存在时返回 None。
     async fn insert_candidate_once(&self, memory: &Memory) -> Result<Option<i64>, RepositoryError> {
         let Some(source_message_id) = memory

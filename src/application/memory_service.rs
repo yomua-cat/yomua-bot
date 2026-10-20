@@ -26,6 +26,8 @@ pub struct MemoryCandidate {
     pub keywords: Vec<String>,
     /// 来源参与者（消息发送者）。
     pub participant_id: Option<i64>,
+    /// 正文是否因长度限制被截断。
+    pub truncated: bool,
 }
 
 /// 一次记忆提取的完整来源身份与时间。
@@ -49,6 +51,10 @@ pub struct MemoryService {
 const MIN_MESSAGE_CHARS: usize = 12;
 /// 记忆落库的重要度阈值。低于它不持久化（避免每条消息都成记忆）。
 const MIN_IMPORTANCE: f64 = 0.5;
+/// 单个全域用户每天最多生成的候选记忆数量。
+const MAX_DAILY_CANDIDATES: i64 = 20;
+/// 候选记忆正文的最大字符数。
+const MAX_CANDIDATE_CONTENT_CHARS: usize = 200;
 
 /// 关系类触发词（表达与他人关系的陈述 → Relationship 记忆）。
 const REL_TRIGGERS: &[&str] = &[
@@ -66,7 +72,6 @@ const REL_TRIGGERS: &[&str] = &[
     "我对象",
     "我室友",
     "我和",
-    "我们",
 ];
 /// 自我描述类触发词（表达偏好 / 身份 / 长期事实 → Semantic 记忆）。
 const SEM_TRIGGERS: &[&str] = &[
@@ -75,22 +80,17 @@ const SEM_TRIGGERS: &[&str] = &[
     "我讨厌",
     "我不喜欢",
     "我住在",
-    "我是",
     "我的名字",
     "我养",
     "我家",
     "我生日",
     "我今年",
-    "我会",
-    "我能",
     "我想要",
 ];
 /// 事件 / 经历类触发词（表达发生过的事 → Episodic 记忆）。
 const EPI_TRIGGERS: &[&str] = &[
-    "今天",
     "昨天",
     "上周",
-    "明天",
     "我考试",
     "我去了",
     "我做了",
@@ -117,6 +117,28 @@ impl MemoryService {
             return Ok(0);
         };
 
+        let now = Utc::now();
+        let day_start = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("午夜时间有效")
+            .and_utc();
+        if let Some(user_id) = input.user_id {
+            let count = self
+                .memory_repo
+                .count_candidates_for_user_since(user_id, day_start)
+                .await?;
+            if count >= MAX_DAILY_CANDIDATES {
+                tracing::info!(
+                    user_id,
+                    count,
+                    limit = MAX_DAILY_CANDIDATES,
+                    "用户今日候选记忆已达上限，跳过候选"
+                );
+                return Ok(0);
+            }
+        }
+
         let mut memory = Memory::new(
             input.character_id,
             input.conversation_id,
@@ -137,6 +159,8 @@ impl MemoryService {
             "status": "candidate",
             "verification": "pending",
             "candidate_reason": "确定性规则命中，等待后台确认",
+            "candidate_created_at": now,
+            "truncated": candidate.truncated,
             // 直接陈述类候选才允许走程序自动确认；事件类信息仍需更严格的
             // 后台语义审核，避免把随口一说固化成长期事实。
             "visibility": if candidate.memory_type == MemoryType::Episodic { "conversation" } else { "shared" },
@@ -153,7 +177,8 @@ impl MemoryService {
     /// 对消息做确定性重要度评估，返回候选；不足阈值时返回 `None`。
     ///
     /// 这是纯函数，便于单测。规则：
-    /// - 消息过短且无触发词 → 不记录；
+    /// - 必须命中明确触发词；
+    /// - 疑问句和明显否定转折 → 不记录；
     /// - 重要度低于阈值 → 不记录；
     /// - 类型判定：关系 > 自我描述 > 事件（默认 episodic）。
     fn evaluate(&self, message_text: &str, participant_id: i64) -> Option<MemoryCandidate> {
@@ -162,14 +187,22 @@ impl MemoryService {
             return None;
         }
 
+        if is_question_or_negated_turn(text) {
+            return None;
+        }
+
         let lower = text.to_lowercase();
         let has_rel = trigger_hit(&lower, REL_TRIGGERS);
         let has_sem = trigger_hit(&lower, SEM_TRIGGERS);
         let has_epi = trigger_hit(&lower, EPI_TRIGGERS);
 
-        // 重要的只有：消息较长，或含有至少一个触发词。
         let char_count = text.chars().count();
         let trigger_count = [has_rel, has_sem, has_epi].iter().filter(|&&b| b).count() as f64;
+
+        // 只有明确触发词才进入候选，长度本身不能绕过筛选。
+        if trigger_count == 0.0 {
+            return None;
+        }
 
         let mut importance = 0.4 + trigger_count * 0.2;
         if char_count >= 40 {
@@ -179,8 +212,7 @@ impl MemoryService {
         }
         importance = importance.clamp(0.0, 1.0);
 
-        // 信息量不足且无触发词 → 不记录。
-        if char_count < MIN_MESSAGE_CHARS && trigger_count == 0.0 {
+        if char_count < MIN_MESSAGE_CHARS {
             return None;
         }
         if importance < MIN_IMPORTANCE {
@@ -209,12 +241,16 @@ impl MemoryService {
             }
         }
 
+        let truncated = char_count > MAX_CANDIDATE_CONTENT_CHARS;
+        let content = text.chars().take(MAX_CANDIDATE_CONTENT_CHARS).collect();
+
         Some(MemoryCandidate {
-            content: text.to_string(),
+            content,
             memory_type,
             importance,
             keywords,
             participant_id: Some(participant_id),
+            truncated,
         })
     }
 }
@@ -222,6 +258,19 @@ impl MemoryService {
 /// 触发词命中检测（任一命中即返回 true）。
 fn trigger_hit(text: &str, triggers: &[&str]) -> bool {
     triggers.iter().any(|t| text.contains(t))
+}
+
+/// 排除疑问句和把否定转折当作稳定陈述的常见情况。
+fn is_question_or_negated_turn(text: &str) -> bool {
+    text.contains('吗')
+        || text.contains('呢')
+        || text.ends_with('？')
+        || text.ends_with('?')
+        || text.starts_with("不是")
+        || text.starts_with("并不是")
+        || text.contains("但是")
+        || text.contains("不过")
+        || text.contains("然而")
 }
 
 #[cfg(test)]
@@ -319,6 +368,24 @@ mod tests {
         ) -> Result<Vec<Memory>, RepositoryError> {
             Ok(Vec::new())
         }
+
+        async fn count_candidates_for_user_since(
+            &self,
+            user_id: i64,
+            since: DateTime<Utc>,
+        ) -> Result<i64, RepositoryError> {
+            Ok(self
+                .items
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|memory| {
+                    memory.user_id == Some(user_id)
+                        && memory.created_at >= since
+                        && memory.metadata.get("candidate_created_at").is_some()
+                })
+                .count() as i64)
+        }
     }
 
     fn service() -> (MemoryService, Arc<MemMemoryRepo>) {
@@ -334,6 +401,38 @@ mod tests {
         // 过短且无触发词 → 不产生候选。
         assert!(svc.evaluate("嗯 好", 1).is_none());
         assert!(svc.evaluate("哈哈", 1).is_none());
+    }
+
+    #[test]
+    fn evaluate_filters_noise_questions_and_negated_turns() {
+        let (svc, _repo) = service();
+        let cases = [
+            ("今天好累啊，先躺一会儿", false),
+            ("这周工作特别忙，回家只想睡觉", false),
+            ("我喜欢喝咖啡，也喜欢自己在家手冲", true),
+            ("我喜欢喝咖啡吗", false),
+            ("我喜欢喝咖啡？", false),
+            ("我喜欢喝咖啡，但是最近戒了", false),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                svc.evaluate(message, 1).is_some(),
+                expected,
+                "消息：{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_candidate_is_truncated_and_marked() {
+        let (svc, _repo) = service();
+        let message = format!("我喜欢{}", "很".repeat(MAX_CANDIDATE_CONTENT_CHARS));
+        let candidate = svc.evaluate(&message, 1).expect("明确自我陈述应产生候选");
+        assert_eq!(
+            candidate.content.chars().count(),
+            MAX_CANDIDATE_CONTENT_CHARS
+        );
+        assert!(candidate.truncated);
     }
 
     #[test]
@@ -373,7 +472,7 @@ mod tests {
                 conversation_id: Some(10),
                 participant_id: 99,
                 user_id: Some(500),
-                message_text: "我今天考试考砸了，心情不太好",
+                message_text: "我考试考砸了，心情不太好",
                 source_message_id: 100,
                 source_occurred_at: Utc::now(),
             })
@@ -406,5 +505,43 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].memory_type, MemoryType::Episodic);
         assert_eq!(stored[0].user_id, Some(500));
+        assert_eq!(stored[0].metadata["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn daily_candidate_limit_is_enforced_per_user() {
+        let (svc, repo) = service();
+        for source_message_id in 0..MAX_DAILY_CANDIDATES {
+            let count = svc
+                .extract_and_store(MemoryExtractionInput {
+                    character_id: 1,
+                    conversation_id: Some(10),
+                    participant_id: 99,
+                    user_id: Some(500),
+                    message_text: "我喜欢喝咖啡，每天都要来一杯",
+                    source_message_id,
+                    source_occurred_at: Utc::now(),
+                })
+                .await
+                .expect("候选提取应成功");
+            assert_eq!(count, 1);
+        }
+        let count = svc
+            .extract_and_store(MemoryExtractionInput {
+                character_id: 1,
+                conversation_id: Some(10),
+                participant_id: 99,
+                user_id: Some(500),
+                message_text: "我喜欢喝咖啡，每天都要来一杯",
+                source_message_id: 1000,
+                source_occurred_at: Utc::now(),
+            })
+            .await
+            .expect("超限应静默跳过");
+        assert_eq!(count, 0);
+        assert_eq!(
+            repo.items.lock().unwrap().len(),
+            MAX_DAILY_CANDIDATES as usize
+        );
     }
 }
