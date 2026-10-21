@@ -59,6 +59,9 @@ impl MessageAcceptanceService {
         content: &str,
         metadata: &serde_json::Value,
     ) -> Result<(), RuntimeError> {
+        if platform_message_id <= 0 {
+            return Ok(());
+        }
         self.message_repo
             .record_platform_echo(
                 conversation_id,
