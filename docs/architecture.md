@@ -74,6 +74,8 @@ OneBot 连接循环独立路由 Action 回执，不等待入站业务处理任�
 
 `decision.toml` 启用后，请求经 `DecisionLlmServiceImpl` 以 `llm_role=decision` 交给调度器。明确提及由规则引擎直接处理；未提及消息只有规则结果或关系/状态处于边界时才由启发式触发器调用模型。主动任务先通过规则引擎的主动开关、静默、冷却和意愿门槛，再由同一编排器评估；模型保留后原子预留额度并入队，入队失败会恢复预留前状态，模型否决则不产生主动消息副作用。主动情境只接受 `keep` 或 `suggest_ignore`，不接受回复建议或延迟调整。
 
+绑定为 `MentionOnly` 且消息未提及时，回复处理器在记忆抽取、关系更新、批量等待和决策模型之前直接持久化 `Ignored`；这是规则硬约束的提前短路，不改变被提及时的回复路径。
+
 配置路由负责 Provider、模型、输出上限、共享预算和网络/HTTP 可重试备用模型。普通聊天模型返回 JSON 建议；Jev 通过 TypeSafe Provider 发送 `state + choice question`，再由决策服务转换为同一组动作。Pipeline 对建议做语义校验，失败时回到规则决策；编排器应用建议时再次守住硬约束。未绑定、MentionOnly 模式下未提及、静默时段下未提及和主动情境不能被建议回复绕过；规则决策仍保留优先级、认知级别、原因和时间等字段。全部模型失败、输出无效或未触发模型时都使用规则结果。
 
 [ContextBuilder](../src/application/context.rs)加载角色归属的历史、Lorebook、记忆、关系及会话情绪。调用方显式传入全域 `user_id`，participant 只用于本会话消息作者与当前轮身份；跨会话记忆和关系均以该 `user_id` 查询。稳定事实和关系信息默认纳入角色内部上下文，确认禁用策略后由数据库层排除；具体经历仍限于来源会话。[CharacterHistoryProvider](../src/application/character_history.rs)负责历史归属和序号边界。[ContextAssembler](../src/application/context_assembler.rs)估算 token、预留输出空间并按层降级，需要已知的 `context_window`；历史用户标签使用会话内稳定匿名别名，昵称和正文标签会先做安全净化，系统生成的身份标签不包含真实 QQ 号。模型能力从当前 Role 引用的 Model Instance 解析；共享预算和备用模型数配置在对应的 `[roles.*]` 中。

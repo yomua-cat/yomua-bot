@@ -23,6 +23,7 @@ use crate::application::relationship_service::RelationshipService;
 use crate::application::runtime::CharacterRuntime;
 use crate::domain::autonomy::{ReplyBatch, ReplyBatchStatus};
 use crate::domain::behavior::BehaviorAction;
+use crate::domain::character::ReplyMode;
 use crate::domain::conversation::ParticipantRole;
 use crate::domain::event::{
     BehaviorDecidedEvent, CoreEvent, MessageReceivedEvent, ResponseGeneratedEvent, ResponseSource,
@@ -1018,6 +1019,21 @@ impl ReplyProcessor {
         let character = self.runtime.refresh_character(event.character_id).await?;
         if !character.enabled {
             self.save_task_owned(event, lease, ReplyTaskStatus::Cancelled, None)
+                .await?;
+            return Ok(());
+        }
+        // MentionOnly + 未提及是规则硬约束，不需要记忆抽取、关系更新、批量等待
+        // 或决策模型；尽早结束可以避免高频群消息在无回复路径上占用会话门闩。
+        if !event.is_mentioned && binding.reply_mode == ReplyMode::MentionOnly {
+            self.event_bus
+                .publish(&CoreEvent::BehaviorDecided(BehaviorDecidedEvent {
+                    character_id: event.character_id,
+                    conversation_id: event.conversation_id,
+                    action: format!("{:?}", BehaviorAction::Ignore),
+                    reason: "MentionOnly 模式且未被提及，忽略".to_string(),
+                    timestamp: Utc::now(),
+                }));
+            self.save_task_owned(event, lease, ReplyTaskStatus::Ignored, None)
                 .await?;
             return Ok(());
         }
@@ -2608,6 +2624,52 @@ mod tests {
             .await
             .expect("无绑定时应忽略而非报错");
         assert!(adapter.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mention_only_unmentioned_short_circuits_before_batch_wait() {
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let delay_executor: Arc<dyn DelayExecutor> = Arc::new(RecordingDelay {
+            delays: delays.clone(),
+        });
+        let (processor, adapter, provider, _, _, _, _, _, _, _, message_repo) =
+            wire_with_delay(false, true, delay_executor).await;
+        message_repo.messages.lock().unwrap().push(Message {
+            id: 77,
+            conversation_id: 100,
+            sender_id: 66,
+            content: crate::domain::message::MessageContent::Text("未提及消息".to_string()),
+            timestamp: Utc::now(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            metadata: serde_json::json!({}),
+            active_character_id: Some(1),
+            platform_message_id: None,
+            conversation_sequence: Some(1),
+            occurred_at: Some(Utc::now()),
+            ingested_at: Some(Utc::now()),
+        });
+        let mut event = received_event(false);
+        event.message_id = 77;
+
+        processor
+            .process(&event)
+            .await
+            .expect("MentionOnly 未提及消息应正常忽略");
+
+        assert_eq!(*provider.calls.lock().unwrap(), 0);
+        assert!(adapter.sent.lock().unwrap().is_empty());
+        assert!(delays.lock().unwrap().is_empty());
+        assert_eq!(
+            message_repo
+                .reply_tasks
+                .lock()
+                .unwrap()
+                .get(&77)
+                .map(|task| task.status),
+            Some(ReplyTaskStatus::Ignored)
+        );
     }
 
     #[tokio::test]
