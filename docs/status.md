@@ -77,6 +77,8 @@
 
 ## 尚未证明
 
+- 单会话积压压测 `p2_1_single_conversation_backlog_measurement` 与生产装配一致（SQLite WAL、5 秒 `busy_timeout`、5 个连接），但耗时约 1–3 分钟且曾出现并发写入锁竞争，因此标记为 ignored，不作为常规全目标测试的必过项。需要手动测量时运行：`cargo test --locked --test alpha_e2e_test p2_1_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1`；GitHub Actions 通过 `workflow_dispatch` 触发同一命令。
+
 - 2026-10-20 已用唯一好友完成真实 QQ → NapCat → 入库 → Outbox → OneBot 发送验证，QQ 窗口确认显示回复“测试收到2。”。MiniMax `M2-her` 曾返回 `400 invalid params, group chat not supported (2013)`，任务正确进入 `failed` 且只尝试一次；直接构造的最小请求返回 200，但使用应用净化历史重放仍返回同一错误，具体触发条件仍未证明。随后切换到 Zhipu `glm-4.7-flash`，前两次 429 后第三次成功，数据库记录发送成功并保存平台消息 ID `1320729054`。该次是真实单好友场景验证，不代表并发、持续运行或极端积压已验收。
 - 插件 Unix socket 测试在普通测试命令中按 `#[ignore]` 标记；本机显式运行 16 个测试全部通过，CI 必过矩阵配置为单独执行这些 ignored 测试。
 - `unknown` 发送结果仍是待核查终态；现在会保存生成内容和错误原因。机器人自身回声在同一会话内正文完全一致、发送开始后 60 秒内且候选唯一时，会自动调用确认路径写入平台消息 ID 并收敛为 `sent`；内容不同、候选重复、跨会话或超出窗口时保持 `unknown`。该匹配只确认已有回声，不触发自动补发。`reply unknown check` 仍仅在任务有平台消息 ID 时调用 `get_msg`，平台明确返回“未找到”才自动重新排队；没有回声、没有平台消息 ID 或查询网络失败时仍需人工核查。

@@ -1353,6 +1353,7 @@ async fn p1_2_cold_start_behavior() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "耗时 1-3 分钟，仅用于手动测量积压"]
 async fn p2_1_single_conversation_backlog_measurement() {
     let h = setup_with_options(
         Duration::from_secs(3),
