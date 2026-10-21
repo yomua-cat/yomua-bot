@@ -882,6 +882,24 @@ pub trait MemoryRepository: Send + Sync {
         Ok(0)
     }
 
+    /// 在仓储事务内执行候选去重和用户每日上限检查后插入。
+    ///
+    /// 默认实现供轻量测试仓储使用；SQLite 实现把条件插入放在同一事务中。
+    async fn insert_candidate_with_daily_limit(
+        &self,
+        memory: &Memory,
+        since: chrono::DateTime<chrono::Utc>,
+        daily_limit: i64,
+    ) -> Result<Option<i64>, RepositoryError> {
+        if let Some(user_id) = memory.user_id {
+            let count = self.count_candidates_for_user_since(user_id, since).await?;
+            if count >= daily_limit {
+                return Ok(None);
+            }
+        }
+        self.insert_candidate_once(memory).await
+    }
+
     /// 带来源的候选记忆幂等插入。已存在时返回 None。
     async fn insert_candidate_once(&self, memory: &Memory) -> Result<Option<i64>, RepositoryError> {
         let Some(source_message_id) = memory

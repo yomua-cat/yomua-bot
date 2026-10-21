@@ -123,22 +123,6 @@ impl MemoryService {
             .and_hms_opt(0, 0, 0)
             .expect("午夜时间有效")
             .and_utc();
-        if let Some(user_id) = input.user_id {
-            let count = self
-                .memory_repo
-                .count_candidates_for_user_since(user_id, day_start)
-                .await?;
-            if count >= MAX_DAILY_CANDIDATES {
-                tracing::info!(
-                    user_id,
-                    count,
-                    limit = MAX_DAILY_CANDIDATES,
-                    "用户今日候选记忆已达上限，跳过候选"
-                );
-                return Ok(0);
-            }
-        }
-
         let mut memory = Memory::new(
             input.character_id,
             input.conversation_id,
@@ -168,7 +152,7 @@ impl MemoryService {
         });
         Ok(self
             .memory_repo
-            .insert_candidate_once(&memory)
+            .insert_candidate_with_daily_limit(&memory, day_start, MAX_DAILY_CANDIDATES)
             .await?
             .map(|_| 1)
             .unwrap_or(0))
