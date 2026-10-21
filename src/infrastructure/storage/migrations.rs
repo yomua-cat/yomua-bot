@@ -588,6 +588,7 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
         status TEXT NOT NULL DEFAULT 'pending',
         error TEXT,
         platform_message_id INTEGER,
+        delivery_started_at TEXT,
         updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS cognition_progress (
@@ -609,6 +610,23 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
             .await
             .map_err(|e| {
                 StorageError::Migration(format!("reply task delivery migration failed: {e}"))
+            })?;
+    }
+
+    let has_delivery_started_at: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('reply_tasks') WHERE name='delivery_started_at'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        StorageError::Migration(format!("migration reply delivery time probe failed: {e}"))
+    })?;
+    if has_delivery_started_at == 0 {
+        sqlx::query("ALTER TABLE reply_tasks ADD COLUMN delivery_started_at TEXT")
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                StorageError::Migration(format!("migration reply delivery time failed: {e}"))
             })?;
     }
 

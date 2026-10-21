@@ -390,6 +390,16 @@ pub trait MessageRepository: Send + Sync {
         Ok(())
     }
 
+    /// 查找可以由平台回声唯一确认的未知回复任务。
+    async fn find_unknown_reply_task_for_platform_echo(
+        &self,
+        _conversation_id: i64,
+        _content: &str,
+        _echoed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<i64>, RepositoryError> {
+        Ok(None)
+    }
+
     /// 领取一个平台命令消息的幂等凭证。
     /// 返回 false 表示该平台消息已经处理过。
     async fn claim_command_message(

@@ -7,6 +7,8 @@ use crate::domain::message::{Attachment, Message, MessageContent};
 use crate::domain::repository::{AcceptedMessageInput, AcceptedMessageResult, MessageRepository};
 use crate::error::RepositoryError;
 
+const PLATFORM_ECHO_MATCH_WINDOW_SECS: f64 = 60.0;
+
 pub struct SqliteMessageRepository {
     pool: SqlitePool,
 }
@@ -118,6 +120,40 @@ impl MessageRepository for SqliteMessageRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn find_unknown_reply_task_for_platform_echo(
+        &self,
+        conversation_id: i64,
+        content: &str,
+        echoed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<i64>, RepositoryError> {
+        let echoed_at = echoed_at.to_rfc3339();
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            r#"SELECT task.message_id
+                 FROM reply_tasks task
+                 JOIN messages message ON message.id = task.message_id
+                WHERE message.conversation_id = ?
+                  AND task.status = 'unknown'
+                  AND task.platform_message_id IS NULL
+                  AND task.content = ?
+                  AND julianday(COALESCE(task.delivery_started_at, task.updated_at))
+                        BETWEEN julianday(?) - (? / 86400.0) AND julianday(?)
+                ORDER BY task.message_id
+                LIMIT 2"#,
+        )
+        .bind(conversation_id)
+        .bind(content)
+        .bind(&echoed_at)
+        .bind(PLATFORM_ECHO_MATCH_WINDOW_SECS)
+        .bind(&echoed_at)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(if rows.len() == 1 {
+            Some(rows[0].0)
+        } else {
+            None
+        })
     }
 
     async fn claim_command_message(
@@ -453,9 +489,9 @@ impl MessageRepository for SqliteMessageRepository {
         let now = chrono::Utc::now().to_rfc3339();
         let updated = sqlx::query(
             r#"INSERT INTO reply_tasks(
-                   message_id, character_id, status, content, error, updated_at
+                   message_id, character_id, status, content, error, updated_at, delivery_started_at
                )
-               SELECT ?, ?, 'sending', NULL, NULL, ?
+               SELECT ?, ?, 'sending', NULL, NULL, ?, ?
                FROM outbox_events
                WHERE entity_id = ?
                  AND entity_type = 'messages'
@@ -467,12 +503,14 @@ impl MessageRepository for SqliteMessageRepository {
                ON CONFLICT(message_id) DO UPDATE SET
                    status = 'sending',
                    error = NULL,
-                   updated_at = excluded.updated_at
+                   updated_at = excluded.updated_at,
+                   delivery_started_at = excluded.delivery_started_at
                WHERE reply_tasks.character_id = excluded.character_id
                  AND reply_tasks.status IN ('pending', 'generated')"#,
         )
         .bind(message_id)
         .bind(character_id)
+        .bind(&now)
         .bind(&now)
         .bind(message_id)
         .bind(lease_token)

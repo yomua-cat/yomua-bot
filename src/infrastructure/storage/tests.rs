@@ -1139,6 +1139,171 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn platform_echo_matches_only_one_recent_unknown_reply_in_same_conversation() {
+        let storage = setup_storage().await;
+        let char_id: i64 =
+            sqlx::query_scalar("INSERT INTO characters(name) VALUES ('回声匹配角色') RETURNING id")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type, external_id) VALUES ('private', 'echo-match') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let other_conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type, external_id) VALUES ('private', 'echo-other') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let sender_id: i64 = sqlx::query_scalar(
+            "INSERT INTO participants(conversation_id, external_id, display_name, role, metadata) VALUES (?, 'user', '用户', 'user', '{}') RETURNING id",
+        )
+        .bind(conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let other_sender_id: i64 = sqlx::query_scalar(
+            "INSERT INTO participants(conversation_id, external_id, display_name, role, metadata) VALUES (?, 'user', '用户', 'user', '{}') RETURNING id",
+        )
+        .bind(other_conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let now = chrono::Utc::now();
+        let pool = storage.pool().clone();
+        let insert_task = move |conversation_id: i64, sender_id: i64, content: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let repo =
+                    crate::infrastructure::storage::repository::SqliteMessageRepository::new(pool);
+                let message_id = repo
+                    .insert(&make_test_message(
+                        conversation_id,
+                        sender_id,
+                        MessageContent::Text("用户消息".into()),
+                        now,
+                        Some(char_id),
+                    ))
+                    .await
+                    .unwrap();
+                repo.save_reply_task_error(
+                    message_id,
+                    char_id,
+                    ReplyTaskStatus::Unknown,
+                    Some(content),
+                    Some("发送结果未知"),
+                )
+                .await
+                .unwrap();
+                message_id
+            }
+        };
+
+        let unique_id = insert_task(conversation_id, sender_id, "唯一回声").await;
+        let different_id = insert_task(conversation_id, sender_id, "其他内容").await;
+        let duplicate_a = insert_task(conversation_id, sender_id, "重复回声").await;
+        let duplicate_b = insert_task(conversation_id, sender_id, "重复回声").await;
+        let expired_id = insert_task(conversation_id, sender_id, "过期回声").await;
+        let cross_session_id = insert_task(other_conversation_id, other_sender_id, "跨会话").await;
+
+        let old = (now - chrono::Duration::seconds(61)).to_rfc3339();
+        sqlx::query(
+            "UPDATE reply_tasks SET delivery_started_at = ?, updated_at = ? WHERE message_id = ?",
+        )
+        .bind(&old)
+        .bind(&old)
+        .bind(expired_id)
+        .execute(storage.pool())
+        .await
+        .unwrap();
+
+        let echo_time = chrono::Utc::now();
+
+        assert_eq!(
+            repo.find_unknown_reply_task_for_platform_echo(conversation_id, "唯一回声", echo_time,)
+                .await
+                .unwrap(),
+            Some(unique_id)
+        );
+        assert_eq!(
+            repo.find_unknown_reply_task_for_platform_echo(
+                conversation_id,
+                "不存在的回声",
+                echo_time,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            repo.find_unknown_reply_task_for_platform_echo(conversation_id, "重复回声", echo_time,)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            repo.find_unknown_reply_task_for_platform_echo(conversation_id, "过期回声", echo_time,)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            repo.find_unknown_reply_task_for_platform_echo(conversation_id, "跨会话", echo_time,)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let service = crate::application::message_acceptance::MessageAcceptanceService::new(
+            Arc::new(
+                crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+                    storage.pool().clone(),
+                ),
+            ),
+            crate::application::event_bus::EventBus::new(),
+        );
+        service
+            .record_platform_echo(
+                conversation_id,
+                8801,
+                "bot",
+                "唯一回声",
+                &serde_json::json!({"author_kind": "platform_echo"}),
+            )
+            .await
+            .unwrap();
+        let confirmed = repo.reply_task(unique_id).await.unwrap().unwrap();
+        assert_eq!(confirmed.status, ReplyTaskStatus::Sent);
+        assert_eq!(confirmed.platform_message_id, Some(8801));
+        assert_eq!(
+            repo.reply_task(different_id).await.unwrap().unwrap().status,
+            ReplyTaskStatus::Unknown
+        );
+        assert_eq!(
+            repo.reply_task(duplicate_a).await.unwrap().unwrap().status,
+            ReplyTaskStatus::Unknown
+        );
+        assert_eq!(
+            repo.reply_task(duplicate_b).await.unwrap().unwrap().status,
+            ReplyTaskStatus::Unknown
+        );
+        assert_eq!(
+            repo.reply_task(cross_session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ReplyTaskStatus::Unknown
+        );
+    }
+
+    #[tokio::test]
     async fn test_message_crud() {
         let storage = setup_storage().await;
         let conv_repo =

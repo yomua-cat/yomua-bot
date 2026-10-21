@@ -68,7 +68,22 @@ impl MessageAcceptanceService {
                 metadata,
             )
             .await
-            .map_err(RuntimeError::Repository)
+            .map_err(RuntimeError::Repository)?;
+
+        let echoed_at = Utc::now();
+        if let Some(message_id) = self
+            .message_repo
+            .find_unknown_reply_task_for_platform_echo(conversation_id, content, echoed_at)
+            .await
+            .map_err(RuntimeError::Repository)?
+        {
+            // 只确认已经发生的平台回声，不进入补发或 Outbox 重试路径。
+            self.message_repo
+                .confirm_unknown_reply_task(message_id, platform_message_id)
+                .await
+                .map_err(RuntimeError::Repository)?;
+        }
+        Ok(())
     }
 
     /// 将管理指令作为不可见于角色上下文的系统消息持久化。
