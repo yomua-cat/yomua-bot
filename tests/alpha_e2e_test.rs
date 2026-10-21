@@ -73,14 +73,20 @@ struct MockLlmProvider {
     calls: AtomicUsize,
     captured_requests: Mutex<Vec<LlmRequest>>,
     response_text: String,
+    delay: Duration,
 }
 
 impl MockLlmProvider {
     fn new(text: impl Into<String>) -> Self {
+        Self::new_with_delay(text, Duration::ZERO)
+    }
+
+    fn new_with_delay(text: impl Into<String>, delay: Duration) -> Self {
         Self {
             calls: AtomicUsize::new(0),
             captured_requests: Mutex::new(Vec::new()),
             response_text: text.into(),
+            delay,
         }
     }
 
@@ -98,6 +104,9 @@ impl LlmProvider for MockLlmProvider {
     async fn generate(&self, request: LlmRequest) -> Result<LlmResponse, RuntimeError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.captured_requests.lock().unwrap().push(request.clone());
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
         Ok(LlmResponse {
             content: self.response_text.clone(),
             model: "mock".to_string(),
@@ -200,6 +209,78 @@ impl WsConnector for HeldMockConnector {
     }
 }
 
+/// 保持连接并为出站 Action 返回成功回执，用于压测的发送状态统计。
+struct AckHeldTransport {
+    sent: Arc<Mutex<Vec<String>>>,
+    responses: tokio::sync::mpsc::UnboundedReceiver<String>,
+    response_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    next_message_id: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl WsTransport for AckHeldTransport {
+    async fn read_text(&mut self) -> Result<Option<String>, RuntimeError> {
+        Ok(self.responses.recv().await)
+    }
+
+    async fn send_text(&mut self, text: &str) -> Result<(), RuntimeError> {
+        self.sent.lock().unwrap().push(text.to_string());
+        let request: serde_json::Value = serde_json::from_str(text)
+            .map_err(|error| RuntimeError::Adapter(format!("压测 Action 请求无效：{error}")))?;
+        let echo = request
+            .get("echo")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let action = request
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let message_id = self.next_message_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let response = serde_json::json!({
+            "echo": echo,
+            "action": action,
+            "status": "ok",
+            "retcode": 0,
+            "data": {"message_id": message_id}
+        });
+        self.response_tx
+            .send(response.to_string())
+            .map_err(|_| RuntimeError::Adapter("压测 Action 回执通道已关闭".to_string()))?;
+        Ok(())
+    }
+
+    async fn ping(&mut self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+}
+
+struct AckHeldMockConnector {
+    sent: Arc<Mutex<Vec<String>>>,
+    next_message_id: Arc<AtomicUsize>,
+}
+
+impl AckHeldMockConnector {
+    fn new(sent: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            sent,
+            next_message_id: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl WsConnector for AckHeldMockConnector {
+    async fn connect(&self, _config: &OneBotConfig) -> Result<Box<dyn WsTransport>, RuntimeError> {
+        let (response_tx, responses) = tokio::sync::mpsc::unbounded_channel();
+        Ok(Box::new(AckHeldTransport {
+            sent: self.sent.clone(),
+            responses,
+            response_tx,
+            next_message_id: self.next_message_id.clone(),
+        }) as Box<dyn WsTransport>)
+    }
+}
+
 pub struct MockConnector {
     transport: Mutex<Option<MockTransport>>,
 }
@@ -239,11 +320,21 @@ struct AlphaHarness {
     llm_provider: Arc<MockLlmProvider>,
     sent_transport: Arc<Mutex<Vec<String>>>,
     reply_processor: Arc<ReplyProcessor>,
+    acceptance_service: Arc<yomua_bot::application::message_acceptance::MessageAcceptanceService>,
     /// 保存 adapter 以便在测试结束后调用 stop()
     _adapter: Arc<dyn yomua_bot::adapters::onebot::OneBotAdapter>,
 }
 
 async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
+    setup_with_options(Duration::ZERO, Arc::new(ZeroDelay), false, false).await
+}
+
+async fn setup_with_options(
+    provider_delay: Duration,
+    delay_executor: Arc<dyn DelayExecutor>,
+    acknowledge_actions: bool,
+    persist_reply_tasks: bool,
+) -> Result<AlphaHarness, Box<dyn std::error::Error>> {
     // 1. 每个 test 独立 temp dir，确保数据库隔离
     let temp_dir = tempfile::tempdir()?;
     let db_path = temp_dir.path().join("alpha_e2e.db");
@@ -274,7 +365,10 @@ async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
         Arc::new(SqliteMemoryRepository::new(pool.clone()));
 
     // 3. Mock LLM
-    let llm_provider = Arc::new(MockLlmProvider::new("你好，我是小爱。"));
+    let llm_provider = Arc::new(MockLlmProvider::new_with_delay(
+        "你好，我是小爱。",
+        provider_delay,
+    ));
 
     // 配置角色路由（conversation → llm_provider）
     let mut providers: std::collections::HashMap<String, Arc<dyn LlmProvider>> =
@@ -471,8 +565,18 @@ async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
 
     // 10. Mock Transport（捕获出站）- 使用 HeldMockConnector 保持连接开放
     let sent_transport: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let held_connector = Arc::new(HeldMockConnector::new(sent_transport.clone()));
+    let held_connector: Arc<dyn WsConnector> = if acknowledge_actions {
+        Arc::new(AckHeldMockConnector::new(sent_transport.clone()))
+    } else {
+        Arc::new(HeldMockConnector::new(sent_transport.clone()))
+    };
     let conversation_manager = ConversationManager::new(conv_repo.clone(), part_repo.clone());
+    let acceptance_service = Arc::new(
+        yomua_bot::application::message_acceptance::MessageAcceptanceService::new(
+            msg_repo.clone(),
+            bus.clone(),
+        ),
+    );
     let adapter: Arc<dyn yomua_bot::adapters::onebot::OneBotAdapter> =
         Arc::new(OneBotAdapterImpl::with_connector(
             OneBotConfig {
@@ -486,12 +590,7 @@ async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
             },
             bus.clone(),
             conversation_manager,
-            Arc::new(
-                yomua_bot::application::message_acceptance::MessageAcceptanceService::new(
-                    msg_repo.clone(),
-                    bus.clone(),
-                ),
-            ),
+            acceptance_service.clone(),
             binding_manager.clone(),
             held_connector,
         ));
@@ -511,7 +610,7 @@ async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
     let evaluator: Arc<dyn DecisionEvaluator> = behavior_engine.clone();
     let trigger: Arc<dyn LlmAssistanceTrigger> = Arc::new(NoOpTrigger);
     let decision_orchestrator = DecisionOrchestrator::new(evaluator, trigger, None);
-    let reply_processor = Arc::new(ReplyProcessor::new(
+    let mut reply_processor = ReplyProcessor::new(
         runtime,
         binding_manager,
         decision_orchestrator,
@@ -521,10 +620,14 @@ async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
         memory_service,
         action_dispatcher,
         bus,
-        Arc::new(ZeroDelay),
+        delay_executor,
         part_repo,
         None, // None = fallback to first character participant
-    ));
+    );
+    if persist_reply_tasks {
+        reply_processor = reply_processor.with_message_repository(msg_repo.clone());
+    }
+    let reply_processor = Arc::new(reply_processor);
 
     Ok(AlphaHarness {
         _temp_dir: temp_dir,
@@ -537,6 +640,7 @@ async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
         llm_provider,
         sent_transport,
         reply_processor,
+        acceptance_service,
         _adapter: adapter,
     })
 }
@@ -1242,4 +1346,146 @@ async fn p1_2_cold_start_behavior() {
     // Cold start 应该产生 LLM 调用和出站消息
     assert_eq!(llm_count, 1, "Cold start 首条消息应触发 LLM");
     assert_eq!(outbound_count, 1, "Cold start 应产生出站消息");
+}
+
+// ============================================================================
+// 测试：P2-1: 单会话积压压测（2 条/秒，持续 60 秒，Provider 延迟 3 秒）
+// ============================================================================
+
+#[tokio::test]
+async fn p2_1_single_conversation_backlog_measurement() {
+    let h = setup_with_options(
+        Duration::from_secs(3),
+        Arc::new(yomua_bot::application::reply_processor::TokioDelayExecutor),
+        true,
+        true,
+    )
+    .await
+    .expect("压测装配失败");
+    let msg_repo: Arc<dyn MessageRepository> =
+        Arc::new(SqliteMessageRepository::new(h.pool.clone()));
+    let processor = h.reply_processor.clone();
+    let mut jobs = Vec::with_capacity(120);
+
+    for index in 0..120 {
+        let timestamp = chrono::Utc::now();
+        let (message_id, _) = h
+            .acceptance_service
+            .accept_inbound(
+                h.conv_id,
+                h.user_participant_id,
+                format!("请处理第 {} 条消息", index + 1),
+                timestamp,
+                None,
+                h.char_a_id,
+                false,
+                serde_json::json!({}),
+            )
+            .await
+            .expect("压测消息入库失败");
+        let message = msg_repo
+            .find_by_id(message_id)
+            .await
+            .expect("读取压测消息失败")
+            .expect("压测消息不存在");
+        let content = match &message.content {
+            MessageContent::Text(text) => text.clone(),
+            _ => panic!("压测消息必须是文本"),
+        };
+        let event = MessageReceivedEvent {
+            conversation_id: h.conv_id,
+            sender_id: h.user_participant_id,
+            message_id,
+            content,
+            timestamp: message.timestamp,
+            is_mentioned: false,
+            character_id: h.char_a_id,
+            conversation_sequence: message.conversation_sequence.unwrap_or_default(),
+            platform_message_id: message.platform_message_id,
+            ingested_at: message.ingested_at.expect("压测消息缺少入库时间"),
+            metadata: message.metadata,
+        };
+        let processor = processor.clone();
+        jobs.push(tokio::spawn(async move {
+            processor.process_owned(&event, None).await
+        }));
+
+        if index < 119 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    for job in jobs {
+        job.await.expect("压测处理任务异常").expect("压测处理失败");
+    }
+
+    let status_rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT status, COUNT(*) FROM reply_tasks GROUP BY status ORDER BY status")
+            .fetch_all(&h.pool)
+            .await
+            .expect("读取压测状态失败");
+    let count_status = |wanted: &str| {
+        status_rows
+            .iter()
+            .find(|(status, _)| status == wanted)
+            .map(|(_, count)| *count)
+            .unwrap_or(0)
+    };
+    let sent = count_status("sent");
+    let ignored = count_status("ignored");
+    let expired = count_status("expired");
+    let measured: i64 = status_rows.iter().map(|(_, count)| *count).sum();
+    assert_eq!(
+        measured, 120,
+        "120 条入库消息都应有回复任务终态: {status_rows:?}"
+    );
+    assert_eq!(
+        sent + ignored + expired,
+        120,
+        "压测出现未覆盖状态: {status_rows:?}"
+    );
+
+    let sent_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT m.ingested_at, r.updated_at
+           FROM messages m
+           JOIN reply_tasks r ON r.message_id = m.id
+          WHERE r.status = 'sent'
+          ORDER BY m.id",
+    )
+    .fetch_all(&h.pool)
+    .await
+    .expect("读取压测发送时间失败");
+    assert!(!sent_rows.is_empty(), "压测至少应有一条发送成功记录");
+    let mut latencies_ms: Vec<i64> = sent_rows
+        .into_iter()
+        .map(|(ingested_at, sent_at)| {
+            let ingested_at = chrono::DateTime::parse_from_rfc3339(&ingested_at)
+                .expect("入库时间格式无效")
+                .with_timezone(&chrono::Utc);
+            let sent_at = chrono::DateTime::parse_from_rfc3339(&sent_at)
+                .expect("发送时间格式无效")
+                .with_timezone(&chrono::Utc);
+            (sent_at - ingested_at).num_milliseconds()
+        })
+        .collect();
+    latencies_ms.sort_unstable();
+    let percentile = |ratio: f64| {
+        let index = ((latencies_ms.len() as f64 * ratio).ceil() as usize)
+            .saturating_sub(1)
+            .min(latencies_ms.len() - 1);
+        latencies_ms[index]
+    };
+    let p50_ms = percentile(0.50);
+    let p95_ms = percentile(0.95);
+    let outbound_count = h.sent_transport.lock().unwrap().len();
+    println!(
+        "[P2-1] 入库=120, Sent={}, Ignored={}, Expired={}, Outbound={}, P50={}ms, P95={}ms, ProviderCalls={}",
+        sent,
+        ignored,
+        expired,
+        outbound_count,
+        p50_ms,
+        p95_ms,
+        h.llm_provider.call_count(),
+    );
 }

@@ -13,6 +13,7 @@
 | `cargo fmt --all -- --check` | 通过 | 当前工作树 |
 | `cargo clippy --locked --offline --all-targets --all-features -- -D warnings` | 通过 | 当前工作树，包含测试目标 |
 | `git diff --check` | 通过 | 当前差异无空白错误 |
+| 单会话积压压测（2 条/秒、持续 60 秒、Provider 延迟 3 秒） | 通过 | 120 条入库消息：Sent 27、Ignored 64、Expired 29；Sent 任务入库到发送延迟 P50 63,323 ms、P95 116,303 ms；仅使用隔离 SQLite 和假 OneBot/Provider |
 | 隔离配置启动、`status`、`shutdown --confirm` 进程演练 | 通过 | 本地假 OneBot 地址、临时数据目录；进程零退出，控制 socket 清理，无真实 QQ/LLM |
 | Markdown 本地链接检查 | 通过 | README 与 `docs/*.md` 的相对链接 |
 | 控制协议分片、大响应、超时和错误退出码 | 通过 | 单元测试和真实 SQLite/Unix socket 控制集成测试 |
@@ -43,6 +44,7 @@
 - 用户合并会按显式来源和目标身份读取平台账号，不依赖数据库 ID 排序；状态控制中会话状态与心情写入使用同一 SQLite 事务，任一部分失败都会整体回滚。
 - 关系交互幂等表也已从 `participant_id` 迁移为 `user_id`；旧数据按参与者映射到全域用户，重复的同一来源消息只保留一条，避免跨会话重复累计熟悉度。
 - OneBot 当前把平台命名空间写为 `onebot_qq`，外部 QQ 号只作为该命名空间内的 ID；相同外部 ID 在不同平台会生成不同全域用户。关系服务的入口仍以会话 `participant_id` 定位，再由仓储映射到 `user_id`，这是内部适配边界，不是第二套用户身份。
+- 单会话积压压测已证实当前串行回复链路会产生过期任务：以每秒 2 条、持续 60 秒、Provider 延迟 3 秒发送 120 条群消息，最终 27 条 Sent、64 条 Ignored、29 条 Expired；Sent 任务入库到发送延迟 P50 为 63,323 ms、P95 为 116,303 ms。该数据只说明隔离假 Provider/OneBot 下的当前行为，不代表真实 QQ 或多会话部署验收；第二阶段改动需维护者同意后再进行。
 - 记忆表增加可空 `user_id`；写入链路显式传入全域身份，不再通过 metadata 中的 participant ID 隐式回查。上下文与记忆仓储的跨会话查询明确接收 `user_id`；无用户身份时只读取当前会话记忆。
 - 默认配置目录统一为启动目录下的 `config/`；首次启动逐份生成带占位说明的模板。根目录已有的本地配置不删除，继续使用时需显式传入 `--config-dir .`。
 - 主动发言的每日额度已写入 `behavior_states`，进程重启不会清空当日计数；默认冷却为 10 分钟、每日最多 10 次。
