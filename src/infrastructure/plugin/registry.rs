@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use crate::error::RuntimeError;
 use crate::infrastructure::plugin::protocol::{EventType, WireMessage};
 use crate::infrastructure::plugin::{PluginManifest, PluginPermission, PluginState};
+use crate::infrastructure::sync::lock_or_recover;
 
 /// 一条插件运行时记录。
 #[derive(Debug, Clone)]
@@ -45,7 +46,7 @@ impl PluginRegistry {
 
     /// 注册一个插件；同名插件拒绝注册并返回错误。
     pub fn register(&self, manifest: PluginManifest) -> Result<(), RuntimeError> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = lock_or_recover(&self.inner);
         if map.contains_key(&manifest.name) {
             return Err(RuntimeError::Plugin(format!(
                 "插件名冲突，无法注册：{}",
@@ -69,61 +70,59 @@ impl PluginRegistry {
 
     /// 更新插件生命周期状态。插件未注册时静默忽略。
     pub fn set_state(&self, name: &str, state: PluginState) {
-        if let Some(record) = self.inner.lock().unwrap().get_mut(name) {
+        if let Some(record) = lock_or_recover(&self.inner).get_mut(name) {
             record.state = state;
         }
     }
 
     /// 返回一个插件的运行时记录副本；未注册返回 `None`。
     pub fn get(&self, name: &str) -> Option<PluginRecord> {
-        self.inner.lock().unwrap().get(name).cloned()
+        lock_or_recover(&self.inner).get(name).cloned()
     }
 
     /// 返回全部插件的运行时记录副本。
     pub fn all(&self) -> Vec<PluginRecord> {
-        self.inner.lock().unwrap().values().cloned().collect()
+        lock_or_recover(&self.inner).values().cloned().collect()
     }
 
     /// 返回某个插件已被授予的权限；未注册返回 `None`。
     pub fn permissions_for(&self, name: &str) -> Option<Vec<PluginPermission>> {
-        self.inner
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.inner)
             .get(name)
             .map(|r| r.manifest.permissions.clone())
     }
 
     /// 设置插件进程 PID（`None` 表示未启动）。未注册时静默忽略。
     pub fn set_pid(&self, name: &str, pid: Option<u32>) {
-        if let Some(record) = self.inner.lock().unwrap().get_mut(name) {
+        if let Some(record) = lock_or_recover(&self.inner).get_mut(name) {
             record.pid = pid;
         }
     }
 
     /// 记录插件最近一次错误。未注册时静默忽略。
     pub fn set_last_error(&self, name: &str, last_error: Option<String>) {
-        if let Some(record) = self.inner.lock().unwrap().get_mut(name) {
+        if let Some(record) = lock_or_recover(&self.inner).get_mut(name) {
             record.last_error = last_error;
         }
     }
 
     /// 重启计数加一。未注册时静默忽略。
     pub fn record_restart(&self, name: &str) {
-        if let Some(record) = self.inner.lock().unwrap().get_mut(name) {
+        if let Some(record) = lock_or_recover(&self.inner).get_mut(name) {
             record.restart_count += 1;
         }
     }
 
     /// 清零重启计数。未注册时静默忽略。
     pub fn clear_restarts(&self, name: &str) {
-        if let Some(record) = self.inner.lock().unwrap().get_mut(name) {
+        if let Some(record) = lock_or_recover(&self.inner).get_mut(name) {
             record.restart_count = 0;
         }
     }
 
     /// 设置插件的订阅事件列表。未注册时静默忽略。
     pub fn set_subscriptions(&self, name: &str, subscriptions: Vec<EventType>) {
-        if let Some(record) = self.inner.lock().unwrap().get_mut(name) {
+        if let Some(record) = lock_or_recover(&self.inner).get_mut(name) {
             record.subscriptions = subscriptions;
         }
     }
@@ -157,7 +156,7 @@ impl PluginRegistry {
         name: &str,
         tx: mpsc::Sender<WireMessage>,
     ) -> Result<(), RuntimeError> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = lock_or_recover(&self.inner);
         let record = map
             .get_mut(name)
             .ok_or_else(|| RuntimeError::Plugin("插件未注册".to_string()))?;
@@ -176,14 +175,14 @@ impl PluginRegistry {
 
     /// 摘除插件的连接句柄（置 `None`）。状态由 supervisor 控制，本方法不动状态。
     pub fn clear_conn(&self, name: &str) {
-        if let Some(record) = self.inner.lock().unwrap().get_mut(name) {
+        if let Some(record) = lock_or_recover(&self.inner).get_mut(name) {
             record.conn = None;
         }
     }
 
     /// 只摘除本连接拥有的句柄，旧连接退出不能清除新连接。
     pub fn clear_conn_owned(&self, name: &str, owner: &mpsc::Sender<WireMessage>) -> bool {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = lock_or_recover(&self.inner);
         let Some(record) = map.get_mut(name) else {
             return false;
         };
@@ -202,7 +201,7 @@ impl PluginRegistry {
 
     /// 返回插件当前连接的写通道发送端；未连接返回 `None`。
     pub fn connected_plugin(&self, name: &str) -> Option<mpsc::Sender<WireMessage>> {
-        self.inner.lock().unwrap().get(name)?.conn.clone()
+        lock_or_recover(&self.inner).get(name)?.conn.clone()
     }
 
     /// 声明式状态迁移辅助 —— 仅当插件当前处于 `expected_from` 时迁移到 `to`。
@@ -215,7 +214,7 @@ impl PluginRegistry {
         expected_from: PluginState,
         to: PluginState,
     ) -> Result<(), RuntimeError> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = lock_or_recover(&self.inner);
         let record = map
             .get_mut(name)
             .ok_or_else(|| RuntimeError::Plugin("插件未注册".to_string()))?;
@@ -265,6 +264,19 @@ mod tests {
         assert!(record.subscriptions.is_empty());
 
         assert!(registry.get("stranger").is_none(), "未注册插件应查不到");
+    }
+
+    #[test]
+    fn poisoned_mutex_is_recovered() {
+        let registry = std::sync::Arc::new(PluginRegistry::new());
+        let poisoned = std::sync::Arc::clone(&registry);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.inner.lock().unwrap();
+            panic!("测试锁中毒");
+        })
+        .join();
+        registry.register(manifest("after-poison", vec![])).unwrap();
+        assert!(registry.get("after-poison").is_some());
     }
 
     #[test]

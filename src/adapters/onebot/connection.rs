@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use serde_json;
 
 use crate::error::RuntimeError;
+use crate::infrastructure::sync::lock_or_recover;
 
 use super::{OneBotConfig, OneBotConnectionState};
 use crate::application::event_bus::EventBus;
@@ -168,7 +169,7 @@ impl ConnectionShared {
             action: action.clone(),
             response_tx,
         };
-        self.pending.lock().unwrap().insert(id, request);
+        lock_or_recover(&self.pending).insert(id, request);
         tracing::debug!(target: "adapter", id, action, "pending request registered");
         (id, response_rx)
     }
@@ -177,7 +178,7 @@ impl ConnectionShared {
     ///
     /// 如果请求已超时被清理，返回 false。
     pub fn complete_request(&self, id: u64, response: ActionResponse) -> bool {
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = lock_or_recover(&self.pending);
         let Some(req) = pending.get(&id) else {
             tracing::warn!(target: "adapter", id, "response received for unknown or timed-out request");
             return false;
@@ -195,7 +196,10 @@ impl ConnectionShared {
             );
             return false;
         }
-        let req = pending.remove(&id).expect("pending 请求刚刚确认存在");
+        let Some(req) = pending.remove(&id) else {
+            tracing::error!(target: "adapter", id, "pending 请求在确认后消失");
+            return false;
+        };
         drop(pending);
         {
             // 通知已等待的调用方。
@@ -212,7 +216,7 @@ impl ConnectionShared {
     pub fn cleanup_timed_out_requests(&self) -> usize {
         // 当前实现中，超时由调用方的 oneshot 超时处理。
         // 此方法用于在连接断开时清空所有 pending 请求。
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = lock_or_recover(&self.pending);
         let count = pending.len();
         // Draining the HashMap to take ownership of the values.
         let requests: Vec<_> = pending.drain().map(|(_, v)| v).collect();
@@ -790,7 +794,7 @@ mod tests {
                 wording: None,
             }
         ));
-        assert_eq!(shared.pending.lock().unwrap().len(), 1);
+        assert_eq!(lock_or_recover(&shared.pending).len(), 1);
 
         assert!(shared.complete_request(
             id,
@@ -806,7 +810,7 @@ mod tests {
             }
         ));
         assert!(response_rx.try_recv().is_ok());
-        assert!(shared.pending.lock().unwrap().is_empty());
+        assert!(lock_or_recover(&shared.pending).is_empty());
     }
 
     // ------------------------------------------------------------------
@@ -847,8 +851,8 @@ mod tests {
             &self,
             _config: &OneBotConfig,
         ) -> Result<Box<dyn WsTransport>, RuntimeError> {
-            *self.attempts.lock().unwrap() += 1;
-            let next = self.script.lock().unwrap().pop_front();
+            *lock_or_recover(&self.attempts) += 1;
+            let next = lock_or_recover(&self.script).pop_front();
             match next {
                 Some(Script::Fail) => Err(RuntimeError::Adapter("连接失败（脚本）".to_string())),
                 Some(Script::Messages(msgs)) => Ok(Box::new(FakeTransport {
@@ -997,9 +1001,9 @@ mod tests {
             "应至少完成两次重连, 实际: {connected_count}"
         );
         assert!(
-            *attempts.lock().unwrap() >= 3,
+            *lock_or_recover(&attempts) >= 3,
             "连接尝试次数应不少于 3, 实际: {}",
-            *attempts.lock().unwrap()
+            *lock_or_recover(&attempts)
         );
 
         shutdown_tx.send(true).unwrap();
@@ -1056,13 +1060,13 @@ mod tests {
 
         // 第二条连接成功（重连）应发生。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while *attempts.lock().unwrap() < 2 && std::time::Instant::now() < deadline {
+        while *lock_or_recover(&attempts) < 2 && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(
-            *attempts.lock().unwrap() >= 2,
+            *lock_or_recover(&attempts) >= 2,
             "应发生至少一次重连, 实际: {}",
-            *attempts.lock().unwrap()
+            *lock_or_recover(&attempts)
         );
 
         shutdown_tx.send(true).unwrap();

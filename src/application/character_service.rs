@@ -148,7 +148,7 @@ impl CharacterService {
             ("characters", "id"),
         ];
 
-        // 执行所有 ID 重写
+        // 标识符必须来自常量表；值仍通过参数绑定传入。
         for (tbl, col) in tables.iter() {
             let q = format!("UPDATE {} SET {} = ? WHERE {} = ?", tbl, col, col);
             let update_result = sqlx::query(&q)

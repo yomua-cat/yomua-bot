@@ -32,6 +32,7 @@ use crate::infrastructure::plugin::protocol::WireMessage;
 use crate::infrastructure::plugin::registry::PluginRegistry;
 use crate::infrastructure::plugin::transport::UdsServer;
 use crate::infrastructure::plugin::{PluginHost, PluginInfo, PluginManifest, PluginState};
+use crate::infrastructure::sync::lock_or_recover;
 
 /// 监督器配置。
 #[derive(Debug, Clone)]
@@ -186,7 +187,7 @@ impl PluginSupervisor {
             .registry
             .get(name)
             .ok_or_else(|| RuntimeError::Plugin("插件未注册".to_string()))?;
-        self.core.stopping.lock().unwrap().insert(name.to_string());
+        lock_or_recover(&self.core.stopping).insert(name.to_string());
         // 立即置 Stopped：各失败归口（重启决策 / 崩溃判定 / spawn 检查）
         // 都据此识别停止意图，不会再把插件置为 Crashed 或重新拉起。
         self.core.registry.set_state(name, PluginState::Stopped);
@@ -201,7 +202,7 @@ impl PluginSupervisor {
 
         // 通知 monitor 终止子进程，并等待其完成清理（限时兜底）。
         // done 的等待器先注册再 notify，避免 monitor 快速完成时丢失唤醒。
-        let handle = self.core.handles.lock().unwrap().get(name).cloned();
+        let handle = lock_or_recover(&self.core.handles).get(name).cloned();
         if let Some(handle) = handle {
             let done_fut = handle.done.notified();
             handle.stop_request.notify_waiters();
@@ -338,7 +339,7 @@ impl PluginSupervisor {
 ///
 /// 首次启动与崩溃重启共用：`run_plugin_loop` 内部还会在预算内自行重启。
 fn spawn_one(core: &Core, plugin: &PluginManifest) {
-    let mut tasks = core.tasks.lock().unwrap();
+    let mut tasks = lock_or_recover(&core.tasks);
     if tasks
         .get(&plugin.name)
         .is_some_and(|task| !task.is_finished())
@@ -346,7 +347,7 @@ fn spawn_one(core: &Core, plugin: &PluginManifest) {
         tracing::warn!(plugin = %plugin.name, "插件生命周期已在运行，忽略重复启动");
         return;
     }
-    core.stopping.lock().unwrap().remove(&plugin.name);
+    lock_or_recover(&core.stopping).remove(&plugin.name);
     tasks.insert(
         plugin.name.clone(),
         tokio::spawn(run_plugin_loop(core.clone(), plugin.clone())),
@@ -363,13 +364,13 @@ struct StoppingGuard {
 
 impl Drop for StoppingGuard {
     fn drop(&mut self) {
-        self.core.stopping.lock().unwrap().remove(&self.name);
+        lock_or_recover(&self.core.stopping).remove(&self.name);
     }
 }
 
 impl Core {
     fn is_stopping_now(&self, name: &str) -> bool {
-        self.stopping.lock().unwrap().contains(name)
+        lock_or_recover(&self.stopping).contains(name)
     }
 }
 
@@ -855,7 +856,7 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
 
 /// 实例结束/失败时移除句柄（防止 stop() 与已结束的 monitor 挂钩）。
 fn drop_handle(core: &Core, name: &str) {
-    core.handles.lock().unwrap().remove(name);
+    lock_or_recover(&core.handles).remove(name);
 }
 
 // ---------------------------------------------------------------------------
@@ -1223,7 +1224,7 @@ mod tests {
     async fn wait_attach_count(count: &Arc<std::sync::Mutex<u32>>, target: u32) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let now = *count.lock().unwrap();
+            let now = *lock_or_recover(count);
             if now >= target {
                 return;
             }
@@ -1279,7 +1280,7 @@ mod tests {
                     if held.is_none() {
                         // 理论上 attach 成功才有 Running，此时 held 已设；异常丢失则补连。
                         if let Some(stream) = try_handshake(&socket, &name).await {
-                            *attach_count.lock().unwrap() += 1;
+                            *lock_or_recover(&attach_count) += 1;
                             held = Some(stream);
                         } else {
                             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1292,7 +1293,7 @@ mod tests {
                     if held.is_none() {
                         // 实例就绪：握手完成本轮 attach（首轮与崩溃重启都由此进入）。
                         if let Some(stream) = try_handshake(&socket, &name).await {
-                            *attach_count.lock().unwrap() += 1;
+                            *lock_or_recover(&attach_count) += 1;
                             held = Some(stream);
                         } else {
                             tokio::time::sleep(Duration::from_millis(20)).await;

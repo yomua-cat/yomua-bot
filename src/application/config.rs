@@ -9,6 +9,7 @@
 
 use chrono::FixedOffset;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 
 use crate::adapters::onebot::OneBotConfig;
 use crate::error::RuntimeError;
@@ -111,7 +112,7 @@ pub fn parse_timezone_offset(value: &str) -> Result<FixedOffset, String> {
 }
 
 /// 单个 LLM Provider 的配置。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct LlmProviderConfig {
     /// Provider 类型："openai-compatible" 或 TypeSafe 的 "typesafe"。
     pub provider_type: String,
@@ -128,6 +129,19 @@ pub struct LlmProviderConfig {
 
     /// 超时时间（秒）。
     pub timeout_secs: Option<u64>,
+}
+
+impl fmt::Debug for LlmProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LlmProviderConfig")
+            .field("provider_type", &self.provider_type)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("embedding_model", &self.embedding_model)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 fn validate_proxy(proxy: Option<&str>) -> Result<(), String> {
@@ -1275,6 +1289,23 @@ model_instance = "conversation"
         assert_eq!(cfg.max_reconnect_interval_secs, 30);
         assert_eq!(cfg.heartbeat_interval_secs, 20);
         assert_eq!(cfg.action_timeout_secs, 10);
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("token123"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn llm_provider_debug_redacts_api_key() {
+        let cfg: LlmProviderConfig = toml::from_str(
+            r#"provider_type = "openai-compatible"
+base_url = "https://example.invalid/v1"
+api_key = "secret-key"
+"#,
+        )
+        .unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("secret-key"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

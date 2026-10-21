@@ -19,6 +19,7 @@ use tokio::time::timeout as tokio_timeout;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::application::binding::BindingManager;
@@ -43,7 +44,7 @@ const MAX_INBOUND_RETRIES: usize = 3;
 const INBOUND_RETRY_BASE_DELAY_MS: u64 = 100;
 
 /// OneBot 适配器配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OneBotConfig {
     /// WebSocket URL（例如 "ws://127.0.0.1:3001"）。
@@ -66,6 +67,27 @@ pub struct OneBotConfig {
 
     /// Action 请求超时秒数。超时后 pending 请求被清理，调用方收到超时错误。
     pub action_timeout_secs: u64,
+}
+
+impl fmt::Debug for OneBotConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OneBotConfig")
+            .field("websocket_url", &self.websocket_url)
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("bot_self_id", &self.bot_self_id)
+            .field("reconnect_interval_secs", &self.reconnect_interval_secs)
+            .field(
+                "max_reconnect_interval_secs",
+                &self.max_reconnect_interval_secs,
+            )
+            .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .field("action_timeout_secs", &self.action_timeout_secs)
+            .finish()
+    }
 }
 
 impl Default for OneBotConfig {

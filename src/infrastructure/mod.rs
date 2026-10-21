@@ -7,3 +7,4 @@ pub mod character_card;
 pub mod llm;
 pub mod plugin;
 pub mod storage;
+pub mod sync;

@@ -2996,9 +2996,16 @@ async fn run_control_server(
 ) -> Result<(), RuntimeError> {
     // 确保 socket 目录存在。
     if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            RuntimeError::Internal(format!("无法创建 socket 目录 {}: {e}", parent.display()))
-        })?;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(|e| {
+                RuntimeError::Internal(format!("无法创建 socket 目录 {}: {e}", parent.display()))
+            })?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| RuntimeError::Internal(format!("设置控制 socket 目录权限失败：{e}")))?;
     }
 
     prepare_socket_path(&socket_path).await?;

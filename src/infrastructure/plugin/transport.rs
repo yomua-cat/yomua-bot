@@ -60,6 +60,19 @@ impl UdsServer {
         registry: Arc<PluginRegistry>,
         api: Arc<PluginApi>,
     ) -> Result<Self, RuntimeError> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        if let Some(parent) = socket_path.parent() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|error| {
+                    RuntimeError::Plugin(format!("创建插件 socket 目录失败：{error}"))
+                })?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |error| RuntimeError::Plugin(format!("设置插件 socket 目录权限失败：{error}")),
+            )?;
+        }
         // 路径过长防护（macOS sun_path 约 104 字节）。
         let path_bytes = socket_path.as_os_str().as_encoded_bytes().len();
         if path_bytes > MAX_SOCKET_PATH_BYTES {
@@ -70,7 +83,7 @@ impl UdsServer {
                 socket_path.display()
             )));
         }
-        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        use std::os::unix::fs::FileTypeExt;
         if let Ok(metadata) = std::fs::symlink_metadata(socket_path) {
             if !metadata.file_type().is_socket() {
                 return Err(RuntimeError::Plugin(
@@ -929,6 +942,33 @@ mod tests {
             socket_path,
             _task: task,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "Unix socket 权限测试按约定单独运行"]
+    async fn socket_and_parent_directory_permissions_are_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("sockets");
+        let socket_path = socket_dir.join("echo.sock");
+        let registry = plugin_registry(&[("echo", vec![])]);
+        let api = Arc::new(build_api(Arc::clone(&registry)).await);
+        let server = UdsServer::bind(&socket_path, "echo".to_string(), registry, api)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&socket_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(server);
     }
 
     /// 在给定 socket 上完成一次握手并返回流。
