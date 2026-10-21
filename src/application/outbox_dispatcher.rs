@@ -33,8 +33,10 @@ const MAX_RETRY_ATTEMPTS: i64 = 3;
 
 /// 重试退避基数（秒）。实际退避时间 = BASE * 2^attempts。
 const RETRY_BACKOFF_BASE_SECS: i64 = 2;
-const LLM_MAX_RETRY_ATTEMPTS: i64 = 5;
-const LLM_RETRY_BACKOFF_BASE_SECS: i64 = 8;
+/// LLM 总处理尝试次数。第一次失败后的退避从 attempts=1 开始。
+const LLM_MAX_RETRY_ATTEMPTS: i64 = 4;
+/// LLM 重试退避基数（秒）；默认累计退避为 8+16+32 秒。
+const LLM_RETRY_BACKOFF_BASE_SECS: i64 = 4;
 const MAX_RETRY_AFTER_SECS: i64 = 120;
 
 /// Outbox 调度器配置。
@@ -654,6 +656,9 @@ mod tests {
     use crate::domain::repository::OutboxRepository;
     use chrono::Utc;
 
+    /// 为典型生成耗时保留的事件有效期安全余量（秒）。
+    const LLM_RETRY_SAFETY_MARGIN_SECS: i64 = 30;
+
     fn test_event(event_uuid: &str) -> OutboxEvent {
         let now = Utc::now();
         OutboxEvent {
@@ -690,6 +695,25 @@ mod tests {
         assert_eq!(
             config.processing_timeout_secs,
             DEFAULT_EVENT_PROCESSING_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn default_llm_backoff_stays_before_event_expiry_with_safety_margin() {
+        let config = OutboxDispatcherConfig::default();
+        let cumulative_before_final_attempt: i64 = (1..config.llm_max_retry_attempts)
+            .map(|attempt| {
+                config
+                    .llm_backoff_base_secs
+                    .saturating_mul(1_i64.checked_shl(attempt as u32).unwrap_or(i64::MAX))
+            })
+            .sum();
+        assert_eq!(cumulative_before_final_attempt, 56);
+        assert!(
+            cumulative_before_final_attempt
+                < crate::application::reply_processor::EVENT_EXPIRY_SECS
+                    - LLM_RETRY_SAFETY_MARGIN_SECS,
+            "累计退避必须在事件过期前保留安全余量"
         );
     }
 
