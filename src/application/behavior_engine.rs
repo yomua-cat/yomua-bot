@@ -1127,6 +1127,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mention_only_unmentioned_messages_do_not_consume_rate_limit() {
+        let mut configured = binding(10, ReplyMode::MentionOnly);
+        configured.response_rate_limit.per_user_per_minute = Some(1);
+        configured.response_rate_limit.per_session_per_hour = Some(10);
+        let clock = Arc::new(FakeClock::new());
+        let (engine, _) = build_engine(vec![configured], None, None, None, clock);
+
+        for message in ["第一条未提及", "第二条未提及"] {
+            let decision = engine
+                .decide_response(1, 10, message, false, Some(7))
+                .await
+                .unwrap();
+            assert_eq!(decision.action, BehaviorAction::Ignore);
+            assert_eq!(decision.reason, "MentionOnly 模式且未被提及，忽略");
+        }
+
+        let mentioned = engine
+            .decide_response(1, 10, "@角色 请回复", true, Some(7))
+            .await
+            .unwrap();
+        assert_eq!(mentioned.action, BehaviorAction::Reply);
+    }
+
+    #[tokio::test]
     async fn occasionally_mentions_always_replies() {
         let (engine, _) = engine_with(vec![binding(10, ReplyMode::Occasionally)], None, None).await;
         let d = engine
