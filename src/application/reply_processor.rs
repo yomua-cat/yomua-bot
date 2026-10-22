@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::domain::message::ReplyTaskStatus;
 use chrono::Utc;
@@ -201,7 +202,7 @@ impl ReplyProcessor {
                 .collect();
             let mut additional_messages = Vec::new();
             for message in batch {
-                self.mark_task_ignored_if_pending(message.id, event.character_id)
+                self.mark_task_ignored_if_pending(message.id, event.character_id, "batch_merge")
                     .await?;
                 if let crate::domain::message::MessageContent::Text(text) = &message.content {
                     combined.push(text.clone());
@@ -237,7 +238,7 @@ impl ReplyProcessor {
                     combined.push(text.trim().to_string());
                 }
             }
-            self.mark_task_ignored_if_pending(message.id, event.character_id)
+            self.mark_task_ignored_if_pending(message.id, event.character_id, "batch_merge")
                 .await?;
             additional_messages.push(message.clone());
         }
@@ -265,9 +266,10 @@ impl ReplyProcessor {
         &self,
         message_id: i64,
         character_id: i64,
+        reason: &str,
     ) -> Result<(), RuntimeError> {
         if let Some(repo) = &self.message_repo {
-            repo.mark_reply_task_ignored_if_pending(message_id, character_id)
+            repo.mark_reply_task_ignored_if_pending_with_reason(message_id, character_id, reason)
                 .await?;
         }
         Ok(())
@@ -887,12 +889,14 @@ impl ReplyProcessor {
         event: &MessageReceivedEvent,
         lease: Option<&str>,
     ) -> Result<(), RuntimeError> {
+        let processing_started = Instant::now();
         // 整个处理期间持有会话 fencing 门闩。会话删除必须等待当前任务结束，
         // 这样删除提交后不会再有关系、记忆或发送副作用落入已删除会话。
         let _conversation_gate = self
             .binding_manager
             .acquire_conversation_lock(event.conversation_id)
             .await;
+        let lock_wait_ms = processing_started.elapsed().as_millis() as u64;
         // 会话或消息可能已在 Outbox 领取后被删除。此时事件已经失效，
         // 必须在任何关系、记忆或模型调用前直接确认，避免删除后的副作用。
         if let Some(repo) = &self.message_repo {
@@ -1033,8 +1037,14 @@ impl ReplyProcessor {
                     reason: "MentionOnly 模式且未被提及，忽略".to_string(),
                     timestamp: Utc::now(),
                 }));
-            self.save_task_owned(event, lease, ReplyTaskStatus::Ignored, None)
-                .await?;
+            self.save_task_error_owned(
+                event,
+                lease,
+                ReplyTaskStatus::Ignored,
+                None,
+                "rule_ignore_mention_only",
+            )
+            .await?;
             return Ok(());
         }
         if stored.as_ref().is_some_and(|task| {
@@ -1121,8 +1131,11 @@ impl ReplyProcessor {
             }
         }
         self.ensure_event_still_owned(event, lease).await?;
+        let batch_started = Instant::now();
         let frozen_batch = self.freeze_batch(event).await?;
+        let batch_wait_ms = batch_started.elapsed().as_millis() as u64;
         self.persist_frozen_batch(event, &frozen_batch).await?;
+        let memory_started = Instant::now();
         for message in &frozen_batch.additional_messages {
             self.ensure_event_still_owned(event, lease).await?;
             let stable_user_key = message
@@ -1159,7 +1172,9 @@ impl ReplyProcessor {
                 Err(error) => return Err(RuntimeError::Repository(error)),
             }
         }
+        let memory_write_ms = memory_started.elapsed().as_millis() as u64;
         let batch_content = frozen_batch.content;
+        let decision_started = Instant::now();
         let decision = self
             .decision_orchestrator
             .evaluate_response(
@@ -1170,6 +1185,7 @@ impl ReplyProcessor {
                 Some(relationship_participant_id),
             )
             .await?;
+        let decision_ms = decision_started.elapsed().as_millis() as u64;
         self.ensure_event_still_owned(event, lease).await?;
         self.event_bus
             .publish(&CoreEvent::BehaviorDecided(BehaviorDecidedEvent {
@@ -1180,8 +1196,14 @@ impl ReplyProcessor {
                 timestamp: Utc::now(),
             }));
         if decision.action != BehaviorAction::Reply {
-            self.save_task_owned(event, lease, ReplyTaskStatus::Ignored, None)
-                .await?;
+            self.save_task_error_owned(
+                event,
+                lease,
+                ReplyTaskStatus::Ignored,
+                None,
+                "decision_ignore",
+            )
+            .await?;
             return Ok(());
         }
         if !self.cognition.enabled()
@@ -1195,11 +1217,18 @@ impl ReplyProcessor {
                 conversation_id = event.conversation_id,
                 "未配置对话模型，保留原始消息并跳过生成"
             );
-            self.save_task_owned(event, lease, ReplyTaskStatus::Ignored, None)
-                .await?;
+            self.save_task_error_owned(
+                event,
+                lease,
+                ReplyTaskStatus::Ignored,
+                None,
+                "rule_ignore_no_model",
+            )
+            .await?;
             return Ok(());
         }
         // 即时消息不做猜测式关系、情绪和记忆修改；后台批处理记录来源。
+        let mut generation_ms = None;
         let content = if let Some(content) = stored
             .as_ref()
             .filter(|task| task.status.can_reuse_content())
@@ -1228,6 +1257,7 @@ impl ReplyProcessor {
                 self.save_task(event, ReplyTaskStatus::Generating, None)
                     .await?;
             }
+            let generation_started = Instant::now();
             let content = match self
                 .generate_reply(
                     event,
@@ -1254,6 +1284,7 @@ impl ReplyProcessor {
                     return Err(error);
                 }
             };
+            generation_ms = Some(generation_started.elapsed().as_millis() as u64);
             self.ensure_event_still_owned(event, lease).await?;
             if Self::event_expired(event) {
                 self.save_task_owned(event, lease, ReplyTaskStatus::Expired, Some(&content))
@@ -1310,12 +1341,26 @@ impl ReplyProcessor {
             self.save_task(event, ReplyTaskStatus::Sending, None)
                 .await?;
         }
+        let send_started = Instant::now();
         match self
             .action_dispatcher
             .execute_send_message_with_response(event.conversation_id, &content)
             .await
         {
             Ok(response) if response.is_ok() => {
+                let send_ms = send_started.elapsed().as_millis() as u64;
+                tracing::debug!(
+                    target: "reply_pipeline",
+                    conversation_id = event.conversation_id,
+                    message_id = event.message_id,
+                    lock_wait_ms,
+                    batch_wait_ms,
+                    memory_write_ms,
+                    decision_ms,
+                    generation_ms = ?generation_ms,
+                    send_ms,
+                    "回复处理阶段耗时"
+                );
                 let platform_message_id = response
                     .data
                     .as_ref()

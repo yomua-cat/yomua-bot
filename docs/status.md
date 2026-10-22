@@ -2,7 +2,7 @@
 
 本文记录截至 **2026-10-20** 的当前源码证据。项目仍处于开发中；自动化测试通过不等于真实 QQ、外部模型或长期运行已经验收。
 
-本轮加固（2026-10-21）新增 2 个普通回归测试和 1 个 ignored Unix socket 权限测试；串行全目标验证实际为库 543 个通过、16 个忽略，主程序 5 个、ctl 39 个、alpha 集成 9 个、控制集成 84 个通过。
+本轮加固（2026-10-21）新增候选审核注入防护、隐私说明、完整 Outbox 压测和阶段耗时观测；串行全目标验证实际为库 553 个通过、16 个忽略，主程序 5 个、ctl 39 个、alpha 集成 8 个通过、1 个压测忽略，控制集成 84 个通过。
 
 ## 已验证
 
@@ -78,6 +78,10 @@
 ## 尚未证明
 
 - 单会话积压压测 `p2_1_single_conversation_backlog_measurement` 与生产装配一致（SQLite WAL、5 秒 `busy_timeout`、5 个连接），但耗时约 1–3 分钟且曾出现并发写入锁竞争，因此标记为 ignored，不作为常规全目标测试的必过项。需要手动测量时运行：`cargo test --locked --test alpha_e2e_test p2_1_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1`；GitHub Actions 通过 `workflow_dispatch` 触发同一命令。
+
+- 完整 Outbox 压测 `p3_1_outbox_single_conversation_backlog_measurement` 已标记为 ignored，手动运行命令为：`cargo test --locked --test alpha_e2e_test p3_1_outbox_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1`。本机一次实测使用每秒 2 条、持续 60 秒、Provider 延迟 3 秒、隔离 SQLite 和假 OneBot：入库 120、Sent 24、Ignored 58、Expired 38、ProviderCalls 29；Ignored 原因全部为 `batch_merge=58`；Sent 延迟 P50 63,062 ms、P95 114,589 ms。该数据只代表本机一次完整 Outbox 链路测量，不代表真实 QQ 或长期运行验收。
+
+- 回复链路在 `reply_pipeline` tracing target 记录结构化阶段耗时字段：`lock_wait_ms`、`batch_wait_ms`、`memory_write_ms`、`decision_ms`、`generation_ms`、`send_ms`。这些字段用于压测日志汇总，当前尚未把日志自动聚合成持久化指标。
 
 - 2026-10-20 已用唯一好友完成真实 QQ → NapCat → 入库 → Outbox → OneBot 发送验证，QQ 窗口确认显示回复“测试收到2。”。MiniMax `M2-her` 曾返回 `400 invalid params, group chat not supported (2013)`，任务正确进入 `failed` 且只尝试一次；直接构造的最小请求返回 200，但使用应用净化历史重放仍返回同一错误，具体触发条件仍未证明。随后切换到 Zhipu `glm-4.7-flash`，前两次 429 后第三次成功，数据库记录发送成功并保存平台消息 ID `1320729054`。该次是真实单好友场景验证，不代表并发、持续运行或极端积压已验收。
 - 插件 Unix socket 测试在普通测试命令中按 `#[ignore]` 标记；本机显式运行 16 个测试全部通过，CI 必过矩阵配置为单独执行这些 ignored 测试。

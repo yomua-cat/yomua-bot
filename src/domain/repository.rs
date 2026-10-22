@@ -523,6 +523,29 @@ pub trait MessageRepository: Send + Sync {
         .map(|_| true)
     }
 
+    /// 只在待处理任务仍存在时记录忽略原因，供积压观测使用。
+    async fn mark_reply_task_ignored_if_pending_with_reason(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        reason: &str,
+    ) -> Result<bool, RepositoryError> {
+        let changed = self
+            .mark_reply_task_ignored_if_pending(message_id, character_id)
+            .await?;
+        if changed {
+            self.save_reply_task_error(
+                message_id,
+                character_id,
+                crate::domain::message::ReplyTaskStatus::Ignored,
+                None,
+                Some(reason),
+            )
+            .await?;
+        }
+        Ok(changed)
+    }
+
     /// 原子地领取一个尚未开始处理的回复任务。
     /// 返回 `false` 表示任务已经被其它处理器领取或进入终态。
     async fn claim_reply_task_for_generation(

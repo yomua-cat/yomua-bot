@@ -20,6 +20,7 @@ use yomua_bot::application::behavior_engine::RuleBehaviorEngine;
 use yomua_bot::application::binding::BindingManager;
 use yomua_bot::application::character_history::RepositoryCharacterHistoryProvider;
 use yomua_bot::application::cognition::CognitionLayer;
+use yomua_bot::application::command::CommandHandler;
 use yomua_bot::application::config::load_llm;
 use yomua_bot::application::context::ContextBuilder;
 use yomua_bot::application::context_assembler::{
@@ -35,6 +36,8 @@ use yomua_bot::application::llm_scheduler::{
 };
 use yomua_bot::application::memory_service::MemoryService;
 use yomua_bot::application::mood_service::MoodService;
+use yomua_bot::application::outbox_dispatcher::{OutboxDispatcher, OutboxDispatcherConfig};
+use yomua_bot::application::outbox_processor::OutboxProcessor;
 use yomua_bot::application::relationship_service::RelationshipService;
 use yomua_bot::application::reply_processor::{DelayExecutor, ReplyProcessor};
 use yomua_bot::application::runtime::CharacterRuntime;
@@ -61,7 +64,8 @@ use yomua_bot::infrastructure::storage::repository::{
     SqliteBehaviorStateRepository, SqliteCharacterBindingRepository, SqliteCharacterRepository,
     SqliteCharacterStateRepository, SqliteConversationRepository,
     SqliteConversationStateRepository, SqliteMemoryRepository, SqliteMessageRepository,
-    SqliteMoodRepository, SqliteParticipantRepository, SqliteRelationshipRepository,
+    SqliteMoodRepository, SqliteOutboxRepository, SqliteParticipantRepository,
+    SqliteRelationshipRepository,
 };
 use yomua_bot::infrastructure::storage::SqliteStorage;
 
@@ -320,6 +324,8 @@ struct AlphaHarness {
     llm_provider: Arc<MockLlmProvider>,
     sent_transport: Arc<Mutex<Vec<String>>>,
     reply_processor: Arc<ReplyProcessor>,
+    binding_manager: Arc<BindingManager>,
+    outbox_repo: Arc<SqliteOutboxRepository>,
     acceptance_service: Arc<yomua_bot::application::message_acceptance::MessageAcceptanceService>,
     /// 保存 adapter 以便在测试结束后调用 stop()
     _adapter: Arc<dyn yomua_bot::adapters::onebot::OneBotAdapter>,
@@ -612,7 +618,7 @@ async fn setup_with_options(
     let decision_orchestrator = DecisionOrchestrator::new(evaluator, trigger, None);
     let mut reply_processor = ReplyProcessor::new(
         runtime,
-        binding_manager,
+        binding_manager.clone(),
         decision_orchestrator,
         cognition,
         relationship_service,
@@ -628,6 +634,7 @@ async fn setup_with_options(
         reply_processor = reply_processor.with_message_repository(msg_repo.clone());
     }
     let reply_processor = Arc::new(reply_processor);
+    let outbox_repo = Arc::new(SqliteOutboxRepository::new(pool.clone()));
 
     Ok(AlphaHarness {
         _temp_dir: temp_dir,
@@ -640,6 +647,8 @@ async fn setup_with_options(
         llm_provider,
         sent_transport,
         reply_processor,
+        binding_manager,
+        outbox_repo,
         acceptance_service,
         _adapter: adapter,
     })
@@ -1489,4 +1498,146 @@ async fn p2_1_single_conversation_backlog_measurement() {
         p95_ms,
         h.llm_provider.call_count(),
     );
+}
+
+// ============================================================================
+// 测试：P3-1: 完整 Outbox 链路积压测量
+// ============================================================================
+
+#[tokio::test]
+#[ignore = "耗时 1-3 分钟，仅用于手动测量完整 Outbox 链路"]
+async fn p3_1_outbox_single_conversation_backlog_measurement() {
+    let h = setup_with_options(
+        Duration::from_secs(3),
+        Arc::new(yomua_bot::application::reply_processor::TokioDelayExecutor),
+        true,
+        true,
+    )
+    .await
+    .expect("压测装配失败");
+    let command_handler = Arc::new(CommandHandler::new(
+        h.binding_manager.clone(),
+        Arc::new(
+            yomua_bot::infrastructure::storage::repository::SqliteCharacterRepository::new(
+                h.pool.clone(),
+            ),
+        ),
+        h.reply_processor.clone(),
+        None,
+    ));
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(32);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let dispatcher =
+        OutboxDispatcher::new(h.outbox_repo.clone(), OutboxDispatcherConfig::default());
+    let processor = OutboxProcessor::new(h.reply_processor.clone(), command_handler);
+    let dispatcher_shutdown = shutdown_rx.clone();
+    let processor_shutdown = shutdown_rx.clone();
+    let dispatcher_task = tokio::spawn(async move {
+        dispatcher.run(event_tx, dispatcher_shutdown).await;
+    });
+    let processor_task = tokio::spawn(async move {
+        processor.run(event_rx, processor_shutdown).await;
+    });
+
+    for index in 0..120 {
+        h.acceptance_service
+            .accept_inbound(
+                h.conv_id,
+                h.user_participant_id,
+                format!("请处理第 {} 条消息", index + 1),
+                chrono::Utc::now(),
+                None,
+                h.char_a_id,
+                false,
+                serde_json::json!({}),
+            )
+            .await
+            .expect("压测消息入库失败");
+        if index < 119 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+    loop {
+        let terminal: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reply_tasks WHERE status IN ('sent','ignored','expired','failed','cancelled')",
+        )
+        .fetch_one(&h.pool)
+        .await
+        .expect("读取压测状态失败");
+        if terminal == 120 || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let status_rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT status, COUNT(*) FROM reply_tasks GROUP BY status ORDER BY status")
+            .fetch_all(&h.pool)
+            .await
+            .expect("读取压测状态失败");
+    let count_status = |wanted: &str| {
+        status_rows
+            .iter()
+            .find(|(status, _)| status == wanted)
+            .map(|(_, count)| *count)
+            .unwrap_or(0)
+    };
+    let sent = count_status("sent");
+    let ignored = count_status("ignored");
+    let expired = count_status("expired");
+    let ignored_reasons: Vec<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT error, COUNT(*) FROM reply_tasks WHERE status='ignored' GROUP BY error ORDER BY error",
+    )
+    .fetch_all(&h.pool)
+    .await
+    .expect("读取忽略原因失败");
+    let sent_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT m.ingested_at, r.updated_at
+           FROM messages m
+           JOIN reply_tasks r ON r.message_id = m.id
+          WHERE r.status = 'sent'
+          ORDER BY m.id",
+    )
+    .fetch_all(&h.pool)
+    .await
+    .expect("读取压测发送时间失败");
+    assert_eq!(
+        sent + ignored + expired,
+        120,
+        "压测终态不完整: {status_rows:?}"
+    );
+    assert!(!sent_rows.is_empty(), "完整链路至少应有一条发送成功记录");
+    let mut latencies_ms: Vec<i64> = sent_rows
+        .into_iter()
+        .map(|(ingested_at, sent_at)| {
+            let ingested_at = chrono::DateTime::parse_from_rfc3339(&ingested_at)
+                .expect("入库时间格式无效")
+                .with_timezone(&chrono::Utc);
+            let sent_at = chrono::DateTime::parse_from_rfc3339(&sent_at)
+                .expect("发送时间格式无效")
+                .with_timezone(&chrono::Utc);
+            (sent_at - ingested_at).num_milliseconds()
+        })
+        .collect();
+    latencies_ms.sort_unstable();
+    let percentile = |ratio: f64| {
+        let index = ((latencies_ms.len() as f64 * ratio).ceil() as usize)
+            .saturating_sub(1)
+            .min(latencies_ms.len() - 1);
+        latencies_ms[index]
+    };
+    println!(
+        "[P3-1] 入库=120, Sent={}, Ignored={}, Expired={}, IgnoredReasons={:?}, P50={}ms, P95={}ms, ProviderCalls={}",
+        sent,
+        ignored,
+        expired,
+        ignored_reasons,
+        percentile(0.50),
+        percentile(0.95),
+        h.llm_provider.call_count(),
+    );
+    shutdown_tx.send(true).ok();
+    dispatcher_task.await.expect("dispatcher 压测任务异常");
+    processor_task.await.expect("processor 压测任务异常");
 }
