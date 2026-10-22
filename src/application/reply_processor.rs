@@ -152,7 +152,10 @@ impl ReplyProcessor {
         } else {
             NORMAL_BATCH_WAIT_MS
         };
-        self.delay_executor.delay(wait_ms).await;
+        let backlog_age = self.clock.now() - event.ingested_at;
+        if backlog_age <= chrono::Duration::milliseconds(wait_ms as i64) {
+            self.delay_executor.delay(wait_ms).await;
+        }
         let now = self.clock.now();
         let deadline =
             (event.ingested_at + chrono::Duration::milliseconds(wait_ms as i64)).max(now);
@@ -1315,9 +1318,13 @@ impl ReplyProcessor {
             content
         };
         let delay_started = Instant::now();
-        self.delay_executor
-            .delay(capped_delay_ms(decision.delay_ms))
-            .await;
+        if self.clock.now() - event.ingested_at
+            <= chrono::Duration::milliseconds(MAX_REPLY_DELAY_MS as i64)
+        {
+            self.delay_executor
+                .delay(capped_delay_ms(decision.delay_ms))
+                .await;
+        }
         let decision_delay_ms = delay_started.elapsed().as_millis() as u64;
         // 绑定切换与发送前复核已经由整个处理期间持有的会话门闩串行化。
         if self.event_expired(event) {
@@ -2763,7 +2770,7 @@ mod tests {
 
         assert_eq!(*provider.calls.lock().unwrap(), 0);
         assert!(adapter.sent.lock().unwrap().is_empty());
-        assert_eq!(*delays.lock().unwrap(), vec![NORMAL_BATCH_WAIT_MS]);
+        assert!(delays.lock().unwrap().is_empty());
         assert_eq!(
             message_repo
                 .reply_tasks
@@ -2975,7 +2982,7 @@ mod tests {
             .await
             .expect("冻结批次应成功");
         assert_eq!(frozen.content, "积压起点\n积压后的消息");
-        assert_eq!(*delays.lock().unwrap(), vec![NORMAL_BATCH_WAIT_MS]);
+        assert!(delays.lock().unwrap().is_empty());
         assert_eq!(
             message_repo
                 .reply_tasks
@@ -3056,6 +3063,29 @@ mod tests {
                 .map(|task| task.status),
             Some(ReplyTaskStatus::Pending)
         );
+    }
+
+    #[tokio::test]
+    async fn backlog_skips_batch_and_decision_delays() {
+        let now = Utc::now();
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let delay: Arc<dyn DelayExecutor> = Arc::new(RecordingDelay {
+            delays: delays.clone(),
+        });
+        let (processor, adapter, _, _, _, _, _, _, _, _, _) =
+            wire_with_delay(false, true, delay).await;
+        let processor = Arc::new(
+            Arc::try_unwrap(processor)
+                .unwrap_or_else(|_| panic!("测试处理器应唯一"))
+                .with_clock(Arc::new(FixedClock(now))),
+        );
+        let mut event = received_event(true);
+        event.ingested_at = now - chrono::Duration::seconds(10);
+
+        processor.process(&event).await.expect("积压回复应成功");
+
+        assert!(delays.lock().unwrap().is_empty());
+        assert_eq!(adapter.sent.lock().unwrap().len(), 1);
     }
 
     #[test]
