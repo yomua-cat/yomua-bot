@@ -523,6 +523,29 @@ pub trait MessageRepository: Send + Sync {
         .map(|_| true)
     }
 
+    /// 只在待处理任务仍存在时记录忽略原因，供积压观测使用。
+    async fn mark_reply_task_ignored_if_pending_with_reason(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        reason: &str,
+    ) -> Result<bool, RepositoryError> {
+        let changed = self
+            .mark_reply_task_ignored_if_pending(message_id, character_id)
+            .await?;
+        if changed {
+            self.save_reply_task_error(
+                message_id,
+                character_id,
+                crate::domain::message::ReplyTaskStatus::Ignored,
+                None,
+                Some(reason),
+            )
+            .await?;
+        }
+        Ok(changed)
+    }
+
     /// 原子地领取一个尚未开始处理的回复任务。
     /// 返回 `false` 表示任务已经被其它处理器领取或进入终态。
     async fn claim_reply_task_for_generation(
@@ -880,6 +903,24 @@ pub trait MemoryRepository: Send + Sync {
         _since: chrono::DateTime<chrono::Utc>,
     ) -> Result<i64, RepositoryError> {
         Ok(0)
+    }
+
+    /// 在仓储事务内执行候选去重和用户每日上限检查后插入。
+    ///
+    /// 默认实现供轻量测试仓储使用；SQLite 实现把条件插入放在同一事务中。
+    async fn insert_candidate_with_daily_limit(
+        &self,
+        memory: &Memory,
+        since: chrono::DateTime<chrono::Utc>,
+        daily_limit: i64,
+    ) -> Result<Option<i64>, RepositoryError> {
+        if let Some(user_id) = memory.user_id {
+            let count = self.count_candidates_for_user_since(user_id, since).await?;
+            if count >= daily_limit {
+                return Ok(None);
+            }
+        }
+        self.insert_candidate_once(memory).await
     }
 
     /// 带来源的候选记忆幂等插入。已存在时返回 None。

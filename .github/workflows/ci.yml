@@ -153,3 +153,55 @@ jobs:
             echo "该检查失败将阻断整体工作流。"
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$result"
+
+  dependency-audit:
+    name: 必过 / 依赖安全检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: 检查依赖公告、许可证、来源和重复版本
+        run: cargo deny check
+
+  backlog-measurement:
+    name: 手动 / 单会话积压压测
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: 运行手动积压压测
+        run: cargo test --locked --test alpha_e2e_test p2_1_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1
+
+  outbox-backlog-measurement:
+    name: 手动 / 完整 Outbox 积压压测
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: 运行完整 Outbox 积压压测
+        run: cargo test --locked --test alpha_e2e_test p3_1_outbox_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1

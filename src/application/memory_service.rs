@@ -123,22 +123,6 @@ impl MemoryService {
             .and_hms_opt(0, 0, 0)
             .expect("午夜时间有效")
             .and_utc();
-        if let Some(user_id) = input.user_id {
-            let count = self
-                .memory_repo
-                .count_candidates_for_user_since(user_id, day_start)
-                .await?;
-            if count >= MAX_DAILY_CANDIDATES {
-                tracing::info!(
-                    user_id,
-                    count,
-                    limit = MAX_DAILY_CANDIDATES,
-                    "用户今日候选记忆已达上限，跳过候选"
-                );
-                return Ok(0);
-            }
-        }
-
         let mut memory = Memory::new(
             input.character_id,
             input.conversation_id,
@@ -168,7 +152,7 @@ impl MemoryService {
         });
         Ok(self
             .memory_repo
-            .insert_candidate_once(&memory)
+            .insert_candidate_with_daily_limit(&memory, day_start, MAX_DAILY_CANDIDATES)
             .await?
             .map(|_| 1)
             .unwrap_or(0))
@@ -193,7 +177,8 @@ impl MemoryService {
 
         let lower = text.to_lowercase();
         let has_rel = trigger_hit(&lower, REL_TRIGGERS);
-        let has_sem = trigger_hit(&lower, SEM_TRIGGERS);
+        let has_identity = identity_trigger_hit(text);
+        let has_sem = trigger_hit(&lower, SEM_TRIGGERS) || has_identity;
         let has_epi = trigger_hit(&lower, EPI_TRIGGERS);
 
         let char_count = text.chars().count();
@@ -212,7 +197,7 @@ impl MemoryService {
         }
         importance = importance.clamp(0.0, 1.0);
 
-        if char_count < MIN_MESSAGE_CHARS {
+        if char_count < MIN_MESSAGE_CHARS && !has_identity {
             return None;
         }
         if importance < MIN_IMPORTANCE {
@@ -240,6 +225,9 @@ impl MemoryService {
                 keywords.push(kw.to_string());
             }
         }
+        if has_identity {
+            keywords.push("身份陈述".to_string());
+        }
 
         let truncated = char_count > MAX_CANDIDATE_CONTENT_CHARS;
         let content = text.chars().take(MAX_CANDIDATE_CONTENT_CHARS).collect();
@@ -258,6 +246,45 @@ impl MemoryService {
 /// 触发词命中检测（任一命中即返回 true）。
 fn trigger_hit(text: &str, triggers: &[&str]) -> bool {
     triggers.iter().any(|t| text.contains(t))
+}
+
+/// 只在句首或标点分隔后的句首识别受限身份陈述，避免恢复裸子串匹配。
+fn identity_trigger_hit(text: &str) -> bool {
+    text.split(|ch| {
+        matches!(
+            ch,
+            '，' | ',' | '。' | '.' | '！' | '!' | '？' | '?' | '；' | ';' | '\n'
+        )
+    })
+    .map(str::trim)
+    .any(|segment| {
+        if let Some(rest) = segment.strip_prefix("我叫") {
+            return identity_value_is_valid(rest);
+        }
+        if let Some(rest) = segment.strip_prefix("我是") {
+            return identity_value_is_valid(rest)
+                && !rest.starts_with("不是")
+                && !rest.starts_with('说');
+        }
+        if let Some(rest) = segment.strip_prefix("我的职业是") {
+            return rest.chars().count() >= 2;
+        }
+        let Some(rest) = segment.strip_prefix("我在") else {
+            return false;
+        };
+        !rest.is_empty()
+            && ["工作", "上学", "读"]
+                .iter()
+                .any(|verb| rest.contains(verb))
+    })
+}
+
+fn identity_value_is_valid(value: &str) -> bool {
+    value.chars().count() >= 2
+        && !value.starts_with("吗")
+        && !value.starts_with("呢")
+        && !value.starts_with('？')
+        && !value.starts_with('?')
 }
 
 /// 排除疑问句和把否定转折当作稳定陈述的常见情况。
@@ -413,6 +440,28 @@ mod tests {
             ("我喜欢喝咖啡吗", false),
             ("我喜欢喝咖啡？", false),
             ("我喜欢喝咖啡，但是最近戒了", false),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                svc.evaluate(message, 1).is_some(),
+                expected,
+                "消息：{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_triggers_are_restricted_and_table_driven() {
+        let (svc, _repo) = service();
+        let cases = [
+            ("我是大二学生", true),
+            ("我叫小明", true),
+            ("我在上海工作", true),
+            ("我是不是该睡了", false),
+            ("你是谁", false),
+            ("我是说今天好累", false),
+            ("我会不会迟到", false),
+            ("我们走吧", false),
         ];
         for (message, expected) in cases {
             assert_eq!(

@@ -394,6 +394,31 @@ impl MessageRepository for SqliteMessageRepository {
         Ok(result.rows_affected() == 1)
     }
 
+    async fn mark_reply_task_ignored_if_pending_with_reason(
+        &self,
+        message_id: i64,
+        character_id: i64,
+        reason: &str,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            r#"INSERT INTO reply_tasks(message_id, character_id, status, content, error, updated_at)
+               VALUES (?, ?, 'ignored', NULL, ?, ?)
+               ON CONFLICT(message_id) DO UPDATE SET
+                   status = 'ignored',
+                   error = excluded.error,
+                   updated_at = excluded.updated_at
+               WHERE reply_tasks.character_id = excluded.character_id
+                 AND reply_tasks.status = 'pending'"#,
+        )
+        .bind(message_id)
+        .bind(character_id)
+        .bind(reason)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn claim_reply_task_for_generation(
         &self,
         message_id: i64,

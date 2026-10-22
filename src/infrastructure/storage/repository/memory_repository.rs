@@ -19,6 +19,73 @@ impl SqliteMemoryRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
+    async fn insert_candidate_once_with_limit(
+        &self,
+        memory: &Memory,
+        daily_limit: Option<(i64, chrono::DateTime<chrono::Utc>, i64)>,
+    ) -> Result<Option<i64>, RepositoryError> {
+        let Some(source_message_id) = memory
+            .metadata
+            .get("source_message_id")
+            .and_then(|value| value.as_i64())
+        else {
+            return Ok(Some(self.insert(memory).await?));
+        };
+        let mut tx = self.pool.begin().await?;
+        let metadata = serde_json::to_string(&memory.metadata)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let (daily_user_id, daily_since, daily_limit) = daily_limit
+            .map(|(user_id, since, limit)| (Some(user_id), Some(since.to_rfc3339()), Some(limit)))
+            .unwrap_or((None, None, None));
+        // 将日限额、来源去重和插入放进同一条写语句。SQLite 会在真正写入前取得写锁，
+        // 即使多个任务并发到达，也不会出现“都读到未超限、随后各插一条”。
+        let id: Option<i64> = sqlx::query_scalar(
+            r#"INSERT INTO memories
+                (character_id, user_id, conversation_id, memory_type, content, importance,
+                 created_at, last_accessed, metadata, embedding)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              WHERE (? IS NULL OR (
+                  SELECT COUNT(*) FROM memories
+                   WHERE user_id = ?
+                     AND created_at >= ?
+                     AND json_extract(metadata, '$.candidate_created_at') IS NOT NULL
+              ) < ?)
+                AND NOT EXISTS (
+                  SELECT 1 FROM memories
+                   WHERE character_id = ?
+                     AND ((conversation_id = ?) OR (conversation_id IS NULL AND ? IS NULL))
+                     AND json_extract(metadata, '$.source_message_id') = ?
+              )
+             RETURNING id"#,
+        )
+        .bind(memory.character_id)
+        .bind(memory.user_id)
+        .bind(memory.conversation_id)
+        .bind(memory_type_name(memory.memory_type))
+        .bind(&memory.content)
+        .bind(memory.importance)
+        .bind(memory.created_at.to_rfc3339())
+        .bind(memory.last_accessed.to_rfc3339())
+        .bind(&metadata)
+        .bind(&memory.embedding)
+        .bind(daily_user_id)
+        .bind(daily_user_id)
+        .bind(daily_since)
+        .bind(daily_limit)
+        .bind(memory.character_id)
+        .bind(memory.conversation_id)
+        .bind(memory.conversation_id)
+        .bind(source_message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = id else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        tx.commit().await?;
+        Ok(Some(id))
+    }
 }
 
 #[async_trait]
@@ -166,53 +233,22 @@ impl MemoryRepository for SqliteMemoryRepository {
     }
 
     async fn insert_candidate_once(&self, memory: &Memory) -> Result<Option<i64>, RepositoryError> {
-        let Some(source_message_id) = memory
-            .metadata
-            .get("source_message_id")
-            .and_then(|value| value.as_i64())
-        else {
-            return Ok(Some(self.insert(memory).await?));
-        };
-        let mut tx = self.pool.begin().await?;
-        let metadata = serde_json::to_string(&memory.metadata)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        // 将去重判断和插入放进同一条写语句。SQLite 会在真正写入前取得写锁，
-        // 即使多个 Outbox 重试并发到达，也不会出现“都读到不存在、随后各插一条”。
-        let id: Option<i64> = sqlx::query_scalar(
-            r#"INSERT INTO memories
-                (character_id, user_id, conversation_id, memory_type, content, importance,
-                 created_at, last_accessed, metadata, embedding)
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-              WHERE NOT EXISTS (
-                  SELECT 1 FROM memories
-                   WHERE character_id = ?
-                     AND ((conversation_id = ?) OR (conversation_id IS NULL AND ? IS NULL))
-                     AND json_extract(metadata, '$.source_message_id') = ?
-              )
-             RETURNING id"#,
+        self.insert_candidate_once_with_limit(memory, None).await
+    }
+
+    async fn insert_candidate_with_daily_limit(
+        &self,
+        memory: &Memory,
+        since: chrono::DateTime<chrono::Utc>,
+        daily_limit: i64,
+    ) -> Result<Option<i64>, RepositoryError> {
+        self.insert_candidate_once_with_limit(
+            memory,
+            memory
+                .user_id
+                .map(|user_id| (user_id, since, daily_limit.max(0))),
         )
-        .bind(memory.character_id)
-        .bind(memory.user_id)
-        .bind(memory.conversation_id)
-        .bind(memory_type_name(memory.memory_type))
-        .bind(&memory.content)
-        .bind(memory.importance)
-        .bind(memory.created_at.to_rfc3339())
-        .bind(memory.last_accessed.to_rfc3339())
-        .bind(&metadata)
-        .bind(&memory.embedding)
-        .bind(memory.character_id)
-        .bind(memory.conversation_id)
-        .bind(memory.conversation_id)
-        .bind(source_message_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(id) = id else {
-            tx.rollback().await?;
-            return Ok(None);
-        };
-        tx.commit().await?;
-        Ok(Some(id))
+        .await
     }
 
     async fn cognition_progress(

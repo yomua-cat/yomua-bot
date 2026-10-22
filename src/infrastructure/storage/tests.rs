@@ -2659,6 +2659,67 @@ mod storage_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_candidate_daily_limit_is_atomic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("candidate-limit.db");
+        let storage = SqliteStorage::open(db_path.to_str().unwrap())
+            .await
+            .expect("failed to open file-backed db");
+        storage.migrate().await.expect("failed to run migrations");
+        let character_id: i64 =
+            sqlx::query_scalar("INSERT INTO characters(name) VALUES('并发候选限额') RETURNING id")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let user_id = crate::infrastructure::storage::repository::SqliteParticipantRepository::new(
+            storage.pool().clone(),
+        )
+        .ensure_user("onebot_qq", "concurrent-candidate-user")
+        .await
+        .unwrap()
+        .unwrap();
+        let service = Arc::new(crate::application::memory_service::MemoryService::new(
+            Arc::new(
+                crate::infrastructure::storage::repository::SqliteMemoryRepository::new(
+                    storage.pool().clone(),
+                ),
+            ),
+        ));
+
+        let mut tasks = Vec::new();
+        for source_message_id in 0..40_i64 {
+            let service = service.clone();
+            tasks.push(tokio::spawn(async move {
+                service
+                    .extract_and_store(crate::application::memory_service::MemoryExtractionInput {
+                        character_id,
+                        conversation_id: None,
+                        participant_id: 7,
+                        user_id: Some(user_id),
+                        message_text: "我喜欢喝咖啡，每天都要来一杯",
+                        source_message_id,
+                        source_occurred_at: chrono::Utc::now(),
+                    })
+                    .await
+            }));
+        }
+
+        let mut inserted = 0;
+        for task in tasks {
+            inserted += task.await.unwrap().unwrap();
+        }
+        assert_eq!(inserted, 20, "并发候选写入应恰好达到每日上限");
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memories WHERE user_id=? AND json_extract(metadata, '$.candidate_created_at') IS NOT NULL",
+        )
+        .bind(user_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored, 20, "并发候选总数不得超过每日上限");
+    }
+
     #[tokio::test]
     async fn candidate_reviews_require_model_evidence_and_keep_audit_metadata() {
         let storage = setup_storage().await;

@@ -2,7 +2,7 @@
 
 本文记录截至 **2026-10-20** 的当前源码证据。项目仍处于开发中；自动化测试通过不等于真实 QQ、外部模型或长期运行已经验收。
 
-本轮加固（2026-10-21）新增 2 个普通回归测试和 1 个 ignored Unix socket 权限测试；串行全目标验证实际为库 543 个通过、16 个忽略，主程序 5 个、ctl 39 个、alpha 集成 9 个、控制集成 84 个通过。
+本轮加固（2026-10-22）新增候选审核注入防护、隐私说明、完整 Outbox 压测和依赖安全检查；串行全目标验证实际为库 553 个通过、16 个忽略，主程序 5 个、ctl 39 个、alpha 集成 8 个通过、2 个压测忽略，控制集成 84 个通过。
 
 ## 已验证
 
@@ -29,6 +29,7 @@
 - 入站处理对数据库锁、连接和仓储暂时错误最多重试 3 次，重试期间保持消息顺序；解析错误、未绑定、黑名单命中和其他业务性拒绝不会重试。进程崩溃前仍留在内存中的事件无法恢复，尚未接入入站事件持久化队列。
 - 消息接收入库使用结构化 `AcceptedMessageInput`，在同一事务中分配会话序号、写入消息并创建 Outbox 事件。
 - 回复任务会按当前会话序号读取连续输入；原消息逐条保存，生成期间的新消息进入下一轮。当前批次冻结后会持久化最小 `reply_batches` 快照，只保留消息 ID、序号、事件 UUID 和上下文摘要，不保存完整 prompt。
+- P3-2 已实现积压压缩：事件年龄超过批量等待时，冻结窗口扩展到当前时间并跳过批量等待；事件年龄超过回复延迟上限时跳过 `decision.delay_ms`。未积压事件仍保留原批量等待和决策延迟；过期阈值仍为 120 秒，被合并消息仍记录为 `batch_merge`。
 - 上下文中只有角色真实发送且归属当前观察角色的消息才使用 `assistant`；当前批次只作为当前输入出现一次。
 - 上下文历史中的系统用户标签使用会话内稳定匿名别名，不因身份标签向模型发送真实 QQ 号；昵称会移除控制字符、替换标签分隔符并限制为 32 个字符，正文、引用文本和当前轮中行首的伪身份标签会被中和。用户主动输入的正文仍按原文处理，关系、记忆和权限逻辑仍使用程序侧的全域用户身份。
 - ctl 客户端、服务端和帮助文本使用统一 canonical 命令定义，支持一段、二段和三段命令；Unix socket 使用版本化结构化 `ControlEnvelope`，bot 不再解析人类 `cmd` 字符串。
@@ -77,6 +78,17 @@
 
 ## 尚未证明
 
+- MiniMax `M2-her` 返回 400（2013）的触发条件仍未查明，需要真实模型 endpoint 才能继续排查；此前最小请求成功、应用历史重放失败的现象尚不能确定根因。
+- 入站事件仍无持久化队列；进程崩溃前只留在内存中的事件无法恢复。设计见 `docs/research/onebot-inbound-event-durability-design-2026-10-21.md`，本轮未实施。
+- 限额开启后，每次限额检查引起的 SQLite 写入成本尚未测量。
+- P3-2 两个提交后的同一手动压测均使用每秒 2 条、持续 60 秒、Provider 延迟 3 秒、120 条消息、隔离 SQLite 和假 OneBot/Provider。第 1 项（批量窗口扩展）实测：`p2_1` 为 `Sent=11、Ignored=109、Expired=0、P50=10,176 ms、P95=10,416 ms`；`p3_1` 为 `Sent=9、Ignored=111、Expired=0、P50=11,557 ms、P95=11,715 ms`，阶段批量等待 P50/P95 为 `1,509/1,510 ms`、决策延迟为 `1,403/1,403 ms`。第 2 项（积压时跳过批量等待和决策延迟）实测：`p2_1` 为 `Sent=21、Ignored=99、Expired=0、P50=5,942 ms、P95=6,022 ms`；`p3_1` 为 `Sent=16、Ignored=104、Expired=0、P50=6,528 ms、P95=10,606 ms`，阶段批量等待 P50/P95 为 `2/1,505 ms`、决策延迟为 `0/0 ms`。两条压测的 Expired 均为 0，P95 均较第 1 项下降；未引入丢弃策略，继续保留消息语义。
+
+- 单会话积压压测 `p2_1_single_conversation_backlog_measurement` 与生产装配一致（SQLite WAL、5 秒 `busy_timeout`、5 个连接），但耗时约 1–3 分钟且曾出现并发写入锁竞争，因此标记为 ignored，不作为常规全目标测试的必过项。需要手动测量时运行：`cargo test --locked --test alpha_e2e_test p2_1_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1`；GitHub Actions 通过 `workflow_dispatch` 触发同一命令。
+
+- 完整 Outbox 压测 `p3_1_outbox_single_conversation_backlog_measurement` 已标记为 ignored，手动运行命令为：`cargo test --locked --test alpha_e2e_test p3_1_outbox_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1`。本机一次实测使用每秒 2 条、持续 60 秒、Provider 延迟 3 秒、隔离 SQLite 和假 OneBot：入库 120、Sent 24、Ignored 58、Expired 38、ProviderCalls 29；Ignored 原因全部为 `batch_merge=58`；Sent 总延迟 P50 63,085 ms、P95 114,629 ms。阶段耗时 P50/P95（毫秒）为：等会话锁 `0/0`、批量等待 `1,504/1,506`、关系/记忆写入 `2/3`、决策 `1/2`、生成 `3,007/3,008`、决策延迟 `1,402/1,402`、发送调用 `0/0`。该数据只代表本机一次完整 Outbox 链路测量，不代表真实 QQ 或长期运行验收。
+
+- 回复链路在 `reply_pipeline` tracing target 记录结构化阶段耗时字段：`lock_wait_ms`、`batch_wait_ms`、`memory_write_ms`、`decision_ms`、`decision_delay_ms`、`generation_ms`、`send_ms`；P3-1 压测已在测试层收集这些事件并计算阶段 P50/P95。
+
 - 2026-10-20 已用唯一好友完成真实 QQ → NapCat → 入库 → Outbox → OneBot 发送验证，QQ 窗口确认显示回复“测试收到2。”。MiniMax `M2-her` 曾返回 `400 invalid params, group chat not supported (2013)`，任务正确进入 `failed` 且只尝试一次；直接构造的最小请求返回 200，但使用应用净化历史重放仍返回同一错误，具体触发条件仍未证明。随后切换到 Zhipu `glm-4.7-flash`，前两次 429 后第三次成功，数据库记录发送成功并保存平台消息 ID `1320729054`。该次是真实单好友场景验证，不代表并发、持续运行或极端积压已验收。
 - 插件 Unix socket 测试在普通测试命令中按 `#[ignore]` 标记；本机显式运行 16 个测试全部通过，CI 必过矩阵配置为单独执行这些 ignored 测试。
 - `unknown` 发送结果仍是待核查终态；现在会保存生成内容和错误原因。机器人自身回声在同一会话内正文完全一致、发送开始后 60 秒内且候选唯一时，会自动调用确认路径写入平台消息 ID 并收敛为 `sent`；内容不同、候选重复、跨会话或超出窗口时保持 `unknown`。该匹配只确认已有回声，不触发自动补发。`reply unknown check` 仍仅在任务有平台消息 ID 时调用 `get_msg`，平台明确返回“未找到”才自动重新排队；没有回声、没有平台消息 ID 或查询网络失败时仍需人工核查。
@@ -85,6 +97,7 @@
 - 配置重载仅热更新当前已接通的运行时设置和日志过滤器；`shutdown_timeout_secs`、OneBot 连接、插件路径及模型路由变化要求重启。控制请求连接退出前数据库保持打开，避免并发请求访问已关闭的存储。
 - 角色状态缓存与控制命令写入后的长期一致性、真实配置热重载和进程级关停仍需演练。当前 `reload-config` 对 LLM/decision 装配仍提示重启，不能声称模型路由已经热替换。
 - 主动发言的静默时段支持运行时 `timezone` 配置，默认按 `+08:00`（北京时间）解释；修改时区可通过配置重载生效。
+- 依赖安全检查使用 `cargo-deny 0.20.2`。更新锁文件后 advisories、licenses、sources 均通过；现有重复版本警告为 `bitflags`、`getrandom`、`hashbrown`、`linux-raw-sys`、`miniz_oxide`、`rustix`、`syn`、`thiserror`、`windows-core`、`windows-implement`、`windows-interface`、`windows-result`、`windows-sys`。这些来自当前传递依赖并存，尚未做非必要的依赖树重构。
 - 模型配置统一采用 Provider、Model Instance 和 Role 三层结构；单一模型也需显式声明这三层，多个任务可共享 Provider 或配置备用链。备用路由只在网络错误、超时、429 或 5xx 时切换；`decision.toml` 单独配置决策模型。Grok 按 OpenAI-compatible Provider 接入，真实 endpoint、模型名、额度和延迟仍待填写后验证。
 - 语音能力尚未接入；当前 OneBot 出站只有文本动作，后续应以独立 VoiceGateway 接入，并把最终转写作为带来源 metadata 的消息写回现有记忆链。
 - 用户换号的人工合并与删除已通过 `user merge` / `user delete` 控制命令接入，危险操作需要 `--confirm`；合并会迁移参与者和记忆、聚合关系及交互幂等记录，再删除来源身份。删除用户会在单一事务中删除普通与向量记忆、清除关系和旧 QQ 号/昵称，匿名化私聊路由并关闭该私聊主动发言、移除对应用户黑名单；历史消息正文、行和引用关系保留。SQLite 测试覆盖删除成功、其他用户数据保留、外键完整及失败回滚。
