@@ -5,8 +5,7 @@
 //! （可选）认知生成 → 分派发送动作，供 Outbox 处理器复用。
 
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::domain::message::ReplyTaskStatus;
 use chrono::Utc;
@@ -1093,7 +1092,9 @@ impl ReplyProcessor {
             .user_id_for_participant(event.sender_id)
             .await?;
         self.ensure_event_still_owned(event, lease).await?;
+        let mut memory_write_duration = Duration::ZERO;
         if event.message_id > 0 && !non_human_source {
+            let write_started = Instant::now();
             self.memory_service
                 .extract_and_store(MemoryExtractionInput {
                     character_id: event.character_id,
@@ -1107,9 +1108,11 @@ impl ReplyProcessor {
                     source_occurred_at: event.timestamp,
                 })
                 .await?;
+            memory_write_duration += write_started.elapsed();
         }
         self.ensure_event_still_owned(event, lease).await?;
         if event.message_id > 0 && !non_human_source {
+            let write_started = Instant::now();
             match self
                 .relationship_service
                 .record_interaction_once(
@@ -1129,13 +1132,13 @@ impl ReplyProcessor {
                 }
                 Err(error) => return Err(RuntimeError::Repository(error)),
             }
+            memory_write_duration += write_started.elapsed();
         }
         self.ensure_event_still_owned(event, lease).await?;
         let batch_started = Instant::now();
         let frozen_batch = self.freeze_batch(event).await?;
         let batch_wait_ms = batch_started.elapsed().as_millis() as u64;
         self.persist_frozen_batch(event, &frozen_batch).await?;
-        let memory_started = Instant::now();
         for message in &frozen_batch.additional_messages {
             self.ensure_event_still_owned(event, lease).await?;
             let stable_user_key = message
@@ -1151,6 +1154,7 @@ impl ReplyProcessor {
                     .participant_repo
                     .user_id_for_participant(message.sender_id)
                     .await?;
+                let write_started = Instant::now();
                 self.memory_service
                     .extract_and_store(MemoryExtractionInput {
                         character_id: event.character_id,
@@ -1162,7 +1166,9 @@ impl ReplyProcessor {
                         source_occurred_at: message.occurred_at.unwrap_or(message.timestamp),
                     })
                     .await?;
+                memory_write_duration += write_started.elapsed();
             }
+            let relationship_started = Instant::now();
             match self
                 .relationship_service
                 .record_interaction_once(event.character_id, participant_id, message.id)
@@ -1171,8 +1177,9 @@ impl ReplyProcessor {
                 Ok(_) | Err(crate::error::RepositoryError::NotImplemented(_)) => {}
                 Err(error) => return Err(RuntimeError::Repository(error)),
             }
+            memory_write_duration += relationship_started.elapsed();
         }
-        let memory_write_ms = memory_started.elapsed().as_millis() as u64;
+        let memory_write_ms = memory_write_duration.as_millis() as u64;
         let batch_content = frozen_batch.content;
         let decision_started = Instant::now();
         let decision = self
@@ -1295,9 +1302,11 @@ impl ReplyProcessor {
                 .await?;
             content
         };
+        let delay_started = Instant::now();
         self.delay_executor
             .delay(capped_delay_ms(decision.delay_ms))
             .await;
+        let decision_delay_ms = delay_started.elapsed().as_millis() as u64;
         // 绑定切换与发送前复核已经由整个处理期间持有的会话门闩串行化。
         if Self::event_expired(event) {
             self.save_task_owned(event, lease, ReplyTaskStatus::Expired, Some(&content))
@@ -1357,7 +1366,8 @@ impl ReplyProcessor {
                     batch_wait_ms,
                     memory_write_ms,
                     decision_ms,
-                    generation_ms = ?generation_ms,
+                    decision_delay_ms,
+                    generation_ms = generation_ms.unwrap_or_default(),
                     send_ms,
                     "回复处理阶段耗时"
                 );

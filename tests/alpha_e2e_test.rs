@@ -13,6 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::{Context, Layer};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::registry::LookupSpan;
 use yomua_bot::adapters::onebot::connection::{WsConnector, WsTransport};
 use yomua_bot::adapters::onebot::{OneBotAdapterImpl, OneBotConfig};
 use yomua_bot::application::action::ActionDispatcher;
@@ -329,6 +333,58 @@ struct AlphaHarness {
     acceptance_service: Arc<yomua_bot::application::message_acceptance::MessageAcceptanceService>,
     /// 保存 adapter 以便在测试结束后调用 stop()
     _adapter: Arc<dyn yomua_bot::adapters::onebot::OneBotAdapter>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct StageSample {
+    lock_wait_ms: u64,
+    batch_wait_ms: u64,
+    memory_write_ms: u64,
+    decision_ms: u64,
+    decision_delay_ms: u64,
+    generation_ms: u64,
+    send_ms: u64,
+}
+
+struct StageVisitor {
+    sample: StageSample,
+}
+
+impl tracing::field::Visit for StageVisitor {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        match field.name() {
+            "lock_wait_ms" => self.sample.lock_wait_ms = value,
+            "batch_wait_ms" => self.sample.batch_wait_ms = value,
+            "memory_write_ms" => self.sample.memory_write_ms = value,
+            "decision_ms" => self.sample.decision_ms = value,
+            "decision_delay_ms" => self.sample.decision_delay_ms = value,
+            "generation_ms" => self.sample.generation_ms = value,
+            "send_ms" => self.sample.send_ms = value,
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+}
+
+struct StageLayer {
+    samples: Arc<Mutex<Vec<StageSample>>>,
+}
+
+impl<S> Layer<S> for StageLayer
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if event.metadata().target() != "reply_pipeline" {
+            return;
+        }
+        let mut visitor = StageVisitor {
+            sample: StageSample::default(),
+        };
+        event.record(&mut visitor);
+        self.samples.lock().unwrap().push(visitor.sample);
+    }
 }
 
 async fn setup() -> Result<AlphaHarness, Box<dyn std::error::Error>> {
@@ -1507,6 +1563,11 @@ async fn p2_1_single_conversation_backlog_measurement() {
 #[tokio::test]
 #[ignore = "耗时 1-3 分钟，仅用于手动测量完整 Outbox 链路"]
 async fn p3_1_outbox_single_conversation_backlog_measurement() {
+    let stage_samples = Arc::new(Mutex::new(Vec::new()));
+    let _stage_guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(StageLayer {
+            samples: stage_samples.clone(),
+        }));
     let h = setup_with_options(
         Duration::from_secs(3),
         Arc::new(yomua_bot::application::reply_processor::TokioDelayExecutor),
@@ -1627,14 +1688,44 @@ async fn p3_1_outbox_single_conversation_backlog_measurement() {
             .min(latencies_ms.len() - 1);
         latencies_ms[index]
     };
+    let stage_samples = stage_samples.lock().unwrap().clone();
+    let stage_percentile = |mut values: Vec<u64>, ratio: f64| {
+        values.sort_unstable();
+        let index = ((values.len() as f64 * ratio).ceil() as usize)
+            .saturating_sub(1)
+            .min(values.len().saturating_sub(1));
+        values.get(index).copied().unwrap_or_default()
+    };
+    let stage_values = |select: fn(StageSample) -> u64| {
+        stage_samples
+            .iter()
+            .copied()
+            .map(select)
+            .collect::<Vec<_>>()
+    };
+    assert!(!stage_samples.is_empty(), "压测应捕获回复阶段耗时事件");
     println!(
-        "[P3-1] 入库=120, Sent={}, Ignored={}, Expired={}, IgnoredReasons={:?}, P50={}ms, P95={}ms, ProviderCalls={}",
+        "[P3-1] 入库=120, Sent={}, Ignored={}, Expired={}, IgnoredReasons={:?}, TotalP50={}ms, TotalP95={}ms, StageP50/P95={{lock:{} / {}, batch:{} / {}, memory/relationship:{} / {}, decision:{} / {}, generation:{} / {}, decision_delay:{} / {}, send:{} / {}}}ms, ProviderCalls={}",
         sent,
         ignored,
         expired,
         ignored_reasons,
         percentile(0.50),
         percentile(0.95),
+        stage_percentile(stage_values(|s| s.lock_wait_ms), 0.50),
+        stage_percentile(stage_values(|s| s.lock_wait_ms), 0.95),
+        stage_percentile(stage_values(|s| s.batch_wait_ms), 0.50),
+        stage_percentile(stage_values(|s| s.batch_wait_ms), 0.95),
+        stage_percentile(stage_values(|s| s.memory_write_ms), 0.50),
+        stage_percentile(stage_values(|s| s.memory_write_ms), 0.95),
+        stage_percentile(stage_values(|s| s.decision_ms), 0.50),
+        stage_percentile(stage_values(|s| s.decision_ms), 0.95),
+        stage_percentile(stage_values(|s| s.generation_ms), 0.50),
+        stage_percentile(stage_values(|s| s.generation_ms), 0.95),
+        stage_percentile(stage_values(|s| s.decision_delay_ms), 0.50),
+        stage_percentile(stage_values(|s| s.decision_delay_ms), 0.95),
+        stage_percentile(stage_values(|s| s.send_ms), 0.50),
+        stage_percentile(stage_values(|s| s.send_ms), 0.95),
         h.llm_provider.call_count(),
     );
     shutdown_tx.send(true).ok();

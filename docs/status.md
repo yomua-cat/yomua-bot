@@ -80,13 +80,13 @@
 - MiniMax `M2-her` 返回 400（2013）的触发条件仍未查明，需要真实模型 endpoint 才能继续排查；此前最小请求成功、应用历史重放失败的现象尚不能确定根因。
 - 入站事件仍无持久化队列；进程崩溃前只留在内存中的事件无法恢复。设计见 `docs/research/onebot-inbound-event-durability-design-2026-10-21.md`，本轮未实施。
 - 限额开启后，每次限额检查引起的 SQLite 写入成本尚未测量。
-- P3-1 完整 Outbox 压测已完成一次总量测量，但回复阶段耗时尚未从 tracing 事件汇总出 P50/P95；P3-2 未实施，需先补齐阶段测量并评估积压时的回复策略。
+- P3-2 未实施。当前一次测量中 58 条 Ignored 全部来自批量合并，38 条 Expired 与单会话串行处理有关；是否采用“积压时丢弃最旧、保留最新并合并”、优先用户可见回复，或仅对 Natural 下规则忽略提前短路，需要维护者根据产品取舍决定。
 
 - 单会话积压压测 `p2_1_single_conversation_backlog_measurement` 与生产装配一致（SQLite WAL、5 秒 `busy_timeout`、5 个连接），但耗时约 1–3 分钟且曾出现并发写入锁竞争，因此标记为 ignored，不作为常规全目标测试的必过项。需要手动测量时运行：`cargo test --locked --test alpha_e2e_test p2_1_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1`；GitHub Actions 通过 `workflow_dispatch` 触发同一命令。
 
-- 完整 Outbox 压测 `p3_1_outbox_single_conversation_backlog_measurement` 已标记为 ignored，手动运行命令为：`cargo test --locked --test alpha_e2e_test p3_1_outbox_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1`。本机一次实测使用每秒 2 条、持续 60 秒、Provider 延迟 3 秒、隔离 SQLite 和假 OneBot：入库 120、Sent 24、Ignored 58、Expired 38、ProviderCalls 29；Ignored 原因全部为 `batch_merge=58`；Sent 延迟 P50 63,062 ms、P95 114,589 ms。该数据只代表本机一次完整 Outbox 链路测量，不代表真实 QQ 或长期运行验收。
+- 完整 Outbox 压测 `p3_1_outbox_single_conversation_backlog_measurement` 已标记为 ignored，手动运行命令为：`cargo test --locked --test alpha_e2e_test p3_1_outbox_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1`。本机一次实测使用每秒 2 条、持续 60 秒、Provider 延迟 3 秒、隔离 SQLite 和假 OneBot：入库 120、Sent 24、Ignored 58、Expired 38、ProviderCalls 29；Ignored 原因全部为 `batch_merge=58`；Sent 总延迟 P50 63,085 ms、P95 114,629 ms。阶段耗时 P50/P95（毫秒）为：等会话锁 `0/0`、批量等待 `1,504/1,506`、关系/记忆写入 `2/3`、决策 `1/2`、生成 `3,007/3,008`、决策延迟 `1,402/1,402`、发送调用 `0/0`。该数据只代表本机一次完整 Outbox 链路测量，不代表真实 QQ 或长期运行验收。
 
-- 回复链路在 `reply_pipeline` tracing target 记录结构化阶段耗时字段：`lock_wait_ms`、`batch_wait_ms`、`memory_write_ms`、`decision_ms`、`generation_ms`、`send_ms`。目前没有在压测中收集这些 tracing 事件并计算各阶段 P50/P95，因此 P3-1 的阶段分布测量尚未完成；本轮只完成完整 Outbox 链路的终态归因和总延迟测量。
+- 回复链路在 `reply_pipeline` tracing target 记录结构化阶段耗时字段：`lock_wait_ms`、`batch_wait_ms`、`memory_write_ms`、`decision_ms`、`decision_delay_ms`、`generation_ms`、`send_ms`；P3-1 压测已在测试层收集这些事件并计算阶段 P50/P95。
 
 - 2026-10-20 已用唯一好友完成真实 QQ → NapCat → 入库 → Outbox → OneBot 发送验证，QQ 窗口确认显示回复“测试收到2。”。MiniMax `M2-her` 曾返回 `400 invalid params, group chat not supported (2013)`，任务正确进入 `failed` 且只尝试一次；直接构造的最小请求返回 200，但使用应用净化历史重放仍返回同一错误，具体触发条件仍未证明。随后切换到 Zhipu `glm-4.7-flash`，前两次 429 后第三次成功，数据库记录发送成功并保存平台消息 ID `1320729054`。该次是真实单好友场景验证，不代表并发、持续运行或极端积压已验收。
 - 插件 Unix socket 测试在普通测试命令中按 `#[ignore]` 标记；本机显式运行 16 个测试全部通过，CI 必过矩阵配置为单独执行这些 ignored 测试。
