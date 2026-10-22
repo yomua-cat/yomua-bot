@@ -14,6 +14,7 @@ use chrono::Utc;
 use crate::adapters::onebot::ActionResponse;
 use crate::application::action::ActionDispatcher;
 use crate::application::binding::BindingManager;
+use crate::application::clock::{system_clock, Clock};
 use crate::application::cognition::CognitionLayer;
 use crate::application::context::ContextLimits;
 use crate::application::event_bus::EventBus;
@@ -101,6 +102,7 @@ pub struct ReplyProcessor {
     action_dispatcher: Arc<ActionDispatcher>,
     event_bus: EventBus,
     delay_executor: Arc<dyn DelayExecutor>,
+    clock: Arc<dyn Clock>,
     /// 参与者仓储（用于跨回复场景：查询当前 Bot 的 participant_id）。
     participant_repo: Arc<dyn ParticipantRepository>,
     /// 当前 Bot 在 OneBot 中的账号 ID（QQ 号），用于精确识别"当前 Bot 自己"。
@@ -119,8 +121,9 @@ struct FrozenBatch {
 }
 
 impl ReplyProcessor {
-    fn event_expired(event: &MessageReceivedEvent) -> bool {
-        event.message_id > 0 && (Utc::now() - event.ingested_at).num_seconds() > EVENT_EXPIRY_SECS
+    fn event_expired(&self, event: &MessageReceivedEvent) -> bool {
+        event.message_id > 0
+            && (self.clock.now() - event.ingested_at).num_seconds() > EVENT_EXPIRY_SECS
     }
 
     /// 在回复任务开始时冻结一轮连续输入。
@@ -150,7 +153,9 @@ impl ReplyProcessor {
             NORMAL_BATCH_WAIT_MS
         };
         self.delay_executor.delay(wait_ms).await;
-        let deadline = event.ingested_at + chrono::Duration::milliseconds(wait_ms as i64);
+        let now = self.clock.now();
+        let deadline =
+            (event.ingested_at + chrono::Duration::milliseconds(wait_ms as i64)).max(now);
         let ordered = if event.message_id > 0 && event.conversation_sequence > 0 {
             repo.find_after_sequence(
                 event.conversation_id,
@@ -300,11 +305,18 @@ impl ReplyProcessor {
             action_dispatcher,
             event_bus,
             delay_executor,
+            clock: system_clock(),
             participant_repo,
             bot_self_id,
             message_repo: None,
             autonomy_repo: None,
         }
+    }
+
+    /// 注入时间源，供积压策略测试使用。
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// 主动任务沿同一入站事务与发送链路，保存依据与绑定版本。
@@ -1000,7 +1012,7 @@ impl ReplyProcessor {
                 .await?;
             return Ok(());
         };
-        if Self::event_expired(event) {
+        if self.event_expired(event) {
             self.save_task_owned(event, lease, ReplyTaskStatus::Expired, None)
                 .await?;
             return Ok(());
@@ -1293,7 +1305,7 @@ impl ReplyProcessor {
             };
             generation_ms = Some(generation_started.elapsed().as_millis() as u64);
             self.ensure_event_still_owned(event, lease).await?;
-            if Self::event_expired(event) {
+            if self.event_expired(event) {
                 self.save_task_owned(event, lease, ReplyTaskStatus::Expired, Some(&content))
                     .await?;
                 return Ok(());
@@ -1308,7 +1320,7 @@ impl ReplyProcessor {
             .await;
         let decision_delay_ms = delay_started.elapsed().as_millis() as u64;
         // 绑定切换与发送前复核已经由整个处理期间持有的会话门闩串行化。
-        if Self::event_expired(event) {
+        if self.event_expired(event) {
             self.save_task_owned(event, lease, ReplyTaskStatus::Expired, Some(&content))
                 .await?;
             return Ok(());
@@ -1955,6 +1967,34 @@ mod tests {
             all.truncate(limit as usize);
             Ok(all)
         }
+        async fn find_after_sequence(
+            &self,
+            conversation_id: i64,
+            after_sequence: i64,
+            limit: i64,
+        ) -> Result<Vec<Message>, RepositoryError> {
+            let mut messages: Vec<_> = self
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    message.conversation_id == conversation_id
+                        && message
+                            .conversation_sequence
+                            .is_some_and(|sequence| sequence > after_sequence)
+                })
+                .cloned()
+                .collect();
+            messages.sort_by_key(|message| {
+                (
+                    message.conversation_sequence.unwrap_or(i64::MAX),
+                    message.id,
+                )
+            });
+            messages.truncate(limit.max(0) as usize);
+            Ok(messages)
+        }
         async fn find_recent_attributed(
             &self,
             _conversation_id: i64,
@@ -2344,6 +2384,14 @@ mod tests {
         }
     }
 
+    struct FixedClock(chrono::DateTime<chrono::Utc>);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            self.0
+        }
+    }
+
     /// 受控延迟：记录延迟并经通道通知测试，随后阻塞直到测试放行。
     ///
     /// 用于验证"发送前确实等待了延迟"的时序。
@@ -2715,7 +2763,7 @@ mod tests {
 
         assert_eq!(*provider.calls.lock().unwrap(), 0);
         assert!(adapter.sent.lock().unwrap().is_empty());
-        assert!(delays.lock().unwrap().is_empty());
+        assert_eq!(*delays.lock().unwrap(), vec![NORMAL_BATCH_WAIT_MS]);
         assert_eq!(
             message_repo
                 .reply_tasks
@@ -2851,6 +2899,163 @@ mod tests {
         let sent = adapter.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert!(sent[0].0.contains("g100"));
+    }
+
+    fn batch_message(
+        id: i64,
+        sequence: i64,
+        ingested_at: chrono::DateTime<chrono::Utc>,
+        text: &str,
+    ) -> Message {
+        Message {
+            id,
+            conversation_id: 100,
+            sender_id: 66,
+            content: crate::domain::message::MessageContent::Text(text.to_string()),
+            timestamp: ingested_at,
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            metadata: serde_json::json!({"author_kind": "user"}),
+            active_character_id: Some(1),
+            platform_message_id: None,
+            conversation_sequence: Some(sequence),
+            occurred_at: Some(ingested_at),
+            ingested_at: Some(ingested_at),
+        }
+    }
+
+    #[tokio::test]
+    async fn backlog_batch_window_extends_to_current_time_without_waiting() {
+        let now = Utc::now();
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let message_repo = Arc::new(MemMessageRepo {
+            messages: Mutex::new(vec![batch_message(
+                2,
+                2,
+                now - chrono::Duration::seconds(5),
+                "积压后的消息",
+            )]),
+            reply_tasks: Mutex::new(HashMap::from([(
+                2,
+                crate::domain::message::ReplyTask {
+                    status: ReplyTaskStatus::Pending,
+                    content: None,
+                    error: None,
+                    platform_message_id: None,
+                },
+            )])),
+        });
+        let delay: Arc<dyn DelayExecutor> = Arc::new(RecordingDelay {
+            delays: delays.clone(),
+        });
+        let (processor, _, _, _, _, _, _, _, _, _, _) = wire_with_delay(false, true, delay).await;
+        let processor = Arc::new(
+            Arc::try_unwrap(processor)
+                .unwrap_or_else(|_| panic!("测试处理器应唯一"))
+                .with_message_repository(message_repo.clone())
+                .with_clock(Arc::new(FixedClock(now))),
+        );
+        let event = MessageReceivedEvent {
+            conversation_id: 100,
+            sender_id: 66,
+            message_id: 1,
+            content: "积压起点".to_string(),
+            timestamp: now - chrono::Duration::seconds(10),
+            is_mentioned: false,
+            character_id: 1,
+            conversation_sequence: 1,
+            platform_message_id: None,
+            ingested_at: now - chrono::Duration::seconds(10),
+            metadata: serde_json::json!({}),
+        };
+
+        let frozen = processor
+            .freeze_batch(&event)
+            .await
+            .expect("冻结批次应成功");
+        assert_eq!(frozen.content, "积压起点\n积压后的消息");
+        assert_eq!(*delays.lock().unwrap(), vec![NORMAL_BATCH_WAIT_MS]);
+        assert_eq!(
+            message_repo
+                .reply_tasks
+                .lock()
+                .unwrap()
+                .get(&2)
+                .and_then(|task| task.error.as_deref()),
+            Some("batch_merge")
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_batch_window_keeps_original_deadline() {
+        let now = Utc::now();
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let message_repo = Arc::new(MemMessageRepo {
+            messages: Mutex::new(vec![
+                batch_message(2, 2, now + chrono::Duration::milliseconds(1_000), "窗口内"),
+                batch_message(3, 3, now + chrono::Duration::milliseconds(2_000), "窗口外"),
+            ]),
+            reply_tasks: Mutex::new(HashMap::from([
+                (
+                    2,
+                    crate::domain::message::ReplyTask {
+                        status: ReplyTaskStatus::Pending,
+                        content: None,
+                        error: None,
+                        platform_message_id: None,
+                    },
+                ),
+                (
+                    3,
+                    crate::domain::message::ReplyTask {
+                        status: ReplyTaskStatus::Pending,
+                        content: None,
+                        error: None,
+                        platform_message_id: None,
+                    },
+                ),
+            ])),
+        });
+        let delay: Arc<dyn DelayExecutor> = Arc::new(RecordingDelay {
+            delays: delays.clone(),
+        });
+        let (processor, _, _, _, _, _, _, _, _, _, _) = wire_with_delay(false, true, delay).await;
+        let processor = Arc::new(
+            Arc::try_unwrap(processor)
+                .unwrap_or_else(|_| panic!("测试处理器应唯一"))
+                .with_message_repository(message_repo.clone())
+                .with_clock(Arc::new(FixedClock(now))),
+        );
+        let event = MessageReceivedEvent {
+            conversation_id: 100,
+            sender_id: 66,
+            message_id: 1,
+            content: "新消息".to_string(),
+            timestamp: now,
+            is_mentioned: false,
+            character_id: 1,
+            conversation_sequence: 1,
+            platform_message_id: None,
+            ingested_at: now,
+            metadata: serde_json::json!({}),
+        };
+
+        let frozen = processor
+            .freeze_batch(&event)
+            .await
+            .expect("冻结批次应成功");
+        assert_eq!(frozen.content, "新消息\n窗口内");
+        assert_eq!(*delays.lock().unwrap(), vec![NORMAL_BATCH_WAIT_MS]);
+        assert_eq!(
+            message_repo
+                .reply_tasks
+                .lock()
+                .unwrap()
+                .get(&3)
+                .map(|task| task.status),
+            Some(ReplyTaskStatus::Pending)
+        );
     }
 
     #[test]
