@@ -80,7 +80,7 @@
 - MiniMax `M2-her` 返回 400（2013）的触发条件仍未查明，需要真实模型 endpoint 才能继续排查；此前最小请求成功、应用历史重放失败的现象尚不能确定根因。
 - 入站事件仍无持久化队列；进程崩溃前只留在内存中的事件无法恢复。设计见 `docs/research/onebot-inbound-event-durability-design-2026-10-21.md`，本轮未实施。
 - 限额开启后，每次限额检查引起的 SQLite 写入成本尚未测量。
-- P3-2 未实施。当前一次测量中 58 条 Ignored 全部来自批量合并，38 条 Expired 与单会话串行处理有关；是否采用“积压时丢弃最旧、保留最新并合并”、优先用户可见回复，或仅对 Natural 下规则忽略提前短路，需要维护者根据产品取舍决定。
+- P3-2 未改变生产逻辑。P3-1 的 Natural 模式负载中，所有 58 条 Ignored 都由既有批量合并产生；等锁 P50/P95 为 `0/0 ms`、关系/记忆写入为 `2/3 ms`、决策为 `1/2 ms`，而生成为 `3,007/3,008 ms`、规则决策延迟为 `1,402/1,402 ms`，输入速率为每秒 2 条。该场景没有证据支持规则提前短路或调度优先级能降低过期数；压缩固定决策延迟、缩短生成时间会改变回复行为或依赖模型服务，现有负载也不能证明可通过低风险实现改善。保留当前消息语义作为默认值；是否在积压时丢弃较旧消息并合并为较新消息，属于待维护者决定的产品取舍。
 
 - 单会话积压压测 `p2_1_single_conversation_backlog_measurement` 与生产装配一致（SQLite WAL、5 秒 `busy_timeout`、5 个连接），但耗时约 1–3 分钟且曾出现并发写入锁竞争，因此标记为 ignored，不作为常规全目标测试的必过项。需要手动测量时运行：`cargo test --locked --test alpha_e2e_test p2_1_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1`；GitHub Actions 通过 `workflow_dispatch` 触发同一命令。
 
