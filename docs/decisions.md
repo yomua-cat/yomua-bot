@@ -48,4 +48,5 @@
 
 ## 2026-10-22
 
+- 消息积压时进行积压压缩：事件年龄超过批量等待后，冻结窗口扩展到当前时间并跳过批量等待；事件年龄超过回复延迟上限后跳过 `decision.delay_ms`。未积压行为保持原批量等待和决策延迟；过期阈值保持 120 秒，不丢弃消息，被合并消息仍记录为 `batch_merge`，生成期间到达的新消息进入下一轮。影响：ReplyProcessor、行为引擎延迟、积压压测和验收文档。来源：2026-10-22 评审任务 P3-2。
 - CLI 专用依赖 `rustyline`、`crossterm`、`sysinfo` 的归属待维护者决定。方案比较：拆成 workspace 的 bot 与 ctl 两个 package，可让 `cargo run --bin yomua-bot` 和 bot 的 `cargo install` 不编译 CLI 依赖，但仓库内命令需明确 `-p`，CI 需分别构建/测试两个 package，文档中的 ctl 安装与运行命令也需更新；在单 package 中用 feature 门控改动较小，但若 feature 默认开启，主程序仍会编译 CLI 依赖，若默认关闭，则 `cargo run --bin yomua-bot-ctl` 和安装 ctl 需显式传 `--features cli`，CI 与文档同样需区分。建议在需要缩短 bot 构建或隔离依赖时拆 workspace：先新增 ctl package 并迁移二进制和依赖，再调整 workspace 默认成员、CI 命令、安装说明，最后验证两个 package 的独立构建和测试。当前不修改 `Cargo.toml`，等待维护者决定。影响：Cargo workspace、CI、部署与开发文档。来源：2026-10-21 评审任务 P4-2。
