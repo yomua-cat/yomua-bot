@@ -17,6 +17,7 @@ pub mod conversation;
 pub mod decision;
 pub mod emotion;
 pub mod event;
+pub mod inbound_event;
 pub mod memory;
 pub mod message;
 pub mod mute;

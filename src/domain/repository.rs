@@ -13,6 +13,7 @@ use crate::domain::character::{
 };
 use crate::domain::conversation::{Conversation, ConversationType, Participant};
 use crate::domain::emotion::Mood;
+use crate::domain::inbound_event::{InboundEvent, InboundEventStatus};
 use crate::domain::memory::{
     Memory, MemoryCandidateReview, MemoryClaim, MemoryClaimProposal, MemoryClaimResult,
     MemoryRevisionRequest, MemoryRevisionResult, SemanticMatchResult,
@@ -20,6 +21,45 @@ use crate::domain::memory::{
 use crate::domain::message::Message;
 use crate::domain::relationship::Relationship;
 use crate::error::RepositoryError;
+
+// ---------------------------------------------------------------------------
+// OneBot 入站事件
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+pub trait InboundEventRepository: Send + Sync {
+    async fn insert_inbound_event(
+        &self,
+        raw_event: &str,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<InboundEvent, RepositoryError>;
+
+    /// 按 ingress_seq 领取最早的待处理事件，并原子递增尝试次数。
+    async fn claim_next_inbound_event(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<InboundEvent>, RepositoryError>;
+
+    /// 将处理中的事件恢复为 received，供进程重启后继续处理。
+    async fn recover_inbound_events(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, RepositoryError>;
+
+    async fn mark_inbound_event(
+        &self,
+        ingress_seq: i64,
+        status: InboundEventStatus,
+        processed_at: chrono::DateTime<chrono::Utc>,
+        last_error: Option<&str>,
+    ) -> Result<bool, RepositoryError>;
+
+    async fn cleanup_inbound_events(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<u64, RepositoryError>;
+}
 
 // ---------------------------------------------------------------------------
 // 主动意图与回复批次
