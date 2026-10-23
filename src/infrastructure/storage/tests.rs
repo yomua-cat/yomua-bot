@@ -803,6 +803,7 @@ mod storage_tests {
                     "metadata":{"author_kind":"user"}
                 })
                 .to_string(),
+                inbound_event_seq: None,
             })
             .await
             .unwrap();
@@ -825,6 +826,7 @@ mod storage_tests {
                     "metadata":{"author_kind":"user","reply_to_platform_message_id":701}
                 })
                 .to_string(),
+                inbound_event_seq: None,
             })
             .await
             .unwrap();
@@ -888,6 +890,7 @@ mod storage_tests {
                 character_id: 1,
                 event_uuid: "dedup-event".to_string(),
                 outbox_payload: payload.to_string(),
+                inbound_event_seq: None,
             })
             .await
             .unwrap();
@@ -901,6 +904,7 @@ mod storage_tests {
                 character_id: 1,
                 event_uuid: "dedup-event-duplicate".to_string(),
                 outbox_payload: payload.to_string(),
+                inbound_event_seq: None,
             })
             .await
             .unwrap();
@@ -920,6 +924,111 @@ mod storage_tests {
                 .unwrap();
         assert_eq!(count, 1);
         assert_eq!(events, 1);
+    }
+
+    #[tokio::test]
+    async fn inbound_message_and_inbox_completion_commit_atomically_with_dedup() {
+        let storage = setup_storage().await;
+        let conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type, external_id) VALUES ('group', 'inbox-atomic') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let character_id: i64 = sqlx::query_scalar(
+            "INSERT INTO characters(name) VALUES ('入站原子性测试') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO participants(conversation_id, external_id, display_name, role, metadata) VALUES (?, '1', '测试用户', 'user', '{}')")
+            .bind(conversation_id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let ingress_seq: i64 = sqlx::query_scalar(
+            "INSERT INTO inbound_events(raw_event, received_at, status, attempts, processing_at) VALUES ('private-test-payload', ?, 'processing', 1, ?) RETURNING ingress_seq",
+        )
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let message_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let make_input = |event_uuid: &str| crate::domain::repository::AcceptedMessageInput {
+            conversation_id,
+            sender_id: 1,
+            content_json: serde_json::json!({"Text":"事务消息"}).to_string(),
+            timestamp: now.to_rfc3339(),
+            platform_message_id: Some(9001),
+            character_id,
+            event_uuid: event_uuid.to_owned(),
+            outbox_payload: serde_json::json!({
+                "event_uuid": event_uuid,
+                "conversation_id": conversation_id,
+                "sender_id": 1,
+                "message_id": 0,
+                "content": "事务消息",
+                "timestamp": now,
+                "is_mentioned": false,
+                "character_id": character_id,
+                "conversation_sequence": 0,
+                "platform_message_id": 9001,
+                "ingested_at": now,
+                "metadata": {"author_kind": "user"}
+            })
+            .to_string(),
+            inbound_event_seq: Some(ingress_seq),
+        };
+
+        let first = message_repo
+            .accept_message_with_status(&make_input("inbox-atomic-first"))
+            .await
+            .unwrap();
+        assert!(first.created);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM inbound_events WHERE ingress_seq = ?")
+                .bind(ingress_seq)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "done");
+
+        sqlx::query("UPDATE inbound_events SET status = 'processing', processed_at = NULL, processing_at = ? WHERE ingress_seq = ?")
+            .bind(now.to_rfc3339())
+            .bind(ingress_seq)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        let duplicate = message_repo
+            .accept_message_with_status(&make_input("inbox-atomic-replay"))
+            .await
+            .unwrap();
+        assert!(!duplicate.created);
+        assert_eq!(duplicate.message_id, first.message_id);
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM messages WHERE conversation_id = ?),
+                   (SELECT COUNT(*) FROM outbox_events WHERE ordering_key = ?),
+                   (SELECT sequence_counter FROM conversations WHERE id = ?)"#,
+        )
+        .bind(conversation_id)
+        .bind(conversation_id.to_string())
+        .bind(conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts, (1, 1, 1));
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM inbound_events WHERE ingress_seq = ?")
+                .bind(ingress_seq)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "done");
     }
 
     #[tokio::test]
@@ -995,6 +1104,7 @@ mod storage_tests {
                     character_id,
                     event_uuid: format!("batch-freeze-event-{sequence_hint}"),
                     outbox_payload: payload.to_string(),
+                    inbound_event_seq: None,
                 })
                 .await
                 .unwrap()

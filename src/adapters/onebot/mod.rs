@@ -43,6 +43,17 @@ pub use conversion::{
 const MAX_INBOUND_RETRIES: usize = 3;
 const INBOUND_RETRY_BASE_DELAY_MS: u64 = 100;
 
+enum InboundInput {
+    Raw(String),
+    InboxSeq(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InboundDisposition {
+    Done,
+    Ignored,
+}
+
 /// OneBot 适配器配置。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -293,8 +304,8 @@ impl OneBotAdapter for OneBotAdapterImpl {
         ));
 
         let mut tasks = vec![connection_task];
-        let event_rx = if let Some(repo) = self.inbound_event_repo.clone() {
-            let (processor_tx, processor_rx) = mpsc::channel(256);
+        let (processor_tx, processor_rx) = mpsc::channel(256);
+        if let Some(repo) = self.inbound_event_repo.clone() {
             let persistence_shutdown_rx = self.shutdown_tx.subscribe();
             let persistence_task = tokio::spawn(persist_inbound_events(
                 event_rx,
@@ -303,19 +314,25 @@ impl OneBotAdapter for OneBotAdapterImpl {
                 persistence_shutdown_rx,
             ));
             tasks.push(persistence_task);
-            processor_rx
         } else {
-            event_rx
-        };
+            let passthrough_shutdown_rx = self.shutdown_tx.subscribe();
+            let passthrough_task = tokio::spawn(forward_raw_events(
+                event_rx,
+                processor_tx,
+                passthrough_shutdown_rx,
+            ));
+            tasks.push(passthrough_task);
+        }
 
         // 入站处理任务（解析 → 解析核心 ID → Acceptance → 发布 CoreEvent）。
         let processor = InboundProcessor {
-            event_rx,
+            event_rx: processor_rx,
             conversation_manager: self.conversation_manager.clone(),
             bus: self.bus.clone(),
             acceptance_service: self.acceptance_service.clone(),
             binding_manager: self.binding_manager.clone(),
             blacklist_repo: self.blacklist_repo.clone(),
+            inbound_event_repo: self.inbound_event_repo.clone(),
             shutdown_rx: processor_shutdown_rx,
         };
         let processor_task = tokio::spawn(async move { processor.run().await });
@@ -383,7 +400,7 @@ impl OneBotAdapter for OneBotAdapterImpl {
 /// 有界背压；日志只记录错误摘要，不记录原始 OneBot 正文。
 async fn persist_inbound_events(
     mut event_rx: mpsc::Receiver<String>,
-    processor_tx: mpsc::Sender<String>,
+    processor_tx: mpsc::Sender<InboundInput>,
     repo: Arc<dyn InboundEventRepository>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -422,7 +439,7 @@ async fn persist_inbound_events(
                     }
                 };
                 tokio::select! {
-                    result = processor_tx.send(raw) => {
+                    result = processor_tx.send(InboundInput::InboxSeq(ingress_seq)) => {
                         if result.is_err() {
                             tracing::warn!(target: "adapter", ingress_seq, "入站处理器通道已关闭，保留 inbox 记录");
                             break;
@@ -433,6 +450,28 @@ async fn persist_inbound_events(
                             break;
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+async fn forward_raw_events(
+    mut event_rx: mpsc::Receiver<String>,
+    processor_tx: mpsc::Sender<InboundInput>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            raw = event_rx.recv() => {
+                let Some(raw) = raw else { break; };
+                if processor_tx.send(InboundInput::Raw(raw)).await.is_err() {
+                    break;
                 }
             }
         }
@@ -528,13 +567,14 @@ impl OneBotAdapterImpl {
 ///
 /// 独立于连接循环运行；单独一条消息的处理失败不会导致任务退出。
 struct InboundProcessor {
-    event_rx: mpsc::Receiver<String>,
+    event_rx: mpsc::Receiver<InboundInput>,
     conversation_manager: ConversationManager,
     #[allow(dead_code)]
     bus: EventBus,
     acceptance_service: Arc<MessageAcceptanceService>,
     binding_manager: Arc<BindingManager>,
     blacklist_repo: Option<Arc<dyn BlacklistRepository>>,
+    inbound_event_repo: Option<Arc<dyn InboundEventRepository>>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -547,9 +587,10 @@ impl InboundProcessor {
                         break;
                     }
                 }
-                raw = self.event_rx.recv() => {
-                    match raw {
-                        Some(raw) => self.handle_raw(&raw).await,
+                input = self.event_rx.recv() => {
+                    match input {
+                        Some(InboundInput::Raw(raw)) => self.handle_raw(&raw).await,
+                        Some(InboundInput::InboxSeq(ingress_seq)) => self.handle_inbox_event(ingress_seq).await,
                         None => break,
                     }
                 }
@@ -558,7 +599,10 @@ impl InboundProcessor {
     }
 
     async fn handle_raw(&self, raw: &str) {
-        if let Err(error) = retry_inbound_operation(|| self.handle_raw_once(raw)).await {
+        if let Err(error) =
+            retry_inbound_operation(|| async { self.handle_raw_once(raw, None).await.map(|_| ()) })
+                .await
+        {
             tracing::error!(
                 target: "adapter",
                 error = %error,
@@ -567,12 +611,109 @@ impl InboundProcessor {
         }
     }
 
-    async fn handle_raw_once(&self, raw: &str) -> Result<(), RuntimeError> {
+    async fn handle_inbox_event(&mut self, signaled_seq: i64) {
+        let Some(repo) = &self.inbound_event_repo else {
+            tracing::error!(target: "adapter", ingress_seq = signaled_seq, "inbox 事件没有装配仓储");
+            return;
+        };
+        let mut event = match repo.claim_next_inbound_event(chrono::Utc::now()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::error!(target: "adapter", ingress_seq = signaled_seq, error = %error, "领取 inbox 事件失败");
+                return;
+            }
+        };
+        if event.ingress_seq != signaled_seq {
+            tracing::debug!(target: "adapter", signaled_seq, claimed_seq = event.ingress_seq, "按持久序号处理更早的 inbox 事件");
+        }
+
+        loop {
+            match self
+                .handle_raw_once(&event.raw_event, Some(event.ingress_seq))
+                .await
+            {
+                Ok(disposition) => {
+                    if let Err(error) = repo
+                        .mark_inbound_event(
+                            event.ingress_seq,
+                            match disposition {
+                                InboundDisposition::Done => {
+                                    crate::domain::inbound_event::InboundEventStatus::Done
+                                }
+                                InboundDisposition::Ignored => {
+                                    crate::domain::inbound_event::InboundEventStatus::Ignored
+                                }
+                            },
+                            chrono::Utc::now(),
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %error, "写入 inbox 终态失败");
+                    }
+                    return;
+                }
+                Err(error)
+                    if is_retryable_inbound_error(&error)
+                        && event.attempts < MAX_INBOUND_RETRIES as i32 =>
+                {
+                    let summary = inbound_error_summary(&error);
+                    if let Err(mark_error) =
+                        repo.retry_inbound_event(event.ingress_seq, summary).await
+                    {
+                        tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %mark_error, "释放 inbox 事件以便重试失败");
+                        return;
+                    }
+                    let delay = inbound_retry_delay(event.attempts.saturating_sub(1) as usize);
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        changed = self.shutdown_rx.changed() => {
+                            if changed.is_err() || *self.shutdown_rx.borrow() {
+                                return;
+                            }
+                        }
+                    }
+                    event = match repo.claim_next_inbound_event(chrono::Utc::now()).await {
+                        Ok(Some(event)) => event,
+                        Ok(None) => return,
+                        Err(claim_error) => {
+                            tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %claim_error, "重新领取 inbox 事件失败");
+                            return;
+                        }
+                    };
+                }
+                Err(error) => {
+                    let summary = inbound_error_summary(&error);
+                    let status = crate::domain::inbound_event::InboundEventStatus::Dead;
+                    if let Err(mark_error) = repo
+                        .mark_inbound_event(
+                            event.ingress_seq,
+                            status,
+                            chrono::Utc::now(),
+                            Some(summary),
+                        )
+                        .await
+                    {
+                        tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %mark_error, "写入 inbox dead 终态失败");
+                    }
+                    tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %summary, "入站 inbox 事件进入 dead 终态");
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn handle_raw_once(
+        &self,
+        raw: &str,
+        inbound_event_seq: Option<i64>,
+    ) -> Result<InboundDisposition, RuntimeError> {
         let event: OneBotEvent = match serde_json::from_str(raw) {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(target: "adapter", error = %e, "无法解析 OneBot JSON");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             }
         };
 
@@ -581,11 +722,11 @@ impl InboundProcessor {
             Ok(i) => i,
             Err(_) if !is_message_event(&event) => {
                 tracing::debug!(target: "adapter", event = %event.post_type, "忽略非消息事件");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             }
             Err(e) => {
                 tracing::debug!(target: "adapter", error = %e, "忽略无法转换的入站事件");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             }
         };
 
@@ -619,7 +760,7 @@ impl InboundProcessor {
                 platform_message_id = inbound.platform_message_id,
                 "忽略 OneBot 自身回声事件"
             );
-            return Ok(());
+            return Ok(InboundDisposition::Done);
         }
 
         // 黑名单必须在 resolve 之前检查。resolve 会按需创建会话和参与者，
@@ -634,7 +775,7 @@ impl InboundProcessor {
             };
             if user_blocked {
                 tracing::info!(target: "adapter", sender_id = %inbound.external_sender_id, "用户处于黑名单，忽略入站消息");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             }
             if inbound.conversation_type == crate::domain::conversation::ConversationType::Group {
                 let group_blocked = match blacklist_repo
@@ -646,7 +787,7 @@ impl InboundProcessor {
                 };
                 if group_blocked {
                     tracing::info!(target: "adapter", group_id = %inbound.external_conversation_id, "群组处于黑名单，忽略入站消息");
-                    return Ok(());
+                    return Ok(InboundDisposition::Ignored);
                 }
             }
         }
@@ -672,7 +813,7 @@ impl InboundProcessor {
                 .await?
             else {
                 tracing::debug!(target: "adapter", "忽略未绑定会话中的管理指令");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             };
             let Some(sender_id) = self
                 .conversation_manager
@@ -680,7 +821,7 @@ impl InboundProcessor {
                 .await?
             else {
                 tracing::debug!(target: "adapter", conversation_id, "忽略未知参与者的管理指令");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             };
             let Some(binding) = self
                 .binding_manager
@@ -690,13 +831,13 @@ impl InboundProcessor {
                 .next()
             else {
                 tracing::debug!(target: "adapter", conversation_id, "忽略未绑定会话中的管理指令");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             };
             let timestamp = chrono::DateTime::from_timestamp(inbound.unix_time, 0)
                 .unwrap_or_else(chrono::Utc::now);
             match self
                 .acceptance_service
-                .accept_command(
+                .accept_command_with_seq(
                     conversation_id,
                     sender_id,
                     inbound.content,
@@ -707,6 +848,7 @@ impl InboundProcessor {
                     inbound.external_sender_id,
                     binding.id,
                     binding.switched_at,
+                    inbound_event_seq,
                 )
                 .await
             {
@@ -719,7 +861,7 @@ impl InboundProcessor {
                 ),
                 Err(error) => return Err(error),
             }
-            return Ok(());
+            return Ok(InboundDisposition::Done);
         }
 
         // 解析外部 ID → 核心 ID。普通消息允许按需创建会话和参与者。
@@ -744,7 +886,7 @@ impl InboundProcessor {
             Ok(Some(user_id)) => user_id,
             Ok(None) => {
                 tracing::error!(target: "adapter", sender_id, "用户参与者缺少全域用户身份，拒绝持久化消息");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             }
             Err(error) => return Err(error),
         };
@@ -762,7 +904,7 @@ impl InboundProcessor {
                 conversation_id,
                 "该会话未绑定角色，忽略消息（与 ReplyProcessor 行为一致）"
             );
-            return Ok(());
+            return Ok(InboundDisposition::Ignored);
         }
 
         // 取 switched_at 最新的绑定（与 switch_character 逻辑一致）
@@ -775,7 +917,7 @@ impl InboundProcessor {
             chrono::DateTime::from_timestamp(inbound.unix_time, 0).unwrap_or_else(chrono::Utc::now);
         let acceptance_result = self
             .acceptance_service
-            .accept_inbound(
+            .accept_inbound_with_seq(
                 conversation_id,
                 sender_id,
                 inbound.content.clone(),
@@ -784,6 +926,7 @@ impl InboundProcessor {
                 character_id,
                 inbound.is_mentioned,
                 serde_json::json!({"author_kind": if inbound.is_other_bot { "other_bot" } else { "user" },"external_sender_id":inbound.external_sender_id,"user_id":sender_user_id,"display_name":inbound.display_name,"mentions":inbound.mention_targets,"reply_to_platform_message_id":inbound.reply_to,"content_metadata":inbound.content_metadata,"binding_id":sorted[0].id,"binding_version":sorted[0].switched_at}),
+                inbound_event_seq,
             )
             .await;
 
@@ -810,7 +953,7 @@ impl InboundProcessor {
             conversation_sequence,
             "C2-4: 入站消息已通过 Acceptance；canonical MessageAccepted 事件由事务入口发布"
         );
-        Ok(())
+        Ok(InboundDisposition::Done)
     }
 }
 
@@ -875,6 +1018,16 @@ fn is_transient_database_error(message: &str) -> bool {
     ]
     .iter()
     .any(|marker| message.contains(marker))
+}
+
+fn inbound_error_summary(error: &RuntimeError) -> &str {
+    match error {
+        RuntimeError::Repository(crate::error::RepositoryError::Database(_))
+        | RuntimeError::Storage(crate::error::StorageError::Database(_)) => "数据库暂时不可用",
+        RuntimeError::Storage(crate::error::StorageError::Connection(_)) => "数据库连接暂时不可用",
+        RuntimeError::ParseError(_) => "入站事件解析失败",
+        _ => "入站事件处理失败",
+    }
 }
 
 fn is_message_event(event: &OneBotEvent) -> bool {
@@ -1043,6 +1196,7 @@ mod tests {
             acceptance_service: Arc::new(acceptance_service),
             binding_manager: Arc::new(binding_manager),
             blacklist_repo: None,
+            inbound_event_repo: None,
             shutdown_rx: watch::channel(false).1,
         }
     }

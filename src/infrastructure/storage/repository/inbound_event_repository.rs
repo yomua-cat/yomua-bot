@@ -167,6 +167,23 @@ impl InboundEventRepository for SqliteInboundEventRepository {
         Ok(result.rows_affected() == 1)
     }
 
+    async fn retry_inbound_event(
+        &self,
+        ingress_seq: i64,
+        last_error: &str,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            r#"UPDATE inbound_events
+                  SET status = 'received', processing_at = NULL, last_error = ?
+                WHERE ingress_seq = ? AND status = 'processing'"#,
+        )
+        .bind(last_error)
+        .bind(ingress_seq)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn cleanup_inbound_events(
         &self,
         before: DateTime<Utc>,
