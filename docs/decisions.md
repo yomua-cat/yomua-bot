@@ -50,3 +50,8 @@
 
 - 消息积压时进行积压压缩：事件年龄超过批量等待后，冻结窗口扩展到当前时间并跳过批量等待；事件年龄超过回复延迟上限后跳过 `decision.delay_ms`。未积压行为保持原批量等待和决策延迟；过期阈值保持 120 秒，不丢弃消息，被合并消息仍记录为 `batch_merge`，生成期间到达的新消息进入下一轮。影响：ReplyProcessor、行为引擎延迟、积压压测和验收文档。来源：2026-10-22 评审任务 P3-2。
 - CLI 专用依赖 `rustyline`、`crossterm`、`sysinfo` 保持为单包的必须依赖，不拆分 workspace，也不增加 feature 门控；理由是保持单一入口与简单构建，也方便其他贡献者改造控制器。背景比较：拆成 workspace 的 bot 与 ctl 两个 package，可让 `cargo run --bin yomua-bot` 和 bot 的 `cargo install` 不编译 CLI 依赖，但仓库内命令需明确 `-p`，CI 需分别构建/测试两个 package，文档中的 ctl 安装与运行命令也需更新；在单 package 中用 feature 门控改动较小，但若 feature 默认开启，主程序仍会编译 CLI 依赖，若默认关闭，则 `cargo run --bin yomua-bot-ctl` 和安装 ctl 需显式传 `--features cli`，CI 与文档同样需区分。影响：Cargo workspace、CI、部署与开发文档。来源：2026-10-21 评审任务 P4-2 维护者决定。
+
+## 2026-10-24
+
+- OneBot 入站持久化采用有界 SQLite inbox 与单一有序消费者；`runtime.inbound_durability` 第一版默认 `false`，待真实 QQ 环境验证后再以独立提交决定是否开启。容量上限为 1024 条待处理事件，终态保留 7 天后限量清理，每条事件最多处理 3 次后进入 `dead`；Action 回执仍按 `echo` 直接路由。影响：OneBot 连接、SQLite 仓储、消息接受事务、启动关停及部署配置。来源：2026-10-24 P5-1 实施要求。
+- Inbox 只能恢复已提交的事件；帧读取后、inbox 事务提交前崩溃仍可能丢失，QQ/OneBot 重放能力未验证。持久输入不保证回复送达；旧版本遗留的内存事件无法迁移。影响：OneBot 入站可靠性说明与运维预期。来源：2026-10-24 P5-1 设计约束。

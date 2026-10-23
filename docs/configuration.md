@@ -64,6 +64,8 @@ inbound_durability = false
 | `proxy` | 可选的模型出站 HTTP(S) 代理；URL 格式错误会阻止启动，修改后需要重启 |
 | `inbound_durability` | 是否先将 OneBot 原始事件写入 SQLite inbox，再交给入站处理器；默认 `false`，修改后需要重启 |
 
+启用后，SQLite inbox 最多容纳 1024 条待处理事件，终态记录保留 7 天后限量清理。原始事件正文可能包含用户消息，数据库文件应按运行数据的隐私边界保护。
+
 `runtime.proxy` 由主程序显式注入 TypeSafe 和 OpenAI-compatible 的专用 `reqwest` 客户端，覆盖模型生成、健康检查和 embedding 请求；未配置时维持直连。代理仅作用于这些模型 HTTP 请求。OneBot/NapCat WebSocket 使用独立的 `tokio-tungstenite` 连接器，始终直连配置的本地或局域网地址，不读取此代理；插件 Unix socket 与其他非模型流量也不受影响。代理凭据支持写在 URL 中，程序不会将代理 URL 或客户端网络错误写入日志/错误摘要。
 
 ### 日志过滤

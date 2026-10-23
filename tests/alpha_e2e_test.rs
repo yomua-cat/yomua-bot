@@ -56,8 +56,8 @@ use yomua_bot::domain::message::{Message, MessageContent};
 use yomua_bot::domain::repository::{
     BehaviorStateRepository, CharacterBindingRepository, CharacterRepository,
     CharacterStateRepository, ConversationRepository, ConversationStateRepository,
-    MemoryRepository, MessageRepository, MoodRepository, ParticipantRepository,
-    RelationshipRepository,
+    InboundEventRepository, MemoryRepository, MessageRepository, MoodRepository,
+    ParticipantRepository, RelationshipRepository,
 };
 use yomua_bot::error::RuntimeError;
 use yomua_bot::infrastructure::llm::{
@@ -67,9 +67,9 @@ use yomua_bot::infrastructure::llm::{
 use yomua_bot::infrastructure::storage::repository::{
     SqliteBehaviorStateRepository, SqliteCharacterBindingRepository, SqliteCharacterRepository,
     SqliteCharacterStateRepository, SqliteConversationRepository,
-    SqliteConversationStateRepository, SqliteMemoryRepository, SqliteMessageRepository,
-    SqliteMoodRepository, SqliteOutboxRepository, SqliteParticipantRepository,
-    SqliteRelationshipRepository,
+    SqliteConversationStateRepository, SqliteInboundEventRepository, SqliteMemoryRepository,
+    SqliteMessageRepository, SqliteMoodRepository, SqliteOutboxRepository,
+    SqliteParticipantRepository, SqliteRelationshipRepository,
 };
 use yomua_bot::infrastructure::storage::SqliteStorage;
 
@@ -330,6 +330,8 @@ struct AlphaHarness {
     reply_processor: Arc<ReplyProcessor>,
     binding_manager: Arc<BindingManager>,
     outbox_repo: Arc<SqliteOutboxRepository>,
+    inbound_event_repo: Arc<SqliteInboundEventRepository>,
+    inbound_durability: bool,
     acceptance_service: Arc<yomua_bot::application::message_acceptance::MessageAcceptanceService>,
     /// 保存 adapter 以便在测试结束后调用 stop()
     _adapter: Arc<dyn yomua_bot::adapters::onebot::OneBotAdapter>,
@@ -397,12 +399,16 @@ async fn setup_with_options(
     acknowledge_actions: bool,
     persist_reply_tasks: bool,
 ) -> Result<AlphaHarness, Box<dyn std::error::Error>> {
+    let inbound_durability = std::env::var("YOMUA_INBOUND_DURABILITY")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     // 1. 每个 test 独立 temp dir，确保数据库隔离
     let temp_dir = tempfile::tempdir()?;
     let db_path = temp_dir.path().join("alpha_e2e.db");
     let storage = SqliteStorage::open(db_path.to_str().unwrap()).await?;
     storage.migrate().await?;
     let pool = storage.pool().clone();
+    let inbound_event_repo = Arc::new(SqliteInboundEventRepository::new(pool.clone()));
 
     // 2. 真实仓储
     let char_repo: Arc<dyn CharacterRepository> =
@@ -639,23 +645,26 @@ async fn setup_with_options(
             bus.clone(),
         ),
     );
-    let adapter: Arc<dyn yomua_bot::adapters::onebot::OneBotAdapter> =
-        Arc::new(OneBotAdapterImpl::with_connector(
-            OneBotConfig {
-                websocket_url: "ws://localhost:1".to_string(),
-                access_token: None,
-                bot_self_id: Some(111111),
-                reconnect_interval_secs: 1,
-                max_reconnect_interval_secs: 4,
-                heartbeat_interval_secs: 30,
-                action_timeout_secs: 10,
-            },
-            bus.clone(),
-            conversation_manager,
-            acceptance_service.clone(),
-            binding_manager.clone(),
-            held_connector,
-        ));
+    let mut adapter_builder = OneBotAdapterImpl::with_connector(
+        OneBotConfig {
+            websocket_url: "ws://localhost:1".to_string(),
+            access_token: None,
+            bot_self_id: Some(111111),
+            reconnect_interval_secs: 1,
+            max_reconnect_interval_secs: 4,
+            heartbeat_interval_secs: 30,
+            action_timeout_secs: 10,
+        },
+        bus.clone(),
+        conversation_manager,
+        acceptance_service.clone(),
+        binding_manager.clone(),
+        held_connector,
+    );
+    if inbound_durability {
+        adapter_builder = adapter_builder.with_inbound_durability(inbound_event_repo.clone());
+    }
+    let adapter: Arc<dyn yomua_bot::adapters::onebot::OneBotAdapter> = Arc::new(adapter_builder);
 
     // 启动适配器并等待连接建立
     adapter.start().await?;
@@ -705,9 +714,64 @@ async fn setup_with_options(
         reply_processor,
         binding_manager,
         outbox_repo,
+        inbound_event_repo,
+        inbound_durability,
         acceptance_service,
         _adapter: adapter,
     })
+}
+
+async fn persist_measurement_inbox_event(
+    harness: &AlphaHarness,
+    index: usize,
+) -> Result<Option<i64>, Box<dyn std::error::Error>> {
+    if !harness.inbound_durability {
+        return Ok(None);
+    }
+    let raw_event = format!(r#"{{"post_type":"message","message_id":{index}}}"#);
+    let mut retry = 0_u32;
+    let event = loop {
+        match harness
+            .inbound_event_repo
+            .insert_inbound_event(&raw_event, chrono::Utc::now())
+            .await
+        {
+            Ok(event) => break event,
+            Err(yomua_bot::error::RepositoryError::Database(message))
+                if message.to_ascii_lowercase().contains("locked") =>
+            {
+                retry = retry.saturating_add(1);
+                tokio::time::sleep(Duration::from_millis(
+                    (50 * (1_u64 << retry.min(5))).min(2_000),
+                ))
+                .await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let mut retry = 0_u32;
+    let claimed = loop {
+        match harness
+            .inbound_event_repo
+            .claim_next_inbound_event(chrono::Utc::now())
+            .await
+        {
+            Ok(Some(claimed)) => break claimed,
+            Ok(None) => return Err("入站测量事件未能领取".into()),
+            Err(yomua_bot::error::RepositoryError::Database(message))
+                if message.to_ascii_lowercase().contains("locked") =>
+            {
+                retry = retry.saturating_add(1);
+                tokio::time::sleep(Duration::from_millis(
+                    (50 * (1_u64 << retry.min(5))).min(2_000),
+                ))
+                .await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    assert_eq!(claimed.ingress_seq, event.ingress_seq);
+    Ok(Some(event.ingress_seq))
 }
 
 // ============================================================================
@@ -1434,10 +1498,13 @@ async fn p2_1_single_conversation_backlog_measurement() {
     let mut jobs = Vec::with_capacity(120);
 
     for index in 0..120 {
+        let inbound_event_seq = persist_measurement_inbox_event(&h, index)
+            .await
+            .expect("压测 inbox 持久化失败");
         let timestamp = chrono::Utc::now();
         let (message_id, _) = h
             .acceptance_service
-            .accept_inbound(
+            .accept_inbound_with_seq(
                 h.conv_id,
                 h.user_participant_id,
                 format!("请处理第 {} 条消息", index + 1),
@@ -1446,6 +1513,7 @@ async fn p2_1_single_conversation_backlog_measurement() {
                 h.char_a_id,
                 false,
                 serde_json::json!({}),
+                inbound_event_seq,
             )
             .await
             .expect("压测消息入库失败");
@@ -1601,8 +1669,11 @@ async fn p3_1_outbox_single_conversation_backlog_measurement() {
     });
 
     for index in 0..120 {
+        let inbound_event_seq = persist_measurement_inbox_event(&h, index)
+            .await
+            .expect("压测 inbox 持久化失败");
         h.acceptance_service
-            .accept_inbound(
+            .accept_inbound_with_seq(
                 h.conv_id,
                 h.user_participant_id,
                 format!("请处理第 {} 条消息", index + 1),
@@ -1611,6 +1682,7 @@ async fn p3_1_outbox_single_conversation_backlog_measurement() {
                 h.char_a_id,
                 false,
                 serde_json::json!({}),
+                inbound_event_seq,
             )
             .await
             .expect("压测消息入库失败");
@@ -1731,4 +1803,82 @@ async fn p3_1_outbox_single_conversation_backlog_measurement() {
     shutdown_tx.send(true).ok();
     dispatcher_task.await.expect("dispatcher 压测任务异常");
     processor_task.await.expect("processor 压测任务异常");
+}
+
+#[tokio::test]
+#[ignore = "耗时约 10 秒，仅用于手动测量入站持久化与回执延迟"]
+async fn p5_1_inbound_write_and_action_ack_measurement() {
+    let h = setup_with_options(Duration::ZERO, Arc::new(ZeroDelay), true, true)
+        .await
+        .expect("压测装配失败");
+    let repo = h.inbound_event_repo.clone();
+    let ingress_samples = Arc::new(Mutex::new(Vec::with_capacity(1_000)));
+    let ingress_samples_writer = ingress_samples.clone();
+    let writer = tokio::spawn(async move {
+        let interval = tokio::time::interval(Duration::from_millis(10));
+        let mut interval = interval;
+        for index in 0..1_000 {
+            interval.tick().await;
+            let started = std::time::Instant::now();
+            let event = repo
+                .insert_inbound_event(
+                    &format!(r#"{{"post_type":"message","message_id":{index}}}"#),
+                    chrono::Utc::now(),
+                )
+                .await
+                .expect("合成 inbox 写入失败");
+            let write_ms = started.elapsed().as_micros() as u64;
+            let claimed = repo
+                .claim_next_inbound_event(chrono::Utc::now())
+                .await
+                .expect("合成 inbox 领取失败")
+                .expect("合成 inbox 记录应可领取");
+            assert_eq!(claimed.ingress_seq, event.ingress_seq);
+            repo.mark_inbound_event(
+                event.ingress_seq,
+                yomua_bot::domain::inbound_event::InboundEventStatus::Ignored,
+                chrono::Utc::now(),
+                None,
+            )
+            .await
+            .expect("合成 inbox 终结失败");
+            ingress_samples_writer
+                .lock()
+                .unwrap()
+                .push((write_ms, started.elapsed().as_micros() as u64));
+        }
+    });
+
+    let mut ack_samples = Vec::with_capacity(100);
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    for index in 0..100 {
+        interval.tick().await;
+        let started = std::time::Instant::now();
+        h._adapter
+            .send_group_message("100000999", &format!("ack-{index}"))
+            .await
+            .expect("假 OneBot Action 请求失败");
+        ack_samples.push(started.elapsed().as_micros() as u64);
+    }
+    writer.await.expect("入站测量任务异常");
+
+    let percentile = |mut samples: Vec<u64>, ratio: f64| {
+        samples.sort_unstable();
+        let index = ((samples.len() as f64 * ratio).ceil() as usize)
+            .saturating_sub(1)
+            .min(samples.len().saturating_sub(1));
+        samples.get(index).copied().unwrap_or_default()
+    };
+    let ingress = ingress_samples.lock().unwrap().clone();
+    let write_samples = ingress.iter().map(|(write, _)| *write).collect();
+    let process_samples = ingress.iter().map(|(_, process)| *process).collect();
+    println!(
+        "[P5-1] 合成事件=1000/10s, 速率=100/s, inbox_write_p50/p95={} / {}us, insert_to_terminal_p50/p95={} / {}us, action_ack_p50/p95={} / {}us, fake_onebot=true, fake_provider=true",
+        percentile(write_samples, 0.50),
+        percentile(ingress.iter().map(|(write, _)| *write).collect(), 0.95),
+        percentile(process_samples, 0.50),
+        percentile(ingress.iter().map(|(_, process)| *process).collect(), 0.95),
+        percentile(ack_samples.clone(), 0.50),
+        percentile(ack_samples, 0.95),
+    );
 }

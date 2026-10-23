@@ -23,7 +23,13 @@
 
 ```mermaid
 flowchart TD
-    A[OneBot WebSocket 入站] --> B[转换事件、解析会话和参与者]
+    A[OneBot WebSocket 入站] --> A1{Action 回执?}
+    A1 -->|是| ACK[按 echo 路由 pending 回执]
+    A1 -->|否且开关关闭| B[转换事件、解析会话和参与者]
+    A1 -->|否且开关开启| IN[有界持久化任务]
+    IN --> DB0[SQLite inbox 提交]
+    DB0 --> CON[单一消费者按 ingress_seq 领取]
+    CON --> B
     B --> C{系统指令}
     C -->|是| D[已有会话/身份检查后持久化系统消息]
     D --> E[MessageAccepted Outbox]
@@ -39,6 +45,7 @@ flowchart TD
     M --> O[控制回复任务 → OneBot]
     N --> P[回复任务 → OneBot]
     H --> Q[EventBus MessageAccepted → 观察者与插件]
+    DB0 -.忽略/错误终态.-> TERM[inbox 终态]
 ```
 
 入站实现见[OneBot 适配器](../src/adapters/onebot/mod.rs)。系统指令先截流，只接受已有会话、参与者和角色绑定，然后作为 `author_kind=system_command` 的消息写入消息表和 Outbox；它不会进入普通角色上下文或插件消息订阅。普通消息无角色绑定时不进入消息落库及回复流程，但允许按需创建会话与发送者。
@@ -47,7 +54,7 @@ flowchart TD
 
 OneBot 连接循环独立路由 Action 回执，不等待入站业务处理任务；下游通道积压时，连接循环先将普通事件暂存在内存 FIFO，最多 1024 条，以便继续读取并交付其后的回执。达到上限后会暂停 WebSocket 读取形成背压，因此极端入站积压仍可能延迟回执；该上限避免无界内存增长，压力场景尚未完成真实验收。入站处理器对数据库、仓储连接和 SQLite 锁等暂时性错误最多重试 3 次，使用递增短延迟，并在重试期间保持后续消息不被处理；永久错误、解析错误和业务性忽略不会重试。
 
-`runtime.toml` 的 `inbound_durability` 默认关闭。开启后，连接循环仍只分类并转发事件，独立入口先提交原始事件到 SQLite `inbound_events`，之后才通知单一消费者；写入错误会保留当前事件并形成有界背压，不记录事件正文。消费者按自增 `ingress_seq` 处理；普通消息和管理指令在消息/Outbox 事务中同时标记 inbox 完成，忽略分支写入 `ignored`，可恢复错误最多尝试 3 次后进入 `dead`。适配器启动时先把旧的 `processing` 记录恢复为 `received`，再启动新事件入口；关停时未处理记录保持原状态，供下次启动恢复。帧读取后、inbox 事务提交前仍有不可消除的短暂丢失窗口。
+`runtime.toml` 的 `inbound_durability` 默认关闭。开启后，Action 回执仍由连接循环按 `echo` 路由，事件由独立有界入口先提交至 SQLite `inbound_events`，提交后才通知单一消费者；写入失败或 inbox 达到 1024 条待处理上限时会保留当前事件并形成 WebSocket 读取背压，不记录事件正文。消费者按自增 `ingress_seq` 处理；普通消息和管理指令在消息/Outbox 事务中同时标记 inbox 完成，忽略分支写入 `ignored`，可恢复错误最多尝试 3 次后进入 `dead`。终态记录在 7 天后由限量清理移除。适配器启动时先恢复旧的 `processing` 记录，关停时未处理记录保持原状态，供下次启动恢复。帧读取后、inbox 事务提交前仍有不可消除的短暂丢失窗口；持久化输入不保证模型或平台最终送达。
 
 [OutboxDispatcher](../src/application/outbox_dispatcher.rs)轮询、领取租约并等待消费者应答；[OutboxProcessor](../src/application/outbox_processor.rs)把 payload 转交[回复处理器](../src/application/reply_processor.rs)。租约、轮询和重试策略是代码默认值，当前没有对应 TOML 字段；数据库、发送和通用传输错误沿用短退避，LLM 响应内容无效或限流使用更长的重试次数与退避。429 的 `Retry-After` 会被保留并受 120 秒上限及事件过期时间约束。消费者成功后标记完成，失败可转入等待重试或死信；永久失败事件记录后不会阻塞同一会话后续事件。
 

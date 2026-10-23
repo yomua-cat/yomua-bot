@@ -1467,6 +1467,88 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn inbox_command_and_echo_replays_stay_idempotent() {
+        let storage = setup_storage().await;
+        let conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type, external_id) VALUES ('group', 'inbox-side-effects') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let message_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        assert!(message_repo
+            .claim_command_message(conversation_id, 9100)
+            .await
+            .unwrap());
+        let command_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM command_receipts WHERE conversation_id = ? AND platform_message_id = 9100",
+        )
+        .bind(conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(command_rows, 1);
+        assert!(!message_repo
+            .claim_command_message(conversation_id, 9100)
+            .await
+            .unwrap());
+
+        let metadata = serde_json::json!({"author_kind": "platform_echo"});
+        message_repo
+            .record_platform_echo(conversation_id, 9200, "bot-1", "回放回声", &metadata)
+            .await
+            .unwrap();
+        message_repo
+            .record_platform_echo(conversation_id, 9200, "bot-1", "回放回声", &metadata)
+            .await
+            .unwrap();
+        let echo_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM platform_message_echoes WHERE conversation_id = ? AND platform_message_id = 9200",
+        )
+        .bind(conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(echo_rows, 1);
+
+        let inbox_repo =
+            crate::infrastructure::storage::repository::SqliteInboundEventRepository::new(
+                storage.pool().clone(),
+            );
+        let now = chrono::Utc::now();
+        let event = inbox_repo
+            .insert_inbound_event("replay", now)
+            .await
+            .unwrap();
+        let claimed = inbox_repo
+            .claim_next_inbound_event(now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.ingress_seq, event.ingress_seq);
+        assert!(inbox_repo
+            .mark_inbound_event(
+                event.ingress_seq,
+                crate::domain::inbound_event::InboundEventStatus::Done,
+                now,
+                None,
+            )
+            .await
+            .unwrap());
+        assert!(!inbox_repo
+            .mark_inbound_event(
+                event.ingress_seq,
+                crate::domain::inbound_event::InboundEventStatus::Done,
+                now,
+                None,
+            )
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn platform_echo_matches_only_one_recent_unknown_reply_in_same_conversation() {
         let storage = setup_storage().await;
         let char_id: i64 =
