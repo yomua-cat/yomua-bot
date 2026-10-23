@@ -67,8 +67,8 @@ use yomua_bot::domain::decision::{
 use yomua_bot::domain::repository::{
     AutonomyRepository, BehaviorStateRepository, BlacklistRepository, CharacterBindingRepository,
     CharacterRepository, CharacterStateRepository, ConversationRepository,
-    ConversationStateRepository, MemoryRepository, MessageRepository, MoodRepository,
-    ParticipantRepository, PluginDataRepository, RelationshipRepository,
+    ConversationStateRepository, InboundEventRepository, MemoryRepository, MessageRepository,
+    MoodRepository, ParticipantRepository, PluginDataRepository, RelationshipRepository,
 };
 use yomua_bot::error::RuntimeError;
 use yomua_bot::infrastructure::llm::openai_compatible::{
@@ -84,8 +84,8 @@ use yomua_bot::infrastructure::plugin::supervisor::{PluginSupervisor, Supervisor
 use yomua_bot::infrastructure::storage::repository::{
     SqliteAutonomyRepository, SqliteBehaviorStateRepository, SqliteBlacklistRepository,
     SqliteCharacterBindingRepository, SqliteCharacterRepository, SqliteCharacterStateRepository,
-    SqliteConversationRepository, SqliteConversationStateRepository, SqliteMemoryRepository,
-    SqliteMessageRepository, SqliteMoodRepository, SqliteOutboxRepository,
+    SqliteConversationRepository, SqliteConversationStateRepository, SqliteInboundEventRepository,
+    SqliteMemoryRepository, SqliteMessageRepository, SqliteMoodRepository, SqliteOutboxRepository,
     SqliteParticipantRepository, SqlitePluginDataRepository, SqliteRelationshipRepository,
 };
 use yomua_bot::infrastructure::storage::SqliteResponseRateLimiter;
@@ -364,7 +364,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         bus.clone(),
     ));
 
-    let adapter = OneBotAdapterImpl::new(
+    let mut adapter = OneBotAdapterImpl::new(
         onebot_cfg.clone(),
         bus.clone(),
         conversation_manager,
@@ -373,6 +373,9 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     )
     .await
     .with_blacklist_repo(repos.blacklist_repo.clone());
+    if runtime_cfg.inbound_durability {
+        adapter = adapter.with_inbound_durability(repos.inbound_event_repo.clone());
+    }
     let adapter = Arc::new(adapter);
 
     let action_dispatcher = Arc::new(ActionDispatcher::new(
@@ -1021,6 +1024,7 @@ struct Repos {
     blacklist_repo: Arc<dyn BlacklistRepository>,
     outbox_repo: Arc<SqliteOutboxRepository>,
     autonomy_repo: Arc<dyn AutonomyRepository>,
+    inbound_event_repo: Arc<dyn InboundEventRepository>,
     rate_limiter: Arc<dyn ResponseRateLimiter>,
 }
 
@@ -1053,6 +1057,8 @@ fn build_repos(pool: SqlitePool) -> Repos {
     let outbox_repo = Arc::new(SqliteOutboxRepository::new(pool.clone()));
     let autonomy_repo: Arc<dyn AutonomyRepository> =
         Arc::new(SqliteAutonomyRepository::new(pool.clone()));
+    let inbound_event_repo: Arc<dyn InboundEventRepository> =
+        Arc::new(SqliteInboundEventRepository::new(pool.clone()));
     let rate_limiter: Arc<dyn ResponseRateLimiter> =
         Arc::new(SqliteResponseRateLimiter::new(pool.clone()));
 
@@ -1073,6 +1079,7 @@ fn build_repos(pool: SqlitePool) -> Repos {
         blacklist_repo,
         outbox_repo,
         autonomy_repo,
+        inbound_event_repo,
         rate_limiter,
     }
 }

@@ -27,7 +27,7 @@ use crate::application::conversation::ConversationManager;
 use crate::application::event_bus::EventBus;
 use crate::application::message_acceptance::MessageAcceptanceService;
 use crate::domain::blacklist::BlacklistType;
-use crate::domain::repository::BlacklistRepository;
+use crate::domain::repository::{BlacklistRepository, InboundEventRepository};
 use crate::error::RuntimeError;
 
 pub mod connection;
@@ -177,6 +177,8 @@ pub struct OneBotAdapterImpl {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// 连接器（真实或测试用假连接）。
     connector: Arc<dyn WsConnector>,
+    /// 可选的入站 inbox 仓储；启用后先持久化原始事件再交给处理器。
+    inbound_event_repo: Option<Arc<dyn InboundEventRepository>>,
 }
 
 impl OneBotAdapterImpl {
@@ -235,12 +237,19 @@ impl OneBotAdapterImpl {
             started: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
             connector,
+            inbound_event_repo: None,
         }
     }
 
     /// 装配入站黑名单仓储。测试和不需要持久黑名单的调用方可保持默认关闭。
     pub fn with_blacklist_repo(mut self, repo: Arc<dyn BlacklistRepository>) -> Self {
         self.blacklist_repo = Some(repo);
+        self
+    }
+
+    /// 启用入站事件持久化入口。
+    pub fn with_inbound_durability(mut self, repo: Arc<dyn InboundEventRepository>) -> Self {
+        self.inbound_event_repo = Some(repo);
         self
     }
 }
@@ -283,6 +292,22 @@ impl OneBotAdapter for OneBotAdapterImpl {
             shutdown_rx,
         ));
 
+        let mut tasks = vec![connection_task];
+        let event_rx = if let Some(repo) = self.inbound_event_repo.clone() {
+            let (processor_tx, processor_rx) = mpsc::channel(256);
+            let persistence_shutdown_rx = self.shutdown_tx.subscribe();
+            let persistence_task = tokio::spawn(persist_inbound_events(
+                event_rx,
+                processor_tx,
+                repo,
+                persistence_shutdown_rx,
+            ));
+            tasks.push(persistence_task);
+            processor_rx
+        } else {
+            event_rx
+        };
+
         // 入站处理任务（解析 → 解析核心 ID → Acceptance → 发布 CoreEvent）。
         let processor = InboundProcessor {
             event_rx,
@@ -294,10 +319,8 @@ impl OneBotAdapter for OneBotAdapterImpl {
             shutdown_rx: processor_shutdown_rx,
         };
         let processor_task = tokio::spawn(async move { processor.run().await });
-        self.tasks
-            .lock()
-            .await
-            .extend([connection_task, processor_task]);
+        tasks.push(processor_task);
+        self.tasks.lock().await.extend(tasks);
 
         Ok(())
     }
@@ -351,6 +374,68 @@ impl OneBotAdapter for OneBotAdapterImpl {
     ) -> Result<ActionResponse, RuntimeError> {
         let request = build_private_send_request(user_id, content)?;
         self.send_action(request).await
+    }
+}
+
+/// 先把原始事件写入 inbox，再交给现有入站处理器。
+///
+/// 写入失败时停留在当前事件并短暂退避，接收端因无法继续消费而形成
+/// 有界背压；日志只记录错误摘要，不记录原始 OneBot 正文。
+async fn persist_inbound_events(
+    mut event_rx: mpsc::Receiver<String>,
+    processor_tx: mpsc::Sender<String>,
+    repo: Arc<dyn InboundEventRepository>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            raw = event_rx.recv() => {
+                let Some(raw) = raw else { break; };
+                let mut retry = 0u32;
+                let ingress_seq = loop {
+                    match repo.insert_inbound_event(&raw, chrono::Utc::now()).await {
+                        Ok(event) => break event.ingress_seq,
+                        Err(error) => {
+                            retry = retry.saturating_add(1);
+                            let delay_ms = (50_u64.saturating_mul(1_u64 << retry.min(5))).min(2_000);
+                            tracing::warn!(
+                                target: "adapter",
+                                retry,
+                                delay_ms,
+                                error = %error,
+                                "入站事件写入 inbox 失败，保持背压并重试"
+                            );
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                                changed = shutdown_rx.changed() => {
+                                    if changed.is_err() || *shutdown_rx.borrow() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                tokio::select! {
+                    result = processor_tx.send(raw) => {
+                        if result.is_err() {
+                            tracing::warn!(target: "adapter", ingress_seq, "入站处理器通道已关闭，保留 inbox 记录");
+                            break;
+                        }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1557,5 +1642,47 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn inbox_write_failure_blocks_processing_and_applies_bounded_backpressure() {
+        let storage = crate::infrastructure::storage::SqliteStorage::open_in_memory()
+            .await
+            .unwrap();
+        storage.migrate().await.unwrap();
+        sqlx::query("DROP TABLE inbound_events")
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        let repo = Arc::new(
+            crate::infrastructure::storage::repository::SqliteInboundEventRepository::new(
+                storage.pool().clone(),
+            ),
+        );
+        let (source_tx, source_rx) = mpsc::channel(1);
+        let (processor_tx, mut processor_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(persist_inbound_events(
+            source_rx,
+            processor_tx,
+            repo,
+            shutdown_rx,
+        ));
+
+        source_tx.send("event-one".to_owned()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(processor_rx.try_recv().is_err());
+        source_tx.send("event-two".to_owned()).await.unwrap();
+        assert!(matches!(
+            source_tx.try_send("event-three".to_owned()),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("持久化入口应响应关停信号")
+            .expect("持久化入口任务不应 panic");
+        assert!(processor_rx.try_recv().is_err());
     }
 }
