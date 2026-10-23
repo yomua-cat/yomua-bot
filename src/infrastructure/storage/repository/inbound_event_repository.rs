@@ -56,6 +56,15 @@ fn parse_row(row: InboundEventRow) -> Result<InboundEvent, RepositoryError> {
 
 #[async_trait]
 impl InboundEventRepository for SqliteInboundEventRepository {
+    async fn next_pending_inbound_seq(&self) -> Result<Option<i64>, RepositoryError> {
+        sqlx::query_scalar(
+            "SELECT ingress_seq FROM inbound_events WHERE status = 'received' ORDER BY ingress_seq LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(RepositoryError::from)
+    }
+
     async fn insert_inbound_event(
         &self,
         raw_event: &str,
@@ -290,11 +299,18 @@ mod tests {
             repo.insert_inbound_event("second", received_at)
                 .await
                 .unwrap();
+            let claimed = repo
+                .claim_next_inbound_event(received_at)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.ingress_seq, first_seq);
             storage.close().await;
         }
         let storage = SqliteStorage::open(&path_string).await.unwrap();
         storage.migrate().await.unwrap();
         let repo = SqliteInboundEventRepository::new(storage.pool().clone());
+        assert_eq!(repo.recover_inbound_events(Utc::now()).await.unwrap(), 1);
         assert_eq!(
             repo.claim_next_inbound_event(received_at)
                 .await
@@ -302,6 +318,17 @@ mod tests {
                 .unwrap()
                 .ingress_seq,
             first_seq
+        );
+        repo.mark_inbound_event(first_seq, InboundEventStatus::Done, Utc::now(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.claim_next_inbound_event(received_at)
+                .await
+                .unwrap()
+                .unwrap()
+                .ingress_seq,
+            first_seq + 1
         );
     }
 

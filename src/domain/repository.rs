@@ -28,6 +28,8 @@ use crate::error::RepositoryError;
 
 #[async_trait]
 pub trait InboundEventRepository: Send + Sync {
+    async fn next_pending_inbound_seq(&self) -> Result<Option<i64>, RepositoryError>;
+
     async fn insert_inbound_event(
         &self,
         raw_event: &str,

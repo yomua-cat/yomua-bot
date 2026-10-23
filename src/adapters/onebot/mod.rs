@@ -40,7 +40,8 @@ pub use conversion::{
     OutgoingRequest,
 };
 
-const MAX_INBOUND_RETRIES: usize = 3;
+const MAX_INBOUND_RETRIES: usize =
+    crate::domain::inbound_event::INBOUND_EVENT_MAX_ATTEMPTS as usize;
 const INBOUND_RETRY_BASE_DELAY_MS: u64 = 100;
 
 enum InboundInput {
@@ -286,6 +287,20 @@ impl OneBotAdapter for OneBotAdapterImpl {
             .take()
             .ok_or_else(|| RuntimeError::Adapter("入站通道已被占用".to_string()))?;
 
+        let startup_inbox_seq = if let Some(repo) = self.inbound_event_repo.as_ref() {
+            repo.recover_inbound_events(chrono::Utc::now())
+                .await
+                .map_err(RuntimeError::Repository)?;
+            let pending_seq = repo
+                .next_pending_inbound_seq()
+                .await
+                .map_err(RuntimeError::Repository)?;
+            tracing::info!(target: "adapter", "已恢复可重试的入站 inbox 事件");
+            pending_seq
+        } else {
+            None
+        };
+
         let shutdown_rx = self.shutdown_tx.subscribe();
         let processor_shutdown_rx = self.shutdown_tx.subscribe();
         let connector = Arc::clone(&self.connector);
@@ -305,6 +320,12 @@ impl OneBotAdapter for OneBotAdapterImpl {
 
         let mut tasks = vec![connection_task];
         let (processor_tx, processor_rx) = mpsc::channel(256);
+        if let Some(ingress_seq) = startup_inbox_seq {
+            processor_tx
+                .send(InboundInput::InboxSeq(ingress_seq))
+                .await
+                .map_err(|_| RuntimeError::Adapter("无法唤醒入站 inbox 消费者".to_string()))?;
+        }
         if let Some(repo) = self.inbound_event_repo.clone() {
             let persistence_shutdown_rx = self.shutdown_tx.subscribe();
             let persistence_task = tokio::spawn(persist_inbound_events(
@@ -651,12 +672,21 @@ impl InboundProcessor {
                         .await
                     {
                         tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %error, "写入 inbox 终态失败");
+                        return;
                     }
-                    return;
+                    event = match repo.claim_next_inbound_event(chrono::Utc::now()).await {
+                        Ok(Some(event)) => event,
+                        Ok(None) => return,
+                        Err(error) => {
+                            tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %error, "领取后续 inbox 事件失败");
+                            return;
+                        }
+                    };
                 }
                 Err(error)
                     if is_retryable_inbound_error(&error)
-                        && event.attempts < MAX_INBOUND_RETRIES as i32 =>
+                        && event.attempts
+                            < crate::domain::inbound_event::INBOUND_EVENT_MAX_ATTEMPTS =>
                 {
                     let summary = inbound_error_summary(&error);
                     if let Err(mark_error) =
@@ -698,7 +728,14 @@ impl InboundProcessor {
                         tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %mark_error, "写入 inbox dead 终态失败");
                     }
                     tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %summary, "入站 inbox 事件进入 dead 终态");
-                    return;
+                    event = match repo.claim_next_inbound_event(chrono::Utc::now()).await {
+                        Ok(Some(event)) => event,
+                        Ok(None) => return,
+                        Err(error) => {
+                            tracing::error!(target: "adapter", error = %error, "领取 dead 后续 inbox 事件失败");
+                            return;
+                        }
+                    };
                 }
             }
         }

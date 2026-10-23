@@ -3,6 +3,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// 单条入站事件允许的总处理尝试次数。
+pub const INBOUND_EVENT_MAX_ATTEMPTS: i32 = 3;
+/// 终态入站事件的默认保留期（天）。
+pub const INBOUND_EVENT_RETENTION_DAYS: i64 = 7;
+
 /// 入站事件的持久处理状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
