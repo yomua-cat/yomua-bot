@@ -1032,6 +1032,224 @@ mod storage_tests {
     }
 
     #[tokio::test]
+    async fn inbound_acceptance_rolls_back_all_side_effects_when_inbox_completion_fails() {
+        let storage = setup_storage().await;
+        let conversation_id: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations(conversation_type, external_id) VALUES ('group', 'inbox-rollback') RETURNING id",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let character_id: i64 =
+            sqlx::query_scalar("INSERT INTO characters(name) VALUES ('入站回滚测试') RETURNING id")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        sqlx::query("INSERT INTO participants(conversation_id, external_id, display_name, role, metadata) VALUES (?, '1', '测试用户', 'user', '{}')")
+            .bind(conversation_id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let ingress_seq: i64 = sqlx::query_scalar(
+            "INSERT INTO inbound_events(raw_event, received_at, status, attempts, processing_at) VALUES ('rollback-payload', ?, 'processing', 1, ?) RETURNING ingress_seq",
+        )
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"CREATE TRIGGER fail_inbound_completion
+               BEFORE UPDATE OF status ON inbound_events
+               WHEN NEW.status = 'done'
+               BEGIN SELECT RAISE(ABORT, 'injected completion failure'); END"#,
+        )
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        let message_repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let input = crate::domain::repository::AcceptedMessageInput {
+            conversation_id,
+            sender_id: 1,
+            content_json: serde_json::json!({"Text":"回滚消息"}).to_string(),
+            timestamp: now.to_rfc3339(),
+            platform_message_id: Some(9010),
+            character_id,
+            event_uuid: "inbox-rollback-event".to_string(),
+            outbox_payload: serde_json::json!({
+                "event_uuid": "inbox-rollback-event",
+                "conversation_id": conversation_id,
+                "sender_id": 1,
+                "message_id": 0,
+                "content": "回滚消息",
+                "timestamp": now,
+                "is_mentioned": false,
+                "character_id": character_id,
+                "conversation_sequence": 0,
+                "platform_message_id": 9010,
+                "ingested_at": now,
+                "metadata": {"author_kind": "user"}
+            })
+            .to_string(),
+            inbound_event_seq: Some(ingress_seq),
+        };
+
+        let error = message_repo
+            .accept_message_with_status(&input)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::error::RepositoryError::Database(_)));
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM messages WHERE conversation_id = ?),
+                   (SELECT COUNT(*) FROM outbox_events WHERE ordering_key = ?),
+                   (SELECT sequence_counter FROM conversations WHERE id = ?)"#,
+        )
+        .bind(conversation_id)
+        .bind(conversation_id.to_string())
+        .bind(conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0, 0));
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM inbound_events WHERE ingress_seq = ?")
+                .bind(ingress_seq)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "processing");
+
+        let inbox_repo =
+            crate::infrastructure::storage::repository::SqliteInboundEventRepository::new(
+                storage.pool().clone(),
+            );
+        sqlx::query("DROP TRIGGER fail_inbound_completion")
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        inbox_repo
+            .recover_inbound_events(now + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        inbox_repo
+            .claim_next_inbound_event(now)
+            .await
+            .unwrap()
+            .expect("回滚后事件仍应可领取");
+        let accepted = message_repo
+            .accept_message_with_status(&input)
+            .await
+            .unwrap();
+        assert!(accepted.created);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM inbound_events WHERE ingress_seq = ?")
+                .bind(ingress_seq)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "done");
+    }
+
+    #[tokio::test]
+    async fn inbound_replay_after_reopening_sqlite_file_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("inbox-replay.sqlite");
+        let path_string = path.to_string_lossy().into_owned();
+        let now = chrono::Utc::now();
+        let ingress_seq;
+        let input;
+        {
+            let storage = SqliteStorage::open(&path_string).await.unwrap();
+            storage.migrate().await.unwrap();
+            let conversation_id: i64 = sqlx::query_scalar(
+                "INSERT INTO conversations(conversation_type, external_id) VALUES ('group', 'inbox-reopen') RETURNING id",
+            )
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+            let character_id: i64 = sqlx::query_scalar(
+                "INSERT INTO characters(name) VALUES ('入站重放测试') RETURNING id",
+            )
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO participants(conversation_id, external_id, display_name, role, metadata) VALUES (?, '1', '测试用户', 'user', '{}')")
+                .bind(conversation_id)
+                .execute(storage.pool())
+                .await
+                .unwrap();
+            ingress_seq = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO inbound_events(raw_event, received_at, status, attempts, processing_at) VALUES ('reopen-payload', ?, 'processing', 1, ?) RETURNING ingress_seq",
+            )
+            .bind(now.to_rfc3339())
+            .bind(now.to_rfc3339())
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+            input = crate::domain::repository::AcceptedMessageInput {
+                conversation_id,
+                sender_id: 1,
+                content_json: serde_json::json!({"Text":"重放消息"}).to_string(),
+                timestamp: now.to_rfc3339(),
+                platform_message_id: Some(9020),
+                character_id,
+                event_uuid: "inbox-reopen-event".to_string(),
+                outbox_payload: serde_json::json!({
+                    "event_uuid": "inbox-reopen-event",
+                    "conversation_id": conversation_id,
+                    "sender_id": 1,
+                    "message_id": 0,
+                    "content": "重放消息",
+                    "timestamp": now,
+                    "is_mentioned": false,
+                    "character_id": character_id,
+                    "conversation_sequence": 0,
+                    "platform_message_id": 9020,
+                    "ingested_at": now,
+                    "metadata": {"author_kind": "user"}
+                })
+                .to_string(),
+                inbound_event_seq: Some(ingress_seq),
+            };
+            let repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+                storage.pool().clone(),
+            );
+            repo.accept_message_with_status(&input).await.unwrap();
+            storage.close().await;
+        }
+        let storage = SqliteStorage::open(&path_string).await.unwrap();
+        storage.migrate().await.unwrap();
+        sqlx::query("UPDATE inbound_events SET status = 'processing', processed_at = NULL, processing_at = ? WHERE ingress_seq = ?")
+            .bind(now.to_rfc3339())
+            .bind(ingress_seq)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        let repo = crate::infrastructure::storage::repository::SqliteMessageRepository::new(
+            storage.pool().clone(),
+        );
+        let result = repo.accept_message_with_status(&input).await.unwrap();
+        assert!(!result.created);
+        let counts: (i64, i64, i64, String) = sqlx::query_as(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM messages WHERE platform_message_id = 9020),
+                   (SELECT COUNT(*) FROM outbox_events WHERE event_uuid = 'inbox-reopen-event'),
+                   (SELECT sequence_counter FROM conversations WHERE id = ?),
+                   (SELECT status FROM inbound_events WHERE ingress_seq = ?)"#,
+        )
+        .bind(input.conversation_id)
+        .bind(ingress_seq)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts, (1, 1, 1, "done".to_string()));
+    }
+
+    #[tokio::test]
     async fn find_after_sequence_is_not_displaced_by_old_history_noise() {
         let storage = setup_storage().await;
         let conversation_repo =

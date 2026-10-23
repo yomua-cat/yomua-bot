@@ -148,6 +148,9 @@ pub enum RepositoryError {
 
     #[error("仓储所有权已失效")]
     OwnershipLost,
+
+    #[error("入站事件队列已达到容量上限")]
+    InboundQueueFull,
 }
 
 impl From<sqlx::Error> for RepositoryError {

@@ -70,14 +70,25 @@ impl InboundEventRepository for SqliteInboundEventRepository {
         raw_event: &str,
         received_at: DateTime<Utc>,
     ) -> Result<InboundEvent, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let pending_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inbound_events WHERE status IN ('received', 'processing')",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if pending_count >= crate::domain::inbound_event::INBOUND_EVENT_MAX_PENDING {
+            tx.rollback().await?;
+            return Err(RepositoryError::InboundQueueFull);
+        }
         let result = sqlx::query(
             r#"INSERT INTO inbound_events(raw_event, received_at, status)
                VALUES (?, ?, 'received')"#,
         )
         .bind(raw_event)
         .bind(received_at.to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(InboundEvent {
             ingress_seq: result.last_insert_rowid(),
             raw_event: raw_event.to_owned(),
@@ -372,5 +383,58 @@ mod tests {
             repo.cleanup_inbound_events(Utc::now(), 10).await.unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn dead_inbound_event_does_not_block_following_event() {
+        let storage = SqliteStorage::open_in_memory().await.unwrap();
+        storage.migrate().await.unwrap();
+        let repo = SqliteInboundEventRepository::new(storage.pool().clone());
+        let now = Utc::now();
+        let poison = repo.insert_inbound_event("poison", now).await.unwrap();
+        let following = repo.insert_inbound_event("following", now).await.unwrap();
+        let claimed = repo.claim_next_inbound_event(now).await.unwrap().unwrap();
+        assert_eq!(claimed.ingress_seq, poison.ingress_seq);
+        repo.mark_inbound_event(
+            poison.ingress_seq,
+            InboundEventStatus::Dead,
+            now,
+            Some("脱敏错误"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.claim_next_inbound_event(now)
+                .await
+                .unwrap()
+                .unwrap()
+                .ingress_seq,
+            following.ingress_seq
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_event_queue_rejects_insert_at_capacity() {
+        let storage = SqliteStorage::open_in_memory().await.unwrap();
+        storage.migrate().await.unwrap();
+        sqlx::query(
+            r#"WITH RECURSIVE pending(n) AS (
+                   SELECT 1
+                   UNION ALL SELECT n + 1 FROM pending
+                    WHERE n < ?
+               )
+               INSERT INTO inbound_events(raw_event, received_at, status)
+               SELECT 'event', ?, 'received' FROM pending"#,
+        )
+        .bind(crate::domain::inbound_event::INBOUND_EVENT_MAX_PENDING)
+        .bind(Utc::now().to_rfc3339())
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        let repo = SqliteInboundEventRepository::new(storage.pool().clone());
+        assert!(matches!(
+            repo.insert_inbound_event("overflow", Utc::now()).await,
+            Err(RepositoryError::InboundQueueFull)
+        ));
     }
 }

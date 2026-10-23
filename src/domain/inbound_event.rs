@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 /// 单条入站事件允许的总处理尝试次数。
 pub const INBOUND_EVENT_MAX_ATTEMPTS: i32 = 3;
+/// SQLite inbox 最多保留的待处理事件数。
+pub const INBOUND_EVENT_MAX_PENDING: i64 = 1024;
 /// 终态入站事件的默认保留期（天）。
 pub const INBOUND_EVENT_RETENTION_DAYS: i64 = 7;
 
