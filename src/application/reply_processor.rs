@@ -351,6 +351,7 @@ impl ReplyProcessor {
             character_id: binding.character_id,
             event_uuid: uuid,
             outbox_payload: payload.to_string(),
+            inbound_event_seq: None,
         })
         .await?;
         Ok(())

@@ -1083,6 +1083,22 @@ impl MessageRepository for SqliteMessageRepository {
             let existing: Option<(i64,i64,String)> = sqlx::query_as("SELECT id, conversation_sequence, ingested_at FROM messages WHERE conversation_id = ? AND platform_message_id = ? ORDER BY id LIMIT 1")
                 .bind(conversation_id).bind(platform_id).fetch_optional(&mut *tx).await?;
             if let Some((id, seq, at)) = existing {
+                if let Some(ingress_seq) = input.inbound_event_seq {
+                    let updated = sqlx::query(
+                        r#"UPDATE inbound_events
+                              SET status = 'done', processed_at = ?, processing_at = NULL, last_error = NULL
+                            WHERE ingress_seq = ? AND status = 'processing'"#,
+                    )
+                    .bind(chrono::Utc::now().to_rfc3339())
+                    .bind(ingress_seq)
+                    .execute(&mut *tx)
+                    .await?;
+                    if updated.rows_affected() != 1 {
+                        return Err(RepositoryError::Database(format!(
+                            "入站事件 {ingress_seq} 不处于 processing 状态"
+                        )));
+                    }
+                }
                 tx.commit().await?;
                 return Ok(AcceptedMessageResult {
                     message_id: id,
@@ -1183,6 +1199,24 @@ impl MessageRepository for SqliteMessageRepository {
         .execute(&mut *tx)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if let Some(ingress_seq) = input.inbound_event_seq {
+            let updated = sqlx::query(
+                r#"UPDATE inbound_events
+                      SET status = 'done', processed_at = ?, processing_at = NULL, last_error = NULL
+                    WHERE ingress_seq = ? AND status = 'processing'"#,
+            )
+            .bind(ingested_at.to_rfc3339())
+            .bind(ingress_seq)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            if updated.rows_affected() != 1 {
+                return Err(RepositoryError::Database(format!(
+                    "入站事件 {ingress_seq} 不处于 processing 状态"
+                )));
+            }
+        }
 
         // 6. 提交事务
         tx.commit()

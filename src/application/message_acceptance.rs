@@ -26,7 +26,7 @@ impl MessageAcceptanceService {
         platform_message_id: Option<i64>,
         character_id: i64,
     ) -> Result<(i64, i64), RuntimeError> {
-        self.accept_inbound(
+        self.accept_inbound_with_seq(
             conversation_id,
             sender_id,
             content,
@@ -35,6 +35,7 @@ impl MessageAcceptanceService {
             character_id,
             false,
             serde_json::json!({}),
+            None,
         )
         .await
     }
@@ -107,7 +108,38 @@ impl MessageAcceptanceService {
         binding_id: i64,
         binding_version: Option<chrono::DateTime<Utc>>,
     ) -> Result<(i64, i64), RuntimeError> {
-        self.accept_inbound(
+        self.accept_command_with_seq(
+            conversation_id,
+            sender_id,
+            content,
+            timestamp,
+            platform_message_id,
+            character_id,
+            command,
+            external_sender_id,
+            binding_id,
+            binding_version,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn accept_command_with_seq(
+        &self,
+        conversation_id: i64,
+        sender_id: i64,
+        content: String,
+        timestamp: chrono::DateTime<Utc>,
+        platform_message_id: i64,
+        character_id: i64,
+        command: Command,
+        external_sender_id: String,
+        binding_id: i64,
+        binding_version: Option<chrono::DateTime<Utc>>,
+        inbound_event_seq: Option<i64>,
+    ) -> Result<(i64, i64), RuntimeError> {
+        self.accept_inbound_with_seq(
             conversation_id,
             sender_id,
             content,
@@ -122,6 +154,7 @@ impl MessageAcceptanceService {
                 "binding_id": binding_id,
                 "binding_version": binding_version,
             }),
+            inbound_event_seq,
         )
         .await
     }
@@ -136,6 +169,33 @@ impl MessageAcceptanceService {
         character_id: i64,
         is_mentioned: bool,
         metadata: serde_json::Value,
+    ) -> Result<(i64, i64), RuntimeError> {
+        self.accept_inbound_with_seq(
+            conversation_id,
+            sender_id,
+            content,
+            timestamp,
+            platform_message_id,
+            character_id,
+            is_mentioned,
+            metadata,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn accept_inbound_with_seq(
+        &self,
+        conversation_id: i64,
+        sender_id: i64,
+        content: String,
+        timestamp: chrono::DateTime<Utc>,
+        platform_message_id: Option<i64>,
+        character_id: i64,
+        is_mentioned: bool,
+        metadata: serde_json::Value,
+        inbound_event_seq: Option<i64>,
     ) -> Result<(i64, i64), RuntimeError> {
         let event_uuid = uuid::Uuid::new_v4().to_string();
         let payload = serde_json::to_value(MessageAcceptedEvent {
@@ -168,6 +228,7 @@ impl MessageAcceptanceService {
                 character_id,
                 event_uuid: event_uuid.clone(),
                 outbox_payload: payload.to_string(),
+                inbound_event_seq,
             })
             .await?;
         if result.created {

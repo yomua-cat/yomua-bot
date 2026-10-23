@@ -13,6 +13,7 @@ use crate::domain::character::{
 };
 use crate::domain::conversation::{Conversation, ConversationType, Participant};
 use crate::domain::emotion::Mood;
+use crate::domain::inbound_event::{InboundEvent, InboundEventStatus};
 use crate::domain::memory::{
     Memory, MemoryCandidateReview, MemoryClaim, MemoryClaimProposal, MemoryClaimResult,
     MemoryRevisionRequest, MemoryRevisionResult, SemanticMatchResult,
@@ -20,6 +21,54 @@ use crate::domain::memory::{
 use crate::domain::message::Message;
 use crate::domain::relationship::Relationship;
 use crate::error::RepositoryError;
+
+// ---------------------------------------------------------------------------
+// OneBot 入站事件
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+pub trait InboundEventRepository: Send + Sync {
+    async fn next_pending_inbound_seq(&self) -> Result<Option<i64>, RepositoryError>;
+
+    async fn insert_inbound_event(
+        &self,
+        raw_event: &str,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<InboundEvent, RepositoryError>;
+
+    /// 按 ingress_seq 领取最早的待处理事件，并原子递增尝试次数。
+    async fn claim_next_inbound_event(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<InboundEvent>, RepositoryError>;
+
+    /// 将处理中的事件恢复为 received，供进程重启后继续处理。
+    async fn recover_inbound_events(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, RepositoryError>;
+
+    async fn mark_inbound_event(
+        &self,
+        ingress_seq: i64,
+        status: InboundEventStatus,
+        processed_at: chrono::DateTime<chrono::Utc>,
+        last_error: Option<&str>,
+    ) -> Result<bool, RepositoryError>;
+
+    /// 释放暂时失败的事件回到有序队首，保留错误说明供下一次处理。
+    async fn retry_inbound_event(
+        &self,
+        ingress_seq: i64,
+        last_error: &str,
+    ) -> Result<bool, RepositoryError>;
+
+    async fn cleanup_inbound_events(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<u64, RepositoryError>;
+}
 
 // ---------------------------------------------------------------------------
 // 主动意图与回复批次
@@ -362,6 +411,8 @@ pub struct AcceptedMessageInput {
     pub character_id: i64,
     pub event_uuid: String,
     pub outbox_payload: String,
+    /// 由入站 inbox 消费时传入；非 OneBot/主动消息保持 `None`。
+    pub inbound_event_seq: Option<i64>,
 }
 
 /// 消息接受事务的结果。
@@ -847,6 +898,15 @@ pub trait MessageRepository: Send + Sync {
             ingested_at,
             created: true,
         })
+    }
+
+    /// 在消息/Outbox 事务中同时把对应 inbox 记录标记完成。
+    async fn accept_message_with_inbound_status(
+        &self,
+        input: &AcceptedMessageInput,
+        _ingress_seq: i64,
+    ) -> Result<AcceptedMessageResult, RepositoryError> {
+        self.accept_message_with_status(input).await
     }
 }
 

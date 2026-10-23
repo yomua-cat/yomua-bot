@@ -1,6 +1,6 @@
 # 项目现状
 
-本文记录截至 **2026-10-20** 的当前源码证据。项目仍处于开发中；自动化测试通过不等于真实 QQ、外部模型或长期运行已经验收。
+本文记录截至 **2026-10-24** 的当前源码证据。项目仍处于开发中；自动化测试通过不等于真实 QQ、外部模型或长期运行已经验收。
 
 本轮加固（2026-10-22）新增候选审核注入防护、隐私说明、完整 Outbox 压测和依赖安全检查；串行全目标验证实际为库 553 个通过、16 个忽略，主程序 5 个、ctl 39 个、alpha 集成 8 个通过、2 个压测忽略，控制集成 84 个通过。
 
@@ -25,8 +25,8 @@
 ## 当前实现
 
 - 入站消息保存作者类型、平台用户身份、观察角色、提及、引用、绑定版本和来源 metadata；适配器只负责接受，插件事件由事务提交后的 `MessageAccepted` 唯一发布，并在插件协议中归一为一条 `message.received` 通知。
-- OneBot 连接在下游入站队列积压时继续读取 WebSocket 并独立完成 Action 回执；最多暂存 1024 条入站事件，达到上限后会施加读取背压，极端积压下的回执时延尚未通过压力测试。
-- 入站处理对数据库锁、连接和仓储暂时错误最多重试 3 次，重试期间保持消息顺序；解析错误、未绑定、黑名单命中和其他业务性拒绝不会重试。进程崩溃前仍留在内存中的事件无法恢复，尚未接入入站事件持久化队列。
+- OneBot 连接独立路由 Action 回执。`runtime.inbound_durability` 默认关闭；开启后事件由有界入口写入 SQLite inbox，待处理上限为 1024，单消费者按 `ingress_seq` 顺序恢复。普通消息和管理指令将消息、Outbox 与 inbox 完成标记放在同一事务；每条事件最多处理 3 次，耗尽后记为 `dead`，终态 7 天后限量清理。原始事件正文不进入普通日志。真实 QQ 和长期运行尚未验收。
+- 开启 inbox 后，帧读取到 inbox 事务提交前仍有丢失窗口；QQ/OneBot 重放能力未验证。旧版本内存事件不能迁移；输入持久化也不保证模型或平台最终送达。容量满或写入失败会造成有界背压。
 - 消息接收入库使用结构化 `AcceptedMessageInput`，在同一事务中分配会话序号、写入消息并创建 Outbox 事件。
 - 回复任务会按当前会话序号读取连续输入；原消息逐条保存，生成期间的新消息进入下一轮。当前批次冻结后会持久化最小 `reply_batches` 快照，只保留消息 ID、序号、事件 UUID 和上下文摘要，不保存完整 prompt。
 - P3-2 已实现积压压缩：事件年龄超过批量等待时，冻结窗口扩展到当前时间并跳过批量等待；事件年龄超过回复延迟上限时跳过 `decision.delay_ms`。未积压事件仍保留原批量等待和决策延迟；过期阈值仍为 120 秒，被合并消息仍记录为 `batch_merge`。
@@ -56,6 +56,8 @@
 - 主动额度预留在 SQLite 事务中原子完成；并发后台 tick 只能有一个任务通过同一会话的冷却和每日上限检查，避免重复主动发言。
 - 候选记忆保留来源和理由；后台使用 `llm_role=decision` 提出审核意见，程序只在来源消息、全域用户、会话、记忆类型和置信度门槛全部满足时正式化。模型不可用、输出不合规或意见为 `defer` 时候选继续保留；审核模型版本、理由和时间写入内部 metadata。
 - 记忆候选抽取必须命中明确触发词；通用闲聊、疑问句和明显否定转折不会进入审核队列。候选正文最多保留 200 个字符，超长时在 metadata 记录 `truncated=true`；每个全域用户每天最多生成 20 条候选，超限只记录日志并跳过，不影响回复链路。该口径已于 2026-10-20 由维护者确认。候选审核由 `decision` LLM 自动完成，程序只执行来源、作用域和置信度硬校验，不要求维护者逐条确认。
+- 身份类记忆触发词保持当前范围，已决定暂不进一步放宽，留待后期优化；原因是放宽会增加候选噪声与审核模型调用。
+- CLI 专用依赖 `rustyline`、`crossterm`、`sysinfo` 保持为单包必须依赖，已决定不拆分、不增加 feature 门控；理由是保持单一入口与简单构建，也方便其他贡献者改造控制器。
 - 插件只能读取当前会话可见的正式记忆；插件发送消息、修改角色状态、写入记忆和写入关系已在统一 RPC 分发层拒绝。角色、绑定和关系读取也必须带明确范围，关系读取使用全域 `user_id`，不能把 `participant_id` 当作稳定身份。
 - OneBot 发送回执只有同时满足 `status=ok` 与 `retcode=0` 才视为成功，失败回执不会误标为已发送；未知结果核查到平台明确失败时会自动重新排队，网络核查失败仍保持人工核查状态。人工 `reply unknown retry` 也必须先查询平台，不能用确认参数绕过核查。
 - 回复任务的生成领取、生成结果、失败回退、过期/取消/忽略状态和发送结果均受当前 Outbox 租约保护；失去租约的旧 worker 不会覆盖新 worker，过期的 `generating` 任务可由新租约接管。SQLite 竞态测试覆盖旧租约拒绝写入、新租约接管和发送状态保护。
@@ -79,13 +81,15 @@
 ## 尚未证明
 
 - MiniMax `M2-her` 返回 400（2013）的触发条件仍未查明，需要真实模型 endpoint 才能继续排查；此前最小请求成功、应用历史重放失败的现象尚不能确定根因。
-- 入站事件仍无持久化队列；进程崩溃前只留在内存中的事件无法恢复。设计见 `docs/research/onebot-inbound-event-durability-design-2026-10-21.md`，本轮未实施。
+- P5-1 入站持久化尚未连接真实 QQ 验证，也未完成长期运行测试；崩溃注入覆盖 SQLite 完成标记失败回滚、文件重开后重放幂等和仓储恢复，但管理指令副作用与自身回声的完整组件重启重放仍需补充验证。
 - 限额开启后，每次限额检查引起的 SQLite 写入成本尚未测量。
 - P3-2 两个提交后的同一手动压测均使用每秒 2 条、持续 60 秒、Provider 延迟 3 秒、120 条消息、隔离 SQLite 和假 OneBot/Provider。第 1 项（批量窗口扩展）实测：`p2_1` 为 `Sent=11、Ignored=109、Expired=0、P50=10,176 ms、P95=10,416 ms`；`p3_1` 为 `Sent=9、Ignored=111、Expired=0、P50=11,557 ms、P95=11,715 ms`，阶段批量等待 P50/P95 为 `1,509/1,510 ms`、决策延迟为 `1,403/1,403 ms`。第 2 项（积压时跳过批量等待和决策延迟）实测：`p2_1` 为 `Sent=21、Ignored=99、Expired=0、P50=5,942 ms、P95=6,022 ms`；`p3_1` 为 `Sent=16、Ignored=104、Expired=0、P50=6,528 ms、P95=10,606 ms`，阶段批量等待 P50/P95 为 `2/1,505 ms`、决策延迟为 `0/0 ms`。两条压测的 Expired 均为 0，P95 均较第 1 项下降；未引入丢弃策略，继续保留消息语义。
 
 - 单会话积压压测 `p2_1_single_conversation_backlog_measurement` 与生产装配一致（SQLite WAL、5 秒 `busy_timeout`、5 个连接），但耗时约 1–3 分钟且曾出现并发写入锁竞争，因此标记为 ignored，不作为常规全目标测试的必过项。需要手动测量时运行：`cargo test --locked --test alpha_e2e_test p2_1_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1`；GitHub Actions 通过 `workflow_dispatch` 触发同一命令。
 
 - 完整 Outbox 压测 `p3_1_outbox_single_conversation_backlog_measurement` 已标记为 ignored，手动运行命令为：`cargo test --locked --test alpha_e2e_test p3_1_outbox_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1`。本机一次实测使用每秒 2 条、持续 60 秒、Provider 延迟 3 秒、隔离 SQLite 和假 OneBot：入库 120、Sent 24、Ignored 58、Expired 38、ProviderCalls 29；Ignored 原因全部为 `batch_merge=58`；Sent 总延迟 P50 63,085 ms、P95 114,629 ms。阶段耗时 P50/P95（毫秒）为：等会话锁 `0/0`、批量等待 `1,504/1,506`、关系/记忆写入 `2/3`、决策 `1/2`、生成 `3,007/3,008`、决策延迟 `1,402/1,402`、发送调用 `0/0`。该数据只代表本机一次完整 Outbox 链路测量，不代表真实 QQ 或长期运行验收。
+- P5-1f 同一工作树、隔离 SQLite 与假 OneBot/Provider 的手动对比：`p2_1` 关闭开关 `Sent=21、Ignored=99、Expired=0、P50/P95=5,927/6,023 ms`；开启 `Sent=21、Ignored=99、Expired=0、P50/P95=5,849/6,023 ms`。`p3_1` 关闭 `Sent=17、Ignored=103、Expired=0、Total P50/P95=6,527/6,758 ms`；开启 `Sent=18、Ignored=102、Expired=0、Total P50/P95=6,508/6,713 ms`。每组均为 120 条、2 条/秒、Provider 延迟 3 秒；该差异只记录本机一次测量，不据此声称性能改善。开启状态的合成消息先持久化 inbox，再在消息接受事务内标记完成。
+- P5-1 入站写入手动测量：合成事件 100 条/秒、持续 10 秒，共 1,000 条；SQLite inbox 写入 P50/P95 为 `764/1,229 μs`，插入到终态为 `2,324/3,437 μs`；并发假 OneBot Action 回执 P50/P95 为 `490/647 μs`。该测试使用隔离 SQLite、假 OneBot 和假 Provider，不代表真实 QQ、磁盘或长期运行表现。
 
 - 回复链路在 `reply_pipeline` tracing target 记录结构化阶段耗时字段：`lock_wait_ms`、`batch_wait_ms`、`memory_write_ms`、`decision_ms`、`decision_delay_ms`、`generation_ms`、`send_ms`；P3-1 压测已在测试层收集这些事件并计算阶段 P50/P95。
 
