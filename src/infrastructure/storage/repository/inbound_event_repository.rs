@@ -437,4 +437,62 @@ mod tests {
             Err(RepositoryError::InboundQueueFull)
         ));
     }
+
+    #[tokio::test]
+    async fn inbound_event_cleanup_filters_status_age_and_limit() {
+        let storage = SqliteStorage::open_in_memory().await.unwrap();
+        storage.migrate().await.unwrap();
+        let repo = SqliteInboundEventRepository::new(storage.pool().clone());
+        let now = Utc::now();
+        let before = now
+            - chrono::Duration::days(crate::domain::inbound_event::INBOUND_EVENT_RETENTION_DAYS);
+        let old = before - chrono::Duration::seconds(1);
+        let fresh = before + chrono::Duration::seconds(1);
+
+        sqlx::query(
+            r#"INSERT INTO inbound_events(raw_event, received_at, status, processed_at)
+               VALUES
+                 ('old-done', ?, 'done', ?),
+                 ('old-ignored', ?, 'ignored', ?),
+                 ('old-dead', ?, 'dead', ?),
+                 ('fresh-done', ?, 'done', ?),
+                 ('pending-received', ?, 'received', NULL),
+                 ('pending-processing', ?, 'processing', NULL)"#,
+        )
+        .bind(old.to_rfc3339())
+        .bind(old.to_rfc3339())
+        .bind(old.to_rfc3339())
+        .bind(old.to_rfc3339())
+        .bind(old.to_rfc3339())
+        .bind(old.to_rfc3339())
+        .bind(fresh.to_rfc3339())
+        .bind(fresh.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(storage.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(repo.cleanup_inbound_events(before, 2).await.unwrap(), 2);
+        let remaining: Vec<(String, String)> =
+            sqlx::query_as("SELECT raw_event, status FROM inbound_events ORDER BY ingress_seq")
+                .fetch_all(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining,
+            vec![
+                ("old-dead".to_string(), "dead".to_string()),
+                ("fresh-done".to_string(), "done".to_string()),
+                ("pending-received".to_string(), "received".to_string()),
+                ("pending-processing".to_string(), "processing".to_string()),
+            ]
+        );
+        assert_eq!(repo.cleanup_inbound_events(before, 10).await.unwrap(), 1);
+        let remaining_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbound_events")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining_count, 3);
+    }
 }
