@@ -1089,10 +1089,10 @@ mod tests {
     use crate::application::event_bus::EventSubscription;
     use crate::application::message_acceptance::MessageAcceptanceService;
     use crate::domain::conversation::{Conversation, Participant};
-    use crate::domain::event::{Command, CoreEvent};
+    use crate::domain::event::{Command, CommandReceivedEvent, CoreEvent};
     use crate::domain::repository::{
-        CharacterBindingRepository, CharacterRepository, ConversationRepository, MessageRepository,
-        ParticipantRepository,
+        CharacterBindingRepository, CharacterRepository, ConversationRepository,
+        InboundEventRepository, MessageRepository, ParticipantRepository,
     };
     use crate::error::RepositoryError;
     use async_trait::async_trait;
@@ -1642,6 +1642,59 @@ mod tests {
         .to_string()
     }
 
+    fn sqlite_inbound_processor(pool: sqlx::SqlitePool) -> InboundProcessor {
+        use crate::infrastructure::storage::repository::{
+            SqliteCharacterBindingRepository, SqliteCharacterRepository,
+            SqliteConversationRepository, SqliteInboundEventRepository, SqliteMessageRepository,
+            SqliteParticipantRepository,
+        };
+
+        let conversation_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
+        let participant_repo = Arc::new(SqliteParticipantRepository::new(pool.clone()));
+        let conversation_manager = ConversationManager::new(
+            conversation_repo.clone() as Arc<dyn ConversationRepository>,
+            participant_repo as Arc<dyn ParticipantRepository>,
+        );
+        let character_repo = Arc::new(SqliteCharacterRepository::new(pool.clone()));
+        let binding_manager = BindingManager::new(
+            Arc::new(SqliteCharacterBindingRepository::new(pool.clone()))
+                as Arc<dyn CharacterBindingRepository>,
+            character_repo as Arc<dyn CharacterRepository>,
+            conversation_repo as Arc<dyn ConversationRepository>,
+        );
+        let message_repo = Arc::new(SqliteMessageRepository::new(pool.clone()));
+        let bus = EventBus::new();
+        let acceptance_service =
+            MessageAcceptanceService::new(message_repo as Arc<dyn MessageRepository>, bus.clone());
+        let inbound_event_repo = Arc::new(SqliteInboundEventRepository::new(pool));
+        let (_event_tx, event_rx) = mpsc::channel(8);
+
+        InboundProcessor {
+            event_rx,
+            conversation_manager,
+            bus,
+            acceptance_service: Arc::new(acceptance_service),
+            binding_manager: Arc::new(binding_manager),
+            blacklist_repo: None,
+            inbound_event_repo: Some(inbound_event_repo),
+            shutdown_rx: watch::channel(false).1,
+        }
+    }
+
+    struct TestControlReplySender;
+
+    #[async_trait]
+    impl crate::application::command::ControlReplySender for TestControlReplySender {
+        async fn send_control_reply(
+            &self,
+            _conversation_id: i64,
+            _source_message_id: i64,
+            _content: &str,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
     // ------------------------------------------------------------------
     // 发布前截流（硬性约束 B）测试
     // ------------------------------------------------------------------
@@ -1717,6 +1770,284 @@ mod tests {
             }
             other => panic!("期望 MessageAccepted，实际 {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn command_inbox_replay_after_sqlite_restart_does_not_duplicate_outbox_effects() {
+        use crate::infrastructure::storage::repository::SqliteInboundEventRepository;
+        use crate::infrastructure::storage::SqliteStorage;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("command-inbox-replay.sqlite");
+        let path = path.to_string_lossy().into_owned();
+        let (ingress_seq, conversation_id, target_character_id): (i64, i64, i64);
+        let switched_at: String;
+        {
+            let storage = SqliteStorage::open(&path).await.unwrap();
+            storage.migrate().await.unwrap();
+            conversation_id = sqlx::query_scalar(
+                "INSERT INTO conversations(conversation_type, external_id) VALUES ('group', '500000') RETURNING id",
+            )
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+            let current_character_id: i64 =
+                sqlx::query_scalar("INSERT INTO characters(name) VALUES ('旧角色') RETURNING id")
+                    .fetch_one(storage.pool())
+                    .await
+                    .unwrap();
+            target_character_id =
+                sqlx::query_scalar("INSERT INTO characters(name) VALUES ('重放角色') RETURNING id")
+                    .fetch_one(storage.pool())
+                    .await
+                    .unwrap();
+            sqlx::query("INSERT INTO participants(conversation_id, external_id, display_name, role) VALUES (?, '900001', '小明', 'user')")
+                .bind(conversation_id)
+                .execute(storage.pool())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO conversation_bindings(character_id, conversation_id, switched_at) VALUES (?, ?, ?)")
+                .bind(current_character_id)
+                .bind(conversation_id)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(storage.pool())
+                .await
+                .unwrap();
+            let raw_event = group_message_json("换角色 重放角色", true);
+            let inbox = SqliteInboundEventRepository::new(storage.pool().clone());
+            ingress_seq = inbox
+                .insert_inbound_event(&raw_event, chrono::Utc::now())
+                .await
+                .unwrap()
+                .ingress_seq;
+
+            // 提交命令消息和 Outbox，但模拟在 inbox 完成标记前崩溃。
+            sqlite_inbound_processor(storage.pool().clone())
+                .handle_raw(&raw_event)
+                .await;
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM inbound_events WHERE ingress_seq = ?")
+                    .bind(ingress_seq)
+                    .fetch_one(storage.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(status, "received");
+
+            // 模拟 Outbox 中的命令执行，调用真实 CommandHandler 记录一次副作用。
+            let binding_manager = Arc::new(BindingManager::new(
+                Arc::new(
+                    crate::infrastructure::storage::repository::SqliteCharacterBindingRepository::new(
+                        storage.pool().clone(),
+                    ),
+                ) as Arc<dyn CharacterBindingRepository>,
+                Arc::new(
+                    crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+                        storage.pool().clone(),
+                    ),
+                ) as Arc<dyn CharacterRepository>,
+                Arc::new(
+                    crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                        storage.pool().clone(),
+                    ),
+                ) as Arc<dyn ConversationRepository>,
+            ));
+            let character_repo = Arc::new(
+                crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+                    storage.pool().clone(),
+                ),
+            );
+            let command_handler = crate::application::command::CommandHandler::new(
+                binding_manager,
+                character_repo,
+                Arc::new(TestControlReplySender),
+                Some(vec!["900001".to_string()]),
+            );
+            command_handler
+                .handle(&CommandReceivedEvent {
+                    conversation_id,
+                    sender_id: 1,
+                    external_sender_id: "900001".to_string(),
+                    message_id: 1001,
+                    content: "换角色 重放角色".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    command: Command::SwitchCharacter {
+                        character_name: "重放角色".to_string(),
+                    },
+                    source_message_id: 1,
+                    character_id: current_character_id,
+                    conversation_sequence: 1,
+                    platform_message_id: Some(1001),
+                    ingested_at: None,
+                })
+                .await
+                .unwrap();
+            switched_at = sqlx::query_scalar(
+                "SELECT switched_at FROM conversation_bindings WHERE conversation_id = ?",
+            )
+            .bind(conversation_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+
+            storage.close().await;
+        }
+
+        let storage = SqliteStorage::open(&path).await.unwrap();
+        storage.migrate().await.unwrap();
+        sqlite_inbound_processor(storage.pool().clone())
+            .handle_inbox_event(ingress_seq)
+            .await;
+
+        let counts: (i64, i64, i64, String, i64, String) = sqlx::query_as(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM messages WHERE conversation_id = ?),
+                   (SELECT COUNT(*) FROM outbox_events WHERE ordering_key = ?),
+                   (SELECT sequence_counter FROM conversations WHERE id = ?),
+                   (SELECT status FROM inbound_events WHERE ingress_seq = ?),
+                   (SELECT character_id FROM conversation_bindings WHERE conversation_id = ?),
+                   (SELECT switched_at FROM conversation_bindings WHERE conversation_id = ?)"#,
+        )
+        .bind(conversation_id)
+        .bind(conversation_id.to_string())
+        .bind(conversation_id)
+        .bind(ingress_seq)
+        .bind(conversation_id)
+        .bind(conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts.0, 1);
+        assert_eq!(counts.1, 1);
+        assert_eq!(counts.2, 1);
+        assert_eq!(counts.3, "done");
+        assert_eq!(counts.4, target_character_id);
+        assert_eq!(counts.5, switched_at);
+    }
+
+    #[tokio::test]
+    async fn self_echo_inbox_replay_after_sqlite_restart_confirms_unknown_once() {
+        use crate::infrastructure::storage::repository::SqliteInboundEventRepository;
+        use crate::infrastructure::storage::SqliteStorage;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("echo-inbox-replay.sqlite");
+        let path = path.to_string_lossy().into_owned();
+        let (ingress_seq, conversation_id, reply_message_id): (i64, i64, i64);
+        {
+            let storage = SqliteStorage::open(&path).await.unwrap();
+            storage.migrate().await.unwrap();
+            conversation_id = sqlx::query_scalar(
+                "INSERT INTO conversations(conversation_type, external_id, sequence_counter) VALUES ('group', '500000', 1) RETURNING id",
+            )
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+            let character_id: i64 =
+                sqlx::query_scalar("INSERT INTO characters(name) VALUES ('回声角色') RETURNING id")
+                    .fetch_one(storage.pool())
+                    .await
+                    .unwrap();
+            let sender_id: i64 = sqlx::query_scalar(
+                "INSERT INTO participants(conversation_id, external_id, display_name, role) VALUES (?, '123456', '机器人', 'character') RETURNING id",
+            )
+            .bind(conversation_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+            reply_message_id = sqlx::query_scalar(
+                "INSERT INTO messages(conversation_id, sender_id, content, timestamp, metadata, active_character_id, conversation_sequence) VALUES (?, ?, ?, ?, ?, ?, 1) RETURNING id",
+            )
+            .bind(conversation_id)
+            .bind(sender_id)
+            .bind(serde_json::json!({"Text":"回声确认内容"}).to_string())
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(serde_json::json!({"author_kind":"assistant"}).to_string())
+            .bind(character_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+            let now = chrono::Utc::now().to_rfc3339();
+            sqlx::query("INSERT INTO reply_tasks(message_id, character_id, content, status, delivery_started_at, updated_at) VALUES (?, ?, '回声确认内容', 'unknown', ?, ?)")
+                .bind(reply_message_id)
+                .bind(character_id)
+                .bind(&now)
+                .bind(&now)
+                .execute(storage.pool())
+                .await
+                .unwrap();
+            let echo_event = serde_json::json!({
+                "post_type": "message",
+                "time": 1690000000,
+                "self_id": 123456,
+                "message_type": "group",
+                "message_id": 9200,
+                "group_id": 500000,
+                "user_id": 123456,
+                "message": "回声确认内容",
+                "sender": {"user_id": 123456, "nickname": "机器人", "role": "admin"}
+            })
+            .to_string();
+            let inbox = SqliteInboundEventRepository::new(storage.pool().clone());
+            ingress_seq = inbox
+                .insert_inbound_event(&echo_event, chrono::Utc::now())
+                .await
+                .unwrap()
+                .ingress_seq;
+
+            // 对账与 unknown 确认已提交，但 inbox 仍未完成。
+            sqlite_inbound_processor(storage.pool().clone())
+                .handle_raw(&echo_event)
+                .await;
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM inbound_events WHERE ingress_seq = ?")
+                    .bind(ingress_seq)
+                    .fetch_one(storage.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(status, "received");
+            storage.close().await;
+        }
+
+        let storage = SqliteStorage::open(&path).await.unwrap();
+        storage.migrate().await.unwrap();
+        sqlite_inbound_processor(storage.pool().clone())
+            .handle_inbox_event(ingress_seq)
+            .await;
+
+        let echo_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM platform_message_echoes WHERE conversation_id = ? AND platform_message_id = 9200",
+        )
+        .bind(conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let assistant_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ? AND json_extract(metadata, '$.author_kind') = 'assistant'",
+        )
+        .bind(conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let state: (String, Option<i64>, i64, String) = sqlx::query_as(
+            r#"SELECT task.status, task.platform_message_id, conversation.sequence_counter,
+                      event.status
+                 FROM reply_tasks task
+                 JOIN messages ON messages.id = task.message_id
+                 JOIN conversations conversation ON conversation.id = messages.conversation_id
+                 JOIN inbound_events event ON event.ingress_seq = ?
+                WHERE task.message_id = ?"#,
+        )
+        .bind(ingress_seq)
+        .bind(reply_message_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(echo_count, 1);
+        assert_eq!(assistant_count, 2);
+        assert_eq!(
+            state,
+            ("sent".to_string(), Some(9200), 2, "done".to_string())
+        );
     }
 
     #[tokio::test]
