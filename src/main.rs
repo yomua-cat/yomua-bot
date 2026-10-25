@@ -64,11 +64,12 @@ use yomua_bot::domain::decision::{
     DecisionLlmServiceImpl, DecisionResultValidator, DefaultOverridePolicy, HeuristicTrigger,
     NoOpTrigger,
 };
+use yomua_bot::domain::inbound_event::{INBOUND_EVENT_MAX_PENDING, INBOUND_EVENT_RETENTION_DAYS};
 use yomua_bot::domain::repository::{
     AutonomyRepository, BehaviorStateRepository, BlacklistRepository, CharacterBindingRepository,
     CharacterRepository, CharacterStateRepository, ConversationRepository,
-    ConversationStateRepository, MemoryRepository, MessageRepository, MoodRepository,
-    ParticipantRepository, PluginDataRepository, RelationshipRepository,
+    ConversationStateRepository, InboundEventRepository, MemoryRepository, MessageRepository,
+    MoodRepository, ParticipantRepository, PluginDataRepository, RelationshipRepository,
 };
 use yomua_bot::error::RuntimeError;
 use yomua_bot::infrastructure::llm::openai_compatible::{
@@ -84,8 +85,8 @@ use yomua_bot::infrastructure::plugin::supervisor::{PluginSupervisor, Supervisor
 use yomua_bot::infrastructure::storage::repository::{
     SqliteAutonomyRepository, SqliteBehaviorStateRepository, SqliteBlacklistRepository,
     SqliteCharacterBindingRepository, SqliteCharacterRepository, SqliteCharacterStateRepository,
-    SqliteConversationRepository, SqliteConversationStateRepository, SqliteMemoryRepository,
-    SqliteMessageRepository, SqliteMoodRepository, SqliteOutboxRepository,
+    SqliteConversationRepository, SqliteConversationStateRepository, SqliteInboundEventRepository,
+    SqliteMemoryRepository, SqliteMessageRepository, SqliteMoodRepository, SqliteOutboxRepository,
     SqliteParticipantRepository, SqlitePluginDataRepository, SqliteRelationshipRepository,
 };
 use yomua_bot::infrastructure::storage::SqliteResponseRateLimiter;
@@ -98,6 +99,8 @@ const LLM_CONFIG: &str = "llm.toml";
 const DECISION_CONFIG: &str = "decision.toml";
 /// 默认配置目录。相对于启动目录解析，部署时启动目录应为项目/服务根目录。
 const DEFAULT_CONFIG_DIR: &str = "config";
+const INBOUND_EVENT_CLEANUP_INTERVAL_SECS: u64 = 10 * 60;
+const INBOUND_EVENT_CLEANUP_LIMIT: i64 = INBOUND_EVENT_MAX_PENDING;
 
 /// 只使用已展开、已校验的模型路由；默认 Provider 来自 conversation。
 fn build_model_scheduler(
@@ -364,7 +367,7 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
         bus.clone(),
     ));
 
-    let adapter = OneBotAdapterImpl::new(
+    let mut adapter = OneBotAdapterImpl::new(
         onebot_cfg.clone(),
         bus.clone(),
         conversation_manager,
@@ -373,6 +376,9 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     )
     .await
     .with_blacklist_repo(repos.blacklist_repo.clone());
+    if runtime_cfg.inbound_durability {
+        adapter = adapter.with_inbound_durability(repos.inbound_event_repo.clone());
+    }
     let adapter = Arc::new(adapter);
 
     let action_dispatcher = Arc::new(ActionDispatcher::new(
@@ -1021,6 +1027,7 @@ struct Repos {
     blacklist_repo: Arc<dyn BlacklistRepository>,
     outbox_repo: Arc<SqliteOutboxRepository>,
     autonomy_repo: Arc<dyn AutonomyRepository>,
+    inbound_event_repo: Arc<dyn InboundEventRepository>,
     rate_limiter: Arc<dyn ResponseRateLimiter>,
 }
 
@@ -1053,6 +1060,8 @@ fn build_repos(pool: SqlitePool) -> Repos {
     let outbox_repo = Arc::new(SqliteOutboxRepository::new(pool.clone()));
     let autonomy_repo: Arc<dyn AutonomyRepository> =
         Arc::new(SqliteAutonomyRepository::new(pool.clone()));
+    let inbound_event_repo: Arc<dyn InboundEventRepository> =
+        Arc::new(SqliteInboundEventRepository::new(pool.clone()));
     let rate_limiter: Arc<dyn ResponseRateLimiter> =
         Arc::new(SqliteResponseRateLimiter::new(pool.clone()));
 
@@ -1073,6 +1082,7 @@ fn build_repos(pool: SqlitePool) -> Repos {
         blacklist_repo,
         outbox_repo,
         autonomy_repo,
+        inbound_event_repo,
         rate_limiter,
     }
 }
@@ -1267,6 +1277,7 @@ fn spawn_background_tasks(
     settings: tokio::sync::watch::Receiver<yomua_bot::application::config::RuntimeConfig>,
 ) -> BackgroundTasks {
     let mut tasks = BackgroundTasks::default();
+    let inbound_durability = settings.borrow().inbound_durability;
     let reply_processor_for_outbox = reply_processor.clone();
 
     let memory_maintenance = MemoryMaintenanceDriver::new(repos.memory_repo.clone());
@@ -1341,6 +1352,15 @@ fn spawn_background_tasks(
             proactive_driver.run_until_stopped(proactive_shutdown).await;
         }));
 
+    if inbound_durability {
+        let inbound_event_repo = repos.inbound_event_repo.clone();
+        tasks
+            .handles
+            .push(spawn_until_stopped(shutdown_rx.clone(), async move {
+                run_inbound_event_cleanup(inbound_event_repo).await;
+            }));
+    }
+
     // 启动后台认知驱动（LLM 启用时才有意义）。
     if let Some(ref sched) = app.llm_scheduler {
         let cognition_driver = Arc::new(CognitionDriver::new(
@@ -1380,6 +1400,46 @@ fn spawn_background_tasks(
 
     tracing::info!(target: "runtime", "消息处理与后台任务已启动");
     tasks
+}
+
+/// 定期清理已进入终态且超过保留期的入站事件。
+///
+/// 该任务只访问终态记录，不参与入站写入、领取或消息接受热路径；失败时保留
+/// 原记录，下一轮继续尝试，并且日志不包含原始事件正文。
+async fn run_inbound_event_cleanup(repo: Arc<dyn InboundEventRepository>) {
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(INBOUND_EVENT_CLEANUP_INTERVAL_SECS),
+        Duration::from_secs(INBOUND_EVENT_CLEANUP_INTERVAL_SECS),
+    );
+    loop {
+        interval.tick().await;
+        let before = chrono::Utc::now() - chrono::Duration::days(INBOUND_EVENT_RETENTION_DAYS);
+        match repo
+            .cleanup_inbound_events(before, INBOUND_EVENT_CLEANUP_LIMIT)
+            .await
+        {
+            Ok(deleted) => {
+                if deleted > 0 {
+                    tracing::info!(
+                        target: "storage",
+                        deleted,
+                        retention_days = INBOUND_EVENT_RETENTION_DAYS,
+                        limit = INBOUND_EVENT_CLEANUP_LIMIT,
+                        "入站 inbox 终态清理完成"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "storage",
+                    error = %error,
+                    retention_days = INBOUND_EVENT_RETENTION_DAYS,
+                    limit = INBOUND_EVENT_CLEANUP_LIMIT,
+                    "入站 inbox 终态清理失败"
+                );
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1503,5 +1563,21 @@ mod tests {
     fn test_parse_runtime_args_positional_config_dir_is_rejected() {
         let result = parse_runtime_args(&["/tmp/my-config".to_string()]);
         assert!(result.is_err(), "配置目录必须显式使用 --config-dir");
+    }
+
+    #[tokio::test]
+    async fn inbound_cleanup_task_stops_with_runtime_shutdown() {
+        let storage = SqliteStorage::open_in_memory().await.unwrap();
+        storage.migrate().await.unwrap();
+        let repo: Arc<dyn InboundEventRepository> =
+            Arc::new(SqliteInboundEventRepository::new(storage.pool().clone()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = spawn_until_stopped(shutdown_rx, run_inbound_event_cleanup(repo));
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("inbox 清理任务应响应关停信号")
+            .expect("inbox 清理任务不应 panic");
     }
 }

@@ -51,6 +51,10 @@ cargo build --release --locked --bin yomua-bot --bin yomua-bot-ctl
 └── plugin-sockets/      插件启用时按需创建
 ```
 
+设置 `runtime.inbound_durability = true` 后，OneBot 事件会先写入同一 SQLite 文件的 `inbound_events` 表，再交给单一有序消费者。开关默认关闭，真实 QQ 环境验证后再单独决定是否调整。inbox 最多容纳 1024 条待处理事件；达到上限或 SQLite 写入失败时，入口保留当前事件并对 WebSocket 读取施加背压。终态记录按 7 天保留，并由低频限量清理任务删除。表中原始事件文本可能包含用户消息，数据库及其备份应按运行数据隐私边界保护；清理前的磁盘占用取决于实际事件大小和流量，尚无可靠的固定估算值。
+
+持久化只保护已成功提交到 inbox 的事件。帧已读但 inbox 事务尚未提交时崩溃仍可能丢失；QQ/OneBot 没有已验证的重放能力。旧版本内存中的事件无法迁移。输入持久化也不保证回复最终送达，模型、Outbox 和平台发送仍各有失败边界。
+
 日志默认输出到标准错误，由部署环境负责收集与轮转。`RUST_LOG` 优先于 `runtime.toml` 的 `log_level`，例如 `RUST_LOG=info,outbox=debug,llm=debug,adapter=debug` 可在真实收发测试时保留总体状态并提高关键链路细节。可查看[日志过滤与 target 说明](configuration.md#日志过滤)。事件会记录内部会话/消息 ID、平台消息 ID、事件 UUID、Outbox attempt/租约状态及 LLM role/provider/model；聊天正文、API key 和模型服务错误响应正文不写入日志。仍应按运行数据权限保护日志文件。
 
 控制 socket 没有应用层身份认证，能够访问它的进程可以执行管理和删除命令。运行在专用用户下，限制配置、数据和 socket 所在目录的访问权限；不要把控制 socket 暴露给其他用户或网络代理。

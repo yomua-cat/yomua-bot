@@ -48,6 +48,9 @@ pub struct RuntimeConfig {
 
     /// 所有模型 Provider 共用的可选 HTTP(S) 出站代理。
     pub proxy: Option<String>,
+
+    /// 是否先将 OneBot 入站事件写入 SQLite inbox；默认关闭，便于真实环境逐步验收。
+    pub inbound_durability: bool,
 }
 
 /// 管理员 ID 允许 TOML 中使用数字或字符串，加载后统一成字符串。
@@ -87,6 +90,7 @@ impl Default for RuntimeConfig {
             default_character_id: None,
             timezone: "+8".to_string(),
             proxy: None,
+            inbound_durability: false,
         }
     }
 }
@@ -613,6 +617,9 @@ admin_users = []
 
 # 主动行为和静默时段使用的 UTC 偏移，例如 "+8"（北京时间）或 "-5"。
 timezone = "+8"
+
+# 是否先将 OneBot 入站事件写入 SQLite inbox；默认关闭，真实环境验收后再开启。
+inbound_durability = false
 "#;
 
 /// onebot.toml 模板。
@@ -848,6 +855,9 @@ impl ConfigurationBundle {
         }
         if self.runtime.proxy != next.runtime.proxy {
             fields.push("runtime.proxy");
+        }
+        if self.runtime.inbound_durability != next.runtime.inbound_durability {
+            fields.push("runtime.inbound_durability");
         }
         if serde_json::to_value(&self.onebot).ok() != serde_json::to_value(&next.onebot).ok() {
             fields.push("onebot");

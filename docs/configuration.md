@@ -47,6 +47,8 @@ admin_users = ["REPLACE_WITH_ADMIN_ID"]
 # plugins_dir = "/absolute/path/to/plugins"
 # 主动行为和静默时段使用的 UTC 偏移，默认北京时间。
 timezone = "+8"
+# 是否先将 OneBot 入站事件写入 SQLite inbox；默认关闭，真实环境验收后再开启。
+inbound_durability = false
 ```
 
 | 字段 | 实际行为 |
@@ -60,6 +62,9 @@ timezone = "+8"
 | `default_character_id` | 可解析，但主程序没有接入自动绑定逻辑；使用显式导入绑定 |
 | `timezone` | 主动行为、静默时段和每日主动额度使用的 UTC 小时偏移；格式为 `+?` 或 `-?`，默认 `+8` |
 | `proxy` | 可选的模型出站 HTTP(S) 代理；URL 格式错误会阻止启动，修改后需要重启 |
+| `inbound_durability` | 是否先将 OneBot 原始事件写入 SQLite inbox，再交给入站处理器；默认 `false`，修改后需要重启 |
+
+启用后，SQLite inbox 最多容纳 1024 条待处理事件，终态记录保留 7 天后限量清理。原始事件正文可能包含用户消息，数据库文件应按运行数据的隐私边界保护。
 
 `runtime.proxy` 由主程序显式注入 TypeSafe 和 OpenAI-compatible 的专用 `reqwest` 客户端，覆盖模型生成、健康检查和 embedding 请求；未配置时维持直连。代理仅作用于这些模型 HTTP 请求。OneBot/NapCat WebSocket 使用独立的 `tokio-tungstenite` 连接器，始终直连配置的本地或局域网地址，不读取此代理；插件 Unix socket 与其他非模型流量也不受影响。代理凭据支持写在 URL 中，程序不会将代理 URL 或客户端网络错误写入日志/错误摘要。
 
@@ -176,6 +181,6 @@ max_output_tokens = 256
 
 ## 修改与重载
 
-`reload-config` 会读取并校验 `runtime.toml`、`onebot.toml`、`llm.toml` 和 `decision.toml` 四份配置。运行时设置会整体替换当前快照，并同步更新日志过滤器；其中 `timezone` 会被后续行为决策和主动额度检查立即读取。数据目录、插件目录、代理、OneBot 连接、LLM Provider/模型、决策模型和 `shutdown_timeout_secs` 等启动装配项会返回 `restart_required`，当前配置保持不变，需要受控关停后重启。关停超时值在启动时被插件监督器等组件读取，不能只更新配置快照。
+`reload-config` 会读取并校验 `runtime.toml`、`onebot.toml`、`llm.toml` 和 `decision.toml` 四份配置。运行时设置会整体替换当前快照，并同步更新日志过滤器；其中 `timezone` 会被后续行为决策和主动额度检查立即读取。数据目录、插件目录、代理、OneBot 连接、LLM Provider/模型、决策模型、`shutdown_timeout_secs` 和 `inbound_durability` 等启动装配项会返回 `restart_required`，当前配置保持不变，需要受控关停后重启。关停超时值在启动时被插件监督器等组件读取，不能只更新配置快照。
 
 配置文件可能包含令牌和密钥，全部 TOML 默认忽略，只有根 `Cargo.toml` 入库。提交问题时使用占位值，不粘贴真实配置。

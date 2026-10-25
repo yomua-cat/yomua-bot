@@ -895,6 +895,35 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
     .execute(pool)
     .await
     .map_err(|e| StorageError::Migration(format!("migration 021 rate limit index failed: {e}")))?;
+
+    // 迁移 022：持久化 OneBot 原始入站事件，缩小消息接受前的崩溃丢失窗口。
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS inbound_events (
+            ingress_seq    INTEGER PRIMARY KEY AUTOINCREMENT,
+            raw_event      TEXT NOT NULL,
+            received_at    TEXT NOT NULL,
+            status         TEXT NOT NULL CHECK(status IN ('received', 'processing', 'done', 'ignored', 'dead')),
+            attempts       INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+            last_error     TEXT,
+            processing_at  TEXT,
+            processed_at   TEXT
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 022 inbound_events failed: {e}")))?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_inbound_events_pending ON inbound_events(status, ingress_seq)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 022 inbound_events pending index failed: {e}")))?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_inbound_events_processed_at ON inbound_events(processed_at, ingress_seq)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("migration 022 inbound_events cleanup index failed: {e}")))?;
     Ok(())
 }
 

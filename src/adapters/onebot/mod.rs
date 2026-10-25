@@ -27,7 +27,7 @@ use crate::application::conversation::ConversationManager;
 use crate::application::event_bus::EventBus;
 use crate::application::message_acceptance::MessageAcceptanceService;
 use crate::domain::blacklist::BlacklistType;
-use crate::domain::repository::BlacklistRepository;
+use crate::domain::repository::{BlacklistRepository, InboundEventRepository};
 use crate::error::RuntimeError;
 
 pub mod connection;
@@ -40,8 +40,20 @@ pub use conversion::{
     OutgoingRequest,
 };
 
-const MAX_INBOUND_RETRIES: usize = 3;
+const MAX_INBOUND_RETRIES: usize =
+    crate::domain::inbound_event::INBOUND_EVENT_MAX_ATTEMPTS as usize;
 const INBOUND_RETRY_BASE_DELAY_MS: u64 = 100;
+
+enum InboundInput {
+    Raw(String),
+    InboxSeq(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InboundDisposition {
+    Done,
+    Ignored,
+}
 
 /// OneBot 适配器配置。
 #[derive(Clone, Serialize, Deserialize)]
@@ -177,6 +189,8 @@ pub struct OneBotAdapterImpl {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// 连接器（真实或测试用假连接）。
     connector: Arc<dyn WsConnector>,
+    /// 可选的入站 inbox 仓储；启用后先持久化原始事件再交给处理器。
+    inbound_event_repo: Option<Arc<dyn InboundEventRepository>>,
 }
 
 impl OneBotAdapterImpl {
@@ -235,12 +249,19 @@ impl OneBotAdapterImpl {
             started: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
             connector,
+            inbound_event_repo: None,
         }
     }
 
     /// 装配入站黑名单仓储。测试和不需要持久黑名单的调用方可保持默认关闭。
     pub fn with_blacklist_repo(mut self, repo: Arc<dyn BlacklistRepository>) -> Self {
         self.blacklist_repo = Some(repo);
+        self
+    }
+
+    /// 启用入站事件持久化入口。
+    pub fn with_inbound_durability(mut self, repo: Arc<dyn InboundEventRepository>) -> Self {
+        self.inbound_event_repo = Some(repo);
         self
     }
 }
@@ -266,6 +287,20 @@ impl OneBotAdapter for OneBotAdapterImpl {
             .take()
             .ok_or_else(|| RuntimeError::Adapter("入站通道已被占用".to_string()))?;
 
+        let startup_inbox_seq = if let Some(repo) = self.inbound_event_repo.as_ref() {
+            repo.recover_inbound_events(chrono::Utc::now())
+                .await
+                .map_err(RuntimeError::Repository)?;
+            let pending_seq = repo
+                .next_pending_inbound_seq()
+                .await
+                .map_err(RuntimeError::Repository)?;
+            tracing::info!(target: "adapter", "已恢复可重试的入站 inbox 事件");
+            pending_seq
+        } else {
+            None
+        };
+
         let shutdown_rx = self.shutdown_tx.subscribe();
         let processor_shutdown_rx = self.shutdown_tx.subscribe();
         let connector = Arc::clone(&self.connector);
@@ -283,21 +318,47 @@ impl OneBotAdapter for OneBotAdapterImpl {
             shutdown_rx,
         ));
 
+        let mut tasks = vec![connection_task];
+        let (processor_tx, processor_rx) = mpsc::channel(256);
+        if let Some(ingress_seq) = startup_inbox_seq {
+            processor_tx
+                .send(InboundInput::InboxSeq(ingress_seq))
+                .await
+                .map_err(|_| RuntimeError::Adapter("无法唤醒入站 inbox 消费者".to_string()))?;
+        }
+        if let Some(repo) = self.inbound_event_repo.clone() {
+            let persistence_shutdown_rx = self.shutdown_tx.subscribe();
+            let persistence_task = tokio::spawn(persist_inbound_events(
+                event_rx,
+                processor_tx,
+                repo,
+                persistence_shutdown_rx,
+            ));
+            tasks.push(persistence_task);
+        } else {
+            let passthrough_shutdown_rx = self.shutdown_tx.subscribe();
+            let passthrough_task = tokio::spawn(forward_raw_events(
+                event_rx,
+                processor_tx,
+                passthrough_shutdown_rx,
+            ));
+            tasks.push(passthrough_task);
+        }
+
         // 入站处理任务（解析 → 解析核心 ID → Acceptance → 发布 CoreEvent）。
         let processor = InboundProcessor {
-            event_rx,
+            event_rx: processor_rx,
             conversation_manager: self.conversation_manager.clone(),
             bus: self.bus.clone(),
             acceptance_service: self.acceptance_service.clone(),
             binding_manager: self.binding_manager.clone(),
             blacklist_repo: self.blacklist_repo.clone(),
+            inbound_event_repo: self.inbound_event_repo.clone(),
             shutdown_rx: processor_shutdown_rx,
         };
         let processor_task = tokio::spawn(async move { processor.run().await });
-        self.tasks
-            .lock()
-            .await
-            .extend([connection_task, processor_task]);
+        tasks.push(processor_task);
+        self.tasks.lock().await.extend(tasks);
 
         Ok(())
     }
@@ -351,6 +412,90 @@ impl OneBotAdapter for OneBotAdapterImpl {
     ) -> Result<ActionResponse, RuntimeError> {
         let request = build_private_send_request(user_id, content)?;
         self.send_action(request).await
+    }
+}
+
+/// 先把原始事件写入 inbox，再交给现有入站处理器。
+///
+/// 写入失败时停留在当前事件并短暂退避，接收端因无法继续消费而形成
+/// 有界背压；日志只记录错误摘要，不记录原始 OneBot 正文。
+async fn persist_inbound_events(
+    mut event_rx: mpsc::Receiver<String>,
+    processor_tx: mpsc::Sender<InboundInput>,
+    repo: Arc<dyn InboundEventRepository>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            raw = event_rx.recv() => {
+                let Some(raw) = raw else { break; };
+                let mut retry = 0u32;
+                let ingress_seq = loop {
+                    match repo.insert_inbound_event(&raw, chrono::Utc::now()).await {
+                        Ok(event) => break event.ingress_seq,
+                        Err(error) => {
+                            retry = retry.saturating_add(1);
+                            let delay_ms = (50_u64.saturating_mul(1_u64 << retry.min(5))).min(2_000);
+                            tracing::warn!(
+                                target: "adapter",
+                                retry,
+                                delay_ms,
+                                error = %error,
+                                "入站事件写入 inbox 失败，保持背压并重试"
+                            );
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                                changed = shutdown_rx.changed() => {
+                                    if changed.is_err() || *shutdown_rx.borrow() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                tokio::select! {
+                    result = processor_tx.send(InboundInput::InboxSeq(ingress_seq)) => {
+                        if result.is_err() {
+                            tracing::warn!(target: "adapter", ingress_seq, "入站处理器通道已关闭，保留 inbox 记录");
+                            break;
+                        }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn forward_raw_events(
+    mut event_rx: mpsc::Receiver<String>,
+    processor_tx: mpsc::Sender<InboundInput>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            raw = event_rx.recv() => {
+                let Some(raw) = raw else { break; };
+                if processor_tx.send(InboundInput::Raw(raw)).await.is_err() {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -443,13 +588,14 @@ impl OneBotAdapterImpl {
 ///
 /// 独立于连接循环运行；单独一条消息的处理失败不会导致任务退出。
 struct InboundProcessor {
-    event_rx: mpsc::Receiver<String>,
+    event_rx: mpsc::Receiver<InboundInput>,
     conversation_manager: ConversationManager,
     #[allow(dead_code)]
     bus: EventBus,
     acceptance_service: Arc<MessageAcceptanceService>,
     binding_manager: Arc<BindingManager>,
     blacklist_repo: Option<Arc<dyn BlacklistRepository>>,
+    inbound_event_repo: Option<Arc<dyn InboundEventRepository>>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -462,9 +608,10 @@ impl InboundProcessor {
                         break;
                     }
                 }
-                raw = self.event_rx.recv() => {
-                    match raw {
-                        Some(raw) => self.handle_raw(&raw).await,
+                input = self.event_rx.recv() => {
+                    match input {
+                        Some(InboundInput::Raw(raw)) => self.handle_raw(&raw).await,
+                        Some(InboundInput::InboxSeq(ingress_seq)) => self.handle_inbox_event(ingress_seq).await,
                         None => break,
                     }
                 }
@@ -473,7 +620,10 @@ impl InboundProcessor {
     }
 
     async fn handle_raw(&self, raw: &str) {
-        if let Err(error) = retry_inbound_operation(|| self.handle_raw_once(raw)).await {
+        if let Err(error) =
+            retry_inbound_operation(|| async { self.handle_raw_once(raw, None).await.map(|_| ()) })
+                .await
+        {
             tracing::error!(
                 target: "adapter",
                 error = %error,
@@ -482,12 +632,125 @@ impl InboundProcessor {
         }
     }
 
-    async fn handle_raw_once(&self, raw: &str) -> Result<(), RuntimeError> {
+    async fn handle_inbox_event(&mut self, signaled_seq: i64) {
+        let Some(repo) = &self.inbound_event_repo else {
+            tracing::error!(target: "adapter", ingress_seq = signaled_seq, "inbox 事件没有装配仓储");
+            return;
+        };
+        let mut event = match repo.claim_next_inbound_event(chrono::Utc::now()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::error!(target: "adapter", ingress_seq = signaled_seq, error = %error, "领取 inbox 事件失败");
+                return;
+            }
+        };
+        if event.ingress_seq != signaled_seq {
+            tracing::debug!(target: "adapter", signaled_seq, claimed_seq = event.ingress_seq, "按持久序号处理更早的 inbox 事件");
+        }
+
+        loop {
+            match self
+                .handle_raw_once(&event.raw_event, Some(event.ingress_seq))
+                .await
+            {
+                Ok(disposition) => {
+                    if let Err(error) = repo
+                        .mark_inbound_event(
+                            event.ingress_seq,
+                            match disposition {
+                                InboundDisposition::Done => {
+                                    crate::domain::inbound_event::InboundEventStatus::Done
+                                }
+                                InboundDisposition::Ignored => {
+                                    crate::domain::inbound_event::InboundEventStatus::Ignored
+                                }
+                            },
+                            chrono::Utc::now(),
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %error, "写入 inbox 终态失败");
+                        return;
+                    }
+                    event = match repo.claim_next_inbound_event(chrono::Utc::now()).await {
+                        Ok(Some(event)) => event,
+                        Ok(None) => return,
+                        Err(error) => {
+                            tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %error, "领取后续 inbox 事件失败");
+                            return;
+                        }
+                    };
+                }
+                Err(error)
+                    if is_retryable_inbound_error(&error)
+                        && event.attempts
+                            < crate::domain::inbound_event::INBOUND_EVENT_MAX_ATTEMPTS =>
+                {
+                    let summary = inbound_error_summary(&error);
+                    if let Err(mark_error) =
+                        repo.retry_inbound_event(event.ingress_seq, summary).await
+                    {
+                        tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %mark_error, "释放 inbox 事件以便重试失败");
+                        return;
+                    }
+                    let delay = inbound_retry_delay(event.attempts.saturating_sub(1) as usize);
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        changed = self.shutdown_rx.changed() => {
+                            if changed.is_err() || *self.shutdown_rx.borrow() {
+                                return;
+                            }
+                        }
+                    }
+                    event = match repo.claim_next_inbound_event(chrono::Utc::now()).await {
+                        Ok(Some(event)) => event,
+                        Ok(None) => return,
+                        Err(claim_error) => {
+                            tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %claim_error, "重新领取 inbox 事件失败");
+                            return;
+                        }
+                    };
+                }
+                Err(error) => {
+                    let summary = inbound_error_summary(&error);
+                    let status = crate::domain::inbound_event::InboundEventStatus::Dead;
+                    if let Err(mark_error) = repo
+                        .mark_inbound_event(
+                            event.ingress_seq,
+                            status,
+                            chrono::Utc::now(),
+                            Some(summary),
+                        )
+                        .await
+                    {
+                        tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %mark_error, "写入 inbox dead 终态失败");
+                    }
+                    tracing::error!(target: "adapter", ingress_seq = event.ingress_seq, error = %summary, "入站 inbox 事件进入 dead 终态");
+                    event = match repo.claim_next_inbound_event(chrono::Utc::now()).await {
+                        Ok(Some(event)) => event,
+                        Ok(None) => return,
+                        Err(error) => {
+                            tracing::error!(target: "adapter", error = %error, "领取 dead 后续 inbox 事件失败");
+                            return;
+                        }
+                    };
+                }
+            }
+        }
+    }
+
+    async fn handle_raw_once(
+        &self,
+        raw: &str,
+        inbound_event_seq: Option<i64>,
+    ) -> Result<InboundDisposition, RuntimeError> {
         let event: OneBotEvent = match serde_json::from_str(raw) {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(target: "adapter", error = %e, "无法解析 OneBot JSON");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             }
         };
 
@@ -496,11 +759,11 @@ impl InboundProcessor {
             Ok(i) => i,
             Err(_) if !is_message_event(&event) => {
                 tracing::debug!(target: "adapter", event = %event.post_type, "忽略非消息事件");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             }
             Err(e) => {
                 tracing::debug!(target: "adapter", error = %e, "忽略无法转换的入站事件");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             }
         };
 
@@ -534,7 +797,7 @@ impl InboundProcessor {
                 platform_message_id = inbound.platform_message_id,
                 "忽略 OneBot 自身回声事件"
             );
-            return Ok(());
+            return Ok(InboundDisposition::Done);
         }
 
         // 黑名单必须在 resolve 之前检查。resolve 会按需创建会话和参与者，
@@ -549,7 +812,7 @@ impl InboundProcessor {
             };
             if user_blocked {
                 tracing::info!(target: "adapter", sender_id = %inbound.external_sender_id, "用户处于黑名单，忽略入站消息");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             }
             if inbound.conversation_type == crate::domain::conversation::ConversationType::Group {
                 let group_blocked = match blacklist_repo
@@ -561,7 +824,7 @@ impl InboundProcessor {
                 };
                 if group_blocked {
                     tracing::info!(target: "adapter", group_id = %inbound.external_conversation_id, "群组处于黑名单，忽略入站消息");
-                    return Ok(());
+                    return Ok(InboundDisposition::Ignored);
                 }
             }
         }
@@ -587,7 +850,7 @@ impl InboundProcessor {
                 .await?
             else {
                 tracing::debug!(target: "adapter", "忽略未绑定会话中的管理指令");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             };
             let Some(sender_id) = self
                 .conversation_manager
@@ -595,7 +858,7 @@ impl InboundProcessor {
                 .await?
             else {
                 tracing::debug!(target: "adapter", conversation_id, "忽略未知参与者的管理指令");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             };
             let Some(binding) = self
                 .binding_manager
@@ -605,13 +868,13 @@ impl InboundProcessor {
                 .next()
             else {
                 tracing::debug!(target: "adapter", conversation_id, "忽略未绑定会话中的管理指令");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             };
             let timestamp = chrono::DateTime::from_timestamp(inbound.unix_time, 0)
                 .unwrap_or_else(chrono::Utc::now);
             match self
                 .acceptance_service
-                .accept_command(
+                .accept_command_with_seq(
                     conversation_id,
                     sender_id,
                     inbound.content,
@@ -622,6 +885,7 @@ impl InboundProcessor {
                     inbound.external_sender_id,
                     binding.id,
                     binding.switched_at,
+                    inbound_event_seq,
                 )
                 .await
             {
@@ -634,7 +898,7 @@ impl InboundProcessor {
                 ),
                 Err(error) => return Err(error),
             }
-            return Ok(());
+            return Ok(InboundDisposition::Done);
         }
 
         // 解析外部 ID → 核心 ID。普通消息允许按需创建会话和参与者。
@@ -659,7 +923,7 @@ impl InboundProcessor {
             Ok(Some(user_id)) => user_id,
             Ok(None) => {
                 tracing::error!(target: "adapter", sender_id, "用户参与者缺少全域用户身份，拒绝持久化消息");
-                return Ok(());
+                return Ok(InboundDisposition::Ignored);
             }
             Err(error) => return Err(error),
         };
@@ -677,7 +941,7 @@ impl InboundProcessor {
                 conversation_id,
                 "该会话未绑定角色，忽略消息（与 ReplyProcessor 行为一致）"
             );
-            return Ok(());
+            return Ok(InboundDisposition::Ignored);
         }
 
         // 取 switched_at 最新的绑定（与 switch_character 逻辑一致）
@@ -690,7 +954,7 @@ impl InboundProcessor {
             chrono::DateTime::from_timestamp(inbound.unix_time, 0).unwrap_or_else(chrono::Utc::now);
         let acceptance_result = self
             .acceptance_service
-            .accept_inbound(
+            .accept_inbound_with_seq(
                 conversation_id,
                 sender_id,
                 inbound.content.clone(),
@@ -699,6 +963,7 @@ impl InboundProcessor {
                 character_id,
                 inbound.is_mentioned,
                 serde_json::json!({"author_kind": if inbound.is_other_bot { "other_bot" } else { "user" },"external_sender_id":inbound.external_sender_id,"user_id":sender_user_id,"display_name":inbound.display_name,"mentions":inbound.mention_targets,"reply_to_platform_message_id":inbound.reply_to,"content_metadata":inbound.content_metadata,"binding_id":sorted[0].id,"binding_version":sorted[0].switched_at}),
+                inbound_event_seq,
             )
             .await;
 
@@ -725,7 +990,7 @@ impl InboundProcessor {
             conversation_sequence,
             "C2-4: 入站消息已通过 Acceptance；canonical MessageAccepted 事件由事务入口发布"
         );
-        Ok(())
+        Ok(InboundDisposition::Done)
     }
 }
 
@@ -792,6 +1057,16 @@ fn is_transient_database_error(message: &str) -> bool {
     .any(|marker| message.contains(marker))
 }
 
+fn inbound_error_summary(error: &RuntimeError) -> &str {
+    match error {
+        RuntimeError::Repository(crate::error::RepositoryError::Database(_))
+        | RuntimeError::Storage(crate::error::StorageError::Database(_)) => "数据库暂时不可用",
+        RuntimeError::Storage(crate::error::StorageError::Connection(_)) => "数据库连接暂时不可用",
+        RuntimeError::ParseError(_) => "入站事件解析失败",
+        _ => "入站事件处理失败",
+    }
+}
+
 fn is_message_event(event: &OneBotEvent) -> bool {
     event.post_type == "message"
 }
@@ -814,10 +1089,10 @@ mod tests {
     use crate::application::event_bus::EventSubscription;
     use crate::application::message_acceptance::MessageAcceptanceService;
     use crate::domain::conversation::{Conversation, Participant};
-    use crate::domain::event::{Command, CoreEvent};
+    use crate::domain::event::{Command, CommandReceivedEvent, CoreEvent};
     use crate::domain::repository::{
-        CharacterBindingRepository, CharacterRepository, ConversationRepository, MessageRepository,
-        ParticipantRepository,
+        CharacterBindingRepository, CharacterRepository, ConversationRepository,
+        InboundEventRepository, MessageRepository, ParticipantRepository,
     };
     use crate::error::RepositoryError;
     use async_trait::async_trait;
@@ -958,6 +1233,7 @@ mod tests {
             acceptance_service: Arc::new(acceptance_service),
             binding_manager: Arc::new(binding_manager),
             blacklist_repo: None,
+            inbound_event_repo: None,
             shutdown_rx: watch::channel(false).1,
         }
     }
@@ -1366,6 +1642,59 @@ mod tests {
         .to_string()
     }
 
+    fn sqlite_inbound_processor(pool: sqlx::SqlitePool) -> InboundProcessor {
+        use crate::infrastructure::storage::repository::{
+            SqliteCharacterBindingRepository, SqliteCharacterRepository,
+            SqliteConversationRepository, SqliteInboundEventRepository, SqliteMessageRepository,
+            SqliteParticipantRepository,
+        };
+
+        let conversation_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
+        let participant_repo = Arc::new(SqliteParticipantRepository::new(pool.clone()));
+        let conversation_manager = ConversationManager::new(
+            conversation_repo.clone() as Arc<dyn ConversationRepository>,
+            participant_repo as Arc<dyn ParticipantRepository>,
+        );
+        let character_repo = Arc::new(SqliteCharacterRepository::new(pool.clone()));
+        let binding_manager = BindingManager::new(
+            Arc::new(SqliteCharacterBindingRepository::new(pool.clone()))
+                as Arc<dyn CharacterBindingRepository>,
+            character_repo as Arc<dyn CharacterRepository>,
+            conversation_repo as Arc<dyn ConversationRepository>,
+        );
+        let message_repo = Arc::new(SqliteMessageRepository::new(pool.clone()));
+        let bus = EventBus::new();
+        let acceptance_service =
+            MessageAcceptanceService::new(message_repo as Arc<dyn MessageRepository>, bus.clone());
+        let inbound_event_repo = Arc::new(SqliteInboundEventRepository::new(pool));
+        let (_event_tx, event_rx) = mpsc::channel(8);
+
+        InboundProcessor {
+            event_rx,
+            conversation_manager,
+            bus,
+            acceptance_service: Arc::new(acceptance_service),
+            binding_manager: Arc::new(binding_manager),
+            blacklist_repo: None,
+            inbound_event_repo: Some(inbound_event_repo),
+            shutdown_rx: watch::channel(false).1,
+        }
+    }
+
+    struct TestControlReplySender;
+
+    #[async_trait]
+    impl crate::application::command::ControlReplySender for TestControlReplySender {
+        async fn send_control_reply(
+            &self,
+            _conversation_id: i64,
+            _source_message_id: i64,
+            _content: &str,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
     // ------------------------------------------------------------------
     // 发布前截流（硬性约束 B）测试
     // ------------------------------------------------------------------
@@ -1441,6 +1770,284 @@ mod tests {
             }
             other => panic!("期望 MessageAccepted，实际 {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn command_inbox_replay_after_sqlite_restart_does_not_duplicate_outbox_effects() {
+        use crate::infrastructure::storage::repository::SqliteInboundEventRepository;
+        use crate::infrastructure::storage::SqliteStorage;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("command-inbox-replay.sqlite");
+        let path = path.to_string_lossy().into_owned();
+        let (ingress_seq, conversation_id, target_character_id): (i64, i64, i64);
+        let switched_at: String;
+        {
+            let storage = SqliteStorage::open(&path).await.unwrap();
+            storage.migrate().await.unwrap();
+            conversation_id = sqlx::query_scalar(
+                "INSERT INTO conversations(conversation_type, external_id) VALUES ('group', '500000') RETURNING id",
+            )
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+            let current_character_id: i64 =
+                sqlx::query_scalar("INSERT INTO characters(name) VALUES ('旧角色') RETURNING id")
+                    .fetch_one(storage.pool())
+                    .await
+                    .unwrap();
+            target_character_id =
+                sqlx::query_scalar("INSERT INTO characters(name) VALUES ('重放角色') RETURNING id")
+                    .fetch_one(storage.pool())
+                    .await
+                    .unwrap();
+            sqlx::query("INSERT INTO participants(conversation_id, external_id, display_name, role) VALUES (?, '900001', '小明', 'user')")
+                .bind(conversation_id)
+                .execute(storage.pool())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO conversation_bindings(character_id, conversation_id, switched_at) VALUES (?, ?, ?)")
+                .bind(current_character_id)
+                .bind(conversation_id)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(storage.pool())
+                .await
+                .unwrap();
+            let raw_event = group_message_json("换角色 重放角色", true);
+            let inbox = SqliteInboundEventRepository::new(storage.pool().clone());
+            ingress_seq = inbox
+                .insert_inbound_event(&raw_event, chrono::Utc::now())
+                .await
+                .unwrap()
+                .ingress_seq;
+
+            // 提交命令消息和 Outbox，但模拟在 inbox 完成标记前崩溃。
+            sqlite_inbound_processor(storage.pool().clone())
+                .handle_raw(&raw_event)
+                .await;
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM inbound_events WHERE ingress_seq = ?")
+                    .bind(ingress_seq)
+                    .fetch_one(storage.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(status, "received");
+
+            // 模拟 Outbox 中的命令执行，调用真实 CommandHandler 记录一次副作用。
+            let binding_manager = Arc::new(BindingManager::new(
+                Arc::new(
+                    crate::infrastructure::storage::repository::SqliteCharacterBindingRepository::new(
+                        storage.pool().clone(),
+                    ),
+                ) as Arc<dyn CharacterBindingRepository>,
+                Arc::new(
+                    crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+                        storage.pool().clone(),
+                    ),
+                ) as Arc<dyn CharacterRepository>,
+                Arc::new(
+                    crate::infrastructure::storage::repository::SqliteConversationRepository::new(
+                        storage.pool().clone(),
+                    ),
+                ) as Arc<dyn ConversationRepository>,
+            ));
+            let character_repo = Arc::new(
+                crate::infrastructure::storage::repository::SqliteCharacterRepository::new(
+                    storage.pool().clone(),
+                ),
+            );
+            let command_handler = crate::application::command::CommandHandler::new(
+                binding_manager,
+                character_repo,
+                Arc::new(TestControlReplySender),
+                Some(vec!["900001".to_string()]),
+            );
+            command_handler
+                .handle(&CommandReceivedEvent {
+                    conversation_id,
+                    sender_id: 1,
+                    external_sender_id: "900001".to_string(),
+                    message_id: 1001,
+                    content: "换角色 重放角色".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    command: Command::SwitchCharacter {
+                        character_name: "重放角色".to_string(),
+                    },
+                    source_message_id: 1,
+                    character_id: current_character_id,
+                    conversation_sequence: 1,
+                    platform_message_id: Some(1001),
+                    ingested_at: None,
+                })
+                .await
+                .unwrap();
+            switched_at = sqlx::query_scalar(
+                "SELECT switched_at FROM conversation_bindings WHERE conversation_id = ?",
+            )
+            .bind(conversation_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+
+            storage.close().await;
+        }
+
+        let storage = SqliteStorage::open(&path).await.unwrap();
+        storage.migrate().await.unwrap();
+        sqlite_inbound_processor(storage.pool().clone())
+            .handle_inbox_event(ingress_seq)
+            .await;
+
+        let counts: (i64, i64, i64, String, i64, String) = sqlx::query_as(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM messages WHERE conversation_id = ?),
+                   (SELECT COUNT(*) FROM outbox_events WHERE ordering_key = ?),
+                   (SELECT sequence_counter FROM conversations WHERE id = ?),
+                   (SELECT status FROM inbound_events WHERE ingress_seq = ?),
+                   (SELECT character_id FROM conversation_bindings WHERE conversation_id = ?),
+                   (SELECT switched_at FROM conversation_bindings WHERE conversation_id = ?)"#,
+        )
+        .bind(conversation_id)
+        .bind(conversation_id.to_string())
+        .bind(conversation_id)
+        .bind(ingress_seq)
+        .bind(conversation_id)
+        .bind(conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts.0, 1);
+        assert_eq!(counts.1, 1);
+        assert_eq!(counts.2, 1);
+        assert_eq!(counts.3, "done");
+        assert_eq!(counts.4, target_character_id);
+        assert_eq!(counts.5, switched_at);
+    }
+
+    #[tokio::test]
+    async fn self_echo_inbox_replay_after_sqlite_restart_confirms_unknown_once() {
+        use crate::infrastructure::storage::repository::SqliteInboundEventRepository;
+        use crate::infrastructure::storage::SqliteStorage;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("echo-inbox-replay.sqlite");
+        let path = path.to_string_lossy().into_owned();
+        let (ingress_seq, conversation_id, reply_message_id): (i64, i64, i64);
+        {
+            let storage = SqliteStorage::open(&path).await.unwrap();
+            storage.migrate().await.unwrap();
+            conversation_id = sqlx::query_scalar(
+                "INSERT INTO conversations(conversation_type, external_id, sequence_counter) VALUES ('group', '500000', 1) RETURNING id",
+            )
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+            let character_id: i64 =
+                sqlx::query_scalar("INSERT INTO characters(name) VALUES ('回声角色') RETURNING id")
+                    .fetch_one(storage.pool())
+                    .await
+                    .unwrap();
+            let sender_id: i64 = sqlx::query_scalar(
+                "INSERT INTO participants(conversation_id, external_id, display_name, role) VALUES (?, '123456', '机器人', 'character') RETURNING id",
+            )
+            .bind(conversation_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+            reply_message_id = sqlx::query_scalar(
+                "INSERT INTO messages(conversation_id, sender_id, content, timestamp, metadata, active_character_id, conversation_sequence) VALUES (?, ?, ?, ?, ?, ?, 1) RETURNING id",
+            )
+            .bind(conversation_id)
+            .bind(sender_id)
+            .bind(serde_json::json!({"Text":"回声确认内容"}).to_string())
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(serde_json::json!({"author_kind":"assistant"}).to_string())
+            .bind(character_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+            let now = chrono::Utc::now().to_rfc3339();
+            sqlx::query("INSERT INTO reply_tasks(message_id, character_id, content, status, delivery_started_at, updated_at) VALUES (?, ?, '回声确认内容', 'unknown', ?, ?)")
+                .bind(reply_message_id)
+                .bind(character_id)
+                .bind(&now)
+                .bind(&now)
+                .execute(storage.pool())
+                .await
+                .unwrap();
+            let echo_event = serde_json::json!({
+                "post_type": "message",
+                "time": 1690000000,
+                "self_id": 123456,
+                "message_type": "group",
+                "message_id": 9200,
+                "group_id": 500000,
+                "user_id": 123456,
+                "message": "回声确认内容",
+                "sender": {"user_id": 123456, "nickname": "机器人", "role": "admin"}
+            })
+            .to_string();
+            let inbox = SqliteInboundEventRepository::new(storage.pool().clone());
+            ingress_seq = inbox
+                .insert_inbound_event(&echo_event, chrono::Utc::now())
+                .await
+                .unwrap()
+                .ingress_seq;
+
+            // 对账与 unknown 确认已提交，但 inbox 仍未完成。
+            sqlite_inbound_processor(storage.pool().clone())
+                .handle_raw(&echo_event)
+                .await;
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM inbound_events WHERE ingress_seq = ?")
+                    .bind(ingress_seq)
+                    .fetch_one(storage.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(status, "received");
+            storage.close().await;
+        }
+
+        let storage = SqliteStorage::open(&path).await.unwrap();
+        storage.migrate().await.unwrap();
+        sqlite_inbound_processor(storage.pool().clone())
+            .handle_inbox_event(ingress_seq)
+            .await;
+
+        let echo_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM platform_message_echoes WHERE conversation_id = ? AND platform_message_id = 9200",
+        )
+        .bind(conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let assistant_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ? AND json_extract(metadata, '$.author_kind') = 'assistant'",
+        )
+        .bind(conversation_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let state: (String, Option<i64>, i64, String) = sqlx::query_as(
+            r#"SELECT task.status, task.platform_message_id, conversation.sequence_counter,
+                      event.status
+                 FROM reply_tasks task
+                 JOIN messages ON messages.id = task.message_id
+                 JOIN conversations conversation ON conversation.id = messages.conversation_id
+                 JOIN inbound_events event ON event.ingress_seq = ?
+                WHERE task.message_id = ?"#,
+        )
+        .bind(ingress_seq)
+        .bind(reply_message_id)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(echo_count, 1);
+        assert_eq!(assistant_count, 2);
+        assert_eq!(
+            state,
+            ("sent".to_string(), Some(9200), 2, "done".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1557,5 +2164,47 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn inbox_write_failure_blocks_processing_and_applies_bounded_backpressure() {
+        let storage = crate::infrastructure::storage::SqliteStorage::open_in_memory()
+            .await
+            .unwrap();
+        storage.migrate().await.unwrap();
+        sqlx::query("DROP TABLE inbound_events")
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        let repo = Arc::new(
+            crate::infrastructure::storage::repository::SqliteInboundEventRepository::new(
+                storage.pool().clone(),
+            ),
+        );
+        let (source_tx, source_rx) = mpsc::channel(1);
+        let (processor_tx, mut processor_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(persist_inbound_events(
+            source_rx,
+            processor_tx,
+            repo,
+            shutdown_rx,
+        ));
+
+        source_tx.send("event-one".to_owned()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(processor_rx.try_recv().is_err());
+        source_tx.send("event-two".to_owned()).await.unwrap();
+        assert!(matches!(
+            source_tx.try_send("event-three".to_owned()),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("持久化入口应响应关停信号")
+            .expect("持久化入口任务不应 panic");
+        assert!(processor_rx.try_recv().is_err());
     }
 }
