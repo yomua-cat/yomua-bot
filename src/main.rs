@@ -71,7 +71,7 @@ use yomua_bot::domain::repository::{
     ConversationStateRepository, InboundEventRepository, MemoryRepository, MessageRepository,
     MoodRepository, ParticipantRepository, PluginDataRepository, RelationshipRepository,
 };
-use yomua_bot::error::RuntimeError;
+use yomua_bot::error::{RepositoryError, RuntimeError};
 use yomua_bot::infrastructure::llm::openai_compatible::{
     OpenAiCompatibleConfig, OpenAiCompatibleProvider,
 };
@@ -101,6 +101,7 @@ const DECISION_CONFIG: &str = "decision.toml";
 const DEFAULT_CONFIG_DIR: &str = "config";
 const INBOUND_EVENT_CLEANUP_INTERVAL_SECS: u64 = 10 * 60;
 const INBOUND_EVENT_CLEANUP_LIMIT: i64 = INBOUND_EVENT_MAX_PENDING;
+const INBOUND_EVENT_CLEANUP_MAX_ROUNDS: usize = 20;
 
 /// 只使用已展开、已校验的模型路由；默认 Provider 来自 conversation。
 fn build_model_scheduler(
@@ -1406,6 +1407,26 @@ fn spawn_background_tasks(
 ///
 /// 该任务只访问终态记录，不参与入站写入、领取或消息接受热路径；失败时保留
 /// 原记录，下一轮继续尝试，并且日志不包含原始事件正文。
+async fn cleanup_inbound_event_cycle(
+    repo: &dyn InboundEventRepository,
+    before: chrono::DateTime<chrono::Utc>,
+) -> Result<u64, RepositoryError> {
+    let mut total_deleted: u64 = 0;
+    for round in 0..INBOUND_EVENT_CLEANUP_MAX_ROUNDS {
+        let deleted = repo
+            .cleanup_inbound_events(before, INBOUND_EVENT_CLEANUP_LIMIT)
+            .await?;
+        total_deleted = total_deleted.saturating_add(deleted);
+        if deleted < INBOUND_EVENT_CLEANUP_LIMIT as u64 {
+            break;
+        }
+        if round + 1 < INBOUND_EVENT_CLEANUP_MAX_ROUNDS {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(total_deleted)
+}
+
 async fn run_inbound_event_cleanup(repo: Arc<dyn InboundEventRepository>) {
     let mut interval = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(INBOUND_EVENT_CLEANUP_INTERVAL_SECS),
@@ -1414,10 +1435,7 @@ async fn run_inbound_event_cleanup(repo: Arc<dyn InboundEventRepository>) {
     loop {
         interval.tick().await;
         let before = chrono::Utc::now() - chrono::Duration::days(INBOUND_EVENT_RETENTION_DAYS);
-        match repo
-            .cleanup_inbound_events(before, INBOUND_EVENT_CLEANUP_LIMIT)
-            .await
-        {
+        match cleanup_inbound_event_cycle(repo.as_ref(), before).await {
             Ok(deleted) => {
                 if deleted > 0 {
                     tracing::info!(
@@ -1425,6 +1443,7 @@ async fn run_inbound_event_cleanup(repo: Arc<dyn InboundEventRepository>) {
                         deleted,
                         retention_days = INBOUND_EVENT_RETENTION_DAYS,
                         limit = INBOUND_EVENT_CLEANUP_LIMIT,
+                        max_rounds = INBOUND_EVENT_CLEANUP_MAX_ROUNDS,
                         "入站 inbox 终态清理完成"
                     );
                 }
@@ -1435,6 +1454,7 @@ async fn run_inbound_event_cleanup(repo: Arc<dyn InboundEventRepository>) {
                     error = %error,
                     retention_days = INBOUND_EVENT_RETENTION_DAYS,
                     limit = INBOUND_EVENT_CLEANUP_LIMIT,
+                    max_rounds = INBOUND_EVENT_CLEANUP_MAX_ROUNDS,
                     "入站 inbox 终态清理失败"
                 );
             }
@@ -1579,5 +1599,100 @@ mod tests {
             .await
             .expect("inbox 清理任务应响应关停信号")
             .expect("inbox 清理任务不应 panic");
+    }
+
+    async fn insert_expired_terminal_events(
+        storage: &SqliteStorage,
+        batches: usize,
+        status: &str,
+        processed_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        for _ in 0..batches {
+            sqlx::query(
+                r#"WITH RECURSIVE numbers(n) AS (
+                       SELECT 1
+                       UNION ALL SELECT n + 1 FROM numbers WHERE n < ?
+                   )
+                   INSERT INTO inbound_events(raw_event, received_at, status, processed_at)
+                   SELECT 'expired', ?, ?, ? FROM numbers"#,
+            )
+            .bind(INBOUND_EVENT_CLEANUP_LIMIT)
+            .bind(processed_at.to_rfc3339())
+            .bind(status)
+            .bind(processed_at.to_rfc3339())
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_cleanup_cycle_drains_multiple_batches_and_preserves_live_events() {
+        let storage = SqliteStorage::open_in_memory().await.unwrap();
+        storage.migrate().await.unwrap();
+        let repo = SqliteInboundEventRepository::new(storage.pool().clone());
+        let now = chrono::Utc::now();
+        let before = now - chrono::Duration::days(INBOUND_EVENT_RETENTION_DAYS);
+        let expired_at = before - chrono::Duration::seconds(1);
+        insert_expired_terminal_events(&storage, 1, "done", expired_at).await;
+        insert_expired_terminal_events(&storage, 1, "ignored", expired_at).await;
+        insert_expired_terminal_events(&storage, 1, "dead", expired_at).await;
+        sqlx::query(
+            r#"INSERT INTO inbound_events(raw_event, received_at, status, processed_at)
+               VALUES ('fresh', ?, 'done', ?),
+                      ('received', ?, 'received', NULL),
+                      ('processing', ?, 'processing', NULL)"#,
+        )
+        .bind(now.to_rfc3339())
+        .bind((before + chrono::Duration::seconds(1)).to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(storage.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            cleanup_inbound_event_cycle(&repo, before).await.unwrap(),
+            INBOUND_EVENT_CLEANUP_LIMIT as u64 * 3
+        );
+        let remaining: Vec<(String, String)> =
+            sqlx::query_as("SELECT raw_event, status FROM inbound_events ORDER BY ingress_seq")
+                .fetch_all(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining,
+            vec![
+                ("fresh".to_string(), "done".to_string()),
+                ("received".to_string(), "received".to_string()),
+                ("processing".to_string(), "processing".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_cleanup_cycle_stops_at_round_limit() {
+        let storage = SqliteStorage::open_in_memory().await.unwrap();
+        storage.migrate().await.unwrap();
+        let repo = SqliteInboundEventRepository::new(storage.pool().clone());
+        let before = chrono::Utc::now() - chrono::Duration::days(INBOUND_EVENT_RETENTION_DAYS);
+        let expired_at = before - chrono::Duration::seconds(1);
+        insert_expired_terminal_events(
+            &storage,
+            INBOUND_EVENT_CLEANUP_MAX_ROUNDS + 1,
+            "done",
+            expired_at,
+        )
+        .await;
+
+        assert_eq!(
+            cleanup_inbound_event_cycle(&repo, before).await.unwrap(),
+            INBOUND_EVENT_CLEANUP_LIMIT as u64 * INBOUND_EVENT_CLEANUP_MAX_ROUNDS as u64
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbound_events")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, INBOUND_EVENT_CLEANUP_LIMIT);
     }
 }
