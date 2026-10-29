@@ -696,12 +696,8 @@ mod tests {
             runtime_config.proxy.as_deref(),
         )
         .unwrap();
-        let proxy_response = client
-            .get("http://model-target.invalid/test")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(proxy_response.status(), reqwest::StatusCode::BAD_GATEWAY);
+        let proxy_result = client.get("https://model-target.invalid/test").send().await;
+        assert!(proxy_result.is_err());
 
         let websocket_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let websocket_address = websocket_listener.local_addr().unwrap();
@@ -730,7 +726,7 @@ mod tests {
         drop(transport);
         let _ = websocket_server.await.unwrap();
         let (proxy_request, proxy_received_onebot_connection) = proxy_server.await.unwrap();
-        assert!(proxy_request.starts_with("GET http://model-target.invalid/test "));
+        assert!(proxy_request.starts_with("CONNECT model-target.invalid:443 "));
         assert!(!proxy_received_onebot_connection);
     }
 
