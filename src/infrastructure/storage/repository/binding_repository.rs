@@ -1,0 +1,321 @@
+//! CharacterBindingRepository 的 SQLite 实现。
+
+use async_trait::async_trait;
+use sqlx::SqlitePool;
+
+use crate::domain::character::{CharacterBinding, ReplyMode};
+use crate::domain::repository::CharacterBindingRepository;
+use crate::error::RepositoryError;
+
+pub struct SqliteCharacterBindingRepository {
+    pool: SqlitePool,
+}
+
+impl SqliteCharacterBindingRepository {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl CharacterBindingRepository for SqliteCharacterBindingRepository {
+    async fn find_by_character_id(
+        &self,
+        character_id: i64,
+    ) -> Result<Vec<CharacterBinding>, RepositoryError> {
+        let rows: Vec<(
+            i64,
+            i64,
+            i64,
+            String,
+            i32,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            String,
+            i32,
+            Option<i64>,
+            Option<i64>,
+            i32,
+            i32,
+        )> = sqlx::query_as(
+            r#"SELECT id, character_id, conversation_id, reply_mode, proactive_enabled,
+                    mute_schedule, behavior_overrides, context_policy, switched_at, created_at,
+                    cross_reply_enabled, user_reply_limit_per_minute,
+                    session_reply_limit_per_hour, mention_rate_limit_exempt,
+                    mention_rate_limit_multiplier
+                 FROM conversation_bindings WHERE character_id = ?"#,
+        )
+        .bind(character_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(parse_binding_row).collect()
+    }
+
+    async fn find_by_conversation_id(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Vec<CharacterBinding>, RepositoryError> {
+        let rows: Vec<(
+            i64,
+            i64,
+            i64,
+            String,
+            i32,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            String,
+            i32,
+            Option<i64>,
+            Option<i64>,
+            i32,
+            i32,
+        )> = sqlx::query_as(
+            r#"SELECT id, character_id, conversation_id, reply_mode, proactive_enabled,
+                    mute_schedule, behavior_overrides, context_policy, switched_at, created_at,
+                    cross_reply_enabled, user_reply_limit_per_minute,
+                    session_reply_limit_per_hour, mention_rate_limit_exempt,
+                    mention_rate_limit_multiplier
+                 FROM conversation_bindings WHERE conversation_id = ?"#,
+        )
+        .bind(conversation_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(parse_binding_row).collect()
+    }
+
+    async fn find_all(&self) -> Result<Vec<CharacterBinding>, RepositoryError> {
+        let rows: Vec<BindingRow> = sqlx::query_as(
+            r#"SELECT id, character_id, conversation_id, reply_mode, proactive_enabled,
+                    mute_schedule, behavior_overrides, context_policy, switched_at, created_at,
+                    cross_reply_enabled, user_reply_limit_per_minute,
+                    session_reply_limit_per_hour, mention_rate_limit_exempt,
+                    mention_rate_limit_multiplier
+                 FROM conversation_bindings"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(parse_binding_row).collect()
+    }
+
+    async fn find_all_enabled(&self) -> Result<Vec<CharacterBinding>, RepositoryError> {
+        let rows: Vec<BindingRow> = sqlx::query_as(
+            r#"SELECT id, character_id, conversation_id, reply_mode, proactive_enabled,
+                    mute_schedule, behavior_overrides, context_policy, switched_at, created_at,
+                    cross_reply_enabled, user_reply_limit_per_minute,
+                    session_reply_limit_per_hour, mention_rate_limit_exempt,
+                    mention_rate_limit_multiplier
+                 FROM conversation_bindings WHERE proactive_enabled = 1"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(parse_binding_row).collect()
+    }
+
+    async fn insert(&self, binding: &CharacterBinding) -> Result<i64, RepositoryError> {
+        let reply_mode = match binding.reply_mode {
+            ReplyMode::MentionOnly => "mention_only",
+            ReplyMode::Occasionally => "occasional",
+            ReplyMode::Natural => "natural",
+        };
+        let behavior_overrides = serde_json::to_string(&binding.behavior_overrides)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let context_policy = serde_json::to_string(&binding.context_policy)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let result = sqlx::query(
+            r#"INSERT INTO conversation_bindings
+                (character_id, conversation_id, reply_mode, proactive_enabled,
+                 mute_schedule, behavior_overrides, context_policy, switched_at,
+                 cross_reply_enabled, user_reply_limit_per_minute,
+                 session_reply_limit_per_hour, mention_rate_limit_exempt,
+                 mention_rate_limit_multiplier)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(binding.character_id)
+        .bind(binding.conversation_id)
+        .bind(reply_mode)
+        .bind(binding.proactive_enabled as i32)
+        .bind(&binding.mute_schedule)
+        .bind(&behavior_overrides)
+        .bind(&context_policy)
+        .bind(binding.switched_at.map(|t| t.to_rfc3339()))
+        .bind(binding.cross_reply_enabled as i32)
+        .bind(
+            binding
+                .response_rate_limit
+                .per_user_per_minute
+                .map(i64::from),
+        )
+        .bind(
+            binding
+                .response_rate_limit
+                .per_session_per_hour
+                .map(i64::from),
+        )
+        .bind(binding.response_rate_limit.mention_exempt as i32)
+        .bind(i64::from(
+            binding.response_rate_limit.mention_multiplier.max(1),
+        ))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    async fn update(&self, binding: &CharacterBinding) -> Result<(), RepositoryError> {
+        let reply_mode = match binding.reply_mode {
+            ReplyMode::MentionOnly => "mention_only",
+            ReplyMode::Occasionally => "occasional",
+            ReplyMode::Natural => "natural",
+        };
+        let behavior_overrides = serde_json::to_string(&binding.behavior_overrides)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let context_policy = serde_json::to_string(&binding.context_policy)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // 单行原子 UPDATE：换角色核心。更新全部可变字段，created_at 不更新。
+        sqlx::query(
+            r#"UPDATE conversation_bindings
+                SET character_id = ?, reply_mode = ?, proactive_enabled = ?,
+                    mute_schedule = ?, behavior_overrides = ?, context_policy = ?,
+                    switched_at = ?, cross_reply_enabled = ?,
+                    user_reply_limit_per_minute = ?, session_reply_limit_per_hour = ?,
+                    mention_rate_limit_exempt = ?, mention_rate_limit_multiplier = ?
+              WHERE id = ?"#,
+        )
+        .bind(binding.character_id)
+        .bind(reply_mode)
+        .bind(binding.proactive_enabled as i32)
+        .bind(&binding.mute_schedule)
+        .bind(&behavior_overrides)
+        .bind(&context_policy)
+        .bind(binding.switched_at.map(|t| t.to_rfc3339()))
+        .bind(binding.cross_reply_enabled as i32)
+        .bind(
+            binding
+                .response_rate_limit
+                .per_user_per_minute
+                .map(i64::from),
+        )
+        .bind(
+            binding
+                .response_rate_limit
+                .per_session_per_hour
+                .map(i64::from),
+        )
+        .bind(binding.response_rate_limit.mention_exempt as i32)
+        .bind(i64::from(
+            binding.response_rate_limit.mention_multiplier.max(1),
+        ))
+        .bind(binding.id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn delete(&self, id: i64) -> Result<(), RepositoryError> {
+        sqlx::query("DELETE FROM conversation_bindings WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(())
+    }
+}
+
+type BindingRow = (
+    i64,
+    i64,
+    i64,
+    String,
+    i32,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    String,
+    i32,
+    Option<i64>,
+    Option<i64>,
+    i32,
+    i32,
+);
+
+fn parse_binding_row(row: BindingRow) -> Result<CharacterBinding, RepositoryError> {
+    let (
+        id,
+        character_id,
+        conversation_id,
+        reply_mode_str,
+        proactive_enabled,
+        mute_schedule,
+        behavior_overrides_json,
+        context_policy_json,
+        switched_at,
+        created_at,
+        cross_reply_enabled,
+        user_reply_limit_per_minute,
+        session_reply_limit_per_hour,
+        mention_rate_limit_exempt,
+        mention_rate_limit_multiplier,
+    ) = row;
+
+    let reply_mode = match reply_mode_str.as_str() {
+        "mention_only" => ReplyMode::MentionOnly,
+        "occasional" => ReplyMode::Occasionally,
+        "natural" => ReplyMode::Natural,
+        other => {
+            return Err(RepositoryError::Database(format!(
+                "unknown reply_mode: {other}"
+            )))
+        }
+    };
+
+    let behavior_overrides: serde_json::Value = serde_json::from_str(&behavior_overrides_json)
+        .map_err(|e| RepositoryError::Database(format!("invalid behavior_overrides JSON: {e}")))?;
+    let context_policy: serde_json::Value = serde_json::from_str(&context_policy_json)
+        .map_err(|e| RepositoryError::Database(format!("invalid context_policy JSON: {e}")))?;
+
+    let created_at = super::timestamp::parse_timestamp(&created_at)?;
+    // switched_at 列可能为 NULL（从未换过角色）——保持 None。
+    let switched_at = match switched_at {
+        Some(s) => Some(super::timestamp::parse_timestamp(&s)?),
+        None => None,
+    };
+
+    Ok(CharacterBinding {
+        id,
+        character_id,
+        conversation_id,
+        reply_mode,
+        proactive_enabled: proactive_enabled != 0,
+        mute_schedule,
+        behavior_overrides,
+        context_policy,
+        switched_at,
+        cross_reply_enabled: cross_reply_enabled != 0,
+        response_rate_limit: crate::domain::character::ResponseRateLimitPolicy {
+            per_user_per_minute: user_reply_limit_per_minute
+                .and_then(|value| u32::try_from(value).ok()),
+            per_session_per_hour: session_reply_limit_per_hour
+                .and_then(|value| u32::try_from(value).ok()),
+            mention_exempt: mention_rate_limit_exempt != 0,
+            mention_multiplier: u32::try_from(mention_rate_limit_multiplier)
+                .ok()
+                .filter(|value| *value > 0)
+                .unwrap_or(4),
+        },
+        created_at,
+    })
+}

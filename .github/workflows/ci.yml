@@ -1,0 +1,207 @@
+name: 仓库检查
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 必过 / 构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: 构建库、二进制及示例
+        run: cargo build --locked --lib --bins --examples
+
+  minimum-rust-build:
+    name: 必过 / Rust 1.88 最低版本构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+          rustc --version
+          cargo --version
+      - name: 构建库、二进制及示例
+        run: cargo build --locked --lib --bins --examples
+
+  unit-tests:
+    name: 必过 / 库和二进制测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: 运行库和二进制测试
+        run: cargo test --locked --lib --bins
+
+  documentation:
+    name: 必过 / 文档链接
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 检查 Markdown 本地文件链接
+        run: |
+          python3 - <<'PYTHON'
+          import re
+          from pathlib import Path
+          from urllib.parse import unquote, urlsplit
+
+          root = Path.cwd()
+          files = [root / "README.md", root / "CONTRIBUTING.md"]
+          files += sorted((root / "docs").rglob("*.md"))
+          files += sorted((root / ".github").rglob("*.md"))
+          failures = []
+          for source in files:
+              content = re.sub(r"^```[^\n]*\n.*?^```[^\n]*$", "", source.read_text(), flags=re.M | re.S)
+              for match in re.finditer(r"!?\[[^\]]*\]\(([^)]+)\)", content):
+                  target = match.group(1).strip().strip("<>")
+                  parts = urlsplit(target)
+                  if parts.scheme or parts.netloc or not parts.path:
+                      continue
+                  destination = source.parent / unquote(parts.path)
+                  if not destination.exists():
+                      failures.append(f"{source.relative_to(root)}: {target}")
+          if failures:
+              raise SystemExit("无效的本地文档链接：\n" + "\n".join(failures))
+          print(f"文档本地文件链接检查通过：{len(files)} 个文件")
+          PYTHON
+
+  diagnostics:
+    name: 必过 / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 全目标测试
+            command: cargo test --locked --all-targets
+          - name: Rust 格式
+            command: cargo fmt --all -- --check
+          - name: 严格 Clippy
+            command: cargo clippy --locked --all-targets -- -D warnings
+          - name: 插件 Unix socket
+            command: cargo test --locked --lib infrastructure::plugin::transport::tests -- --ignored --test-threads=1
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 Rust stable 与检查组件
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: 执行检查并保留实际结果
+        env:
+          CHECK_NAME: ${{ matrix.name }}
+          CHECK_COMMAND: ${{ matrix.command }}
+        run: |
+          set +e
+          bash -c "$CHECK_COMMAND"
+          result=$?
+          if [ "$result" -eq 0 ]; then
+            verdict="通过"
+          else
+            verdict="失败"
+          fi
+          {
+            echo "### 必过检查：$CHECK_NAME"
+            echo
+            echo "结果：$verdict，退出码：$result。"
+            echo
+            echo "命令：\`$CHECK_COMMAND\`"
+            echo
+            echo "该检查失败将阻断整体工作流。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$result"
+
+  dependency-audit:
+    name: 必过 / 依赖安全检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: 检查依赖公告、许可证、来源和重复版本
+        run: cargo deny check
+
+  backlog-measurement:
+    name: 手动 / 单会话积压压测
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: 运行手动积压压测
+        run: cargo test --locked --test alpha_e2e_test p2_1_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1
+
+  outbox-backlog-measurement:
+    name: 手动 / 完整 Outbox 积压压测
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 安装 Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: 运行完整 Outbox 积压压测
+        run: cargo test --locked --test alpha_e2e_test p3_1_outbox_single_conversation_backlog_measurement -- --ignored --nocapture --test-threads=1

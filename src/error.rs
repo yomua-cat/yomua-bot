@@ -1,0 +1,169 @@
+//! yomua-bot 角色运行时的错误类型。
+
+/// 运行时顶层错误类型。
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeError {
+    #[error("存储错误：{0}")]
+    Storage(#[from] StorageError),
+
+    #[error("仓储错误：{0}")]
+    Repository(#[from] RepositoryError),
+
+    #[error("领域错误：{0}")]
+    Domain(#[from] DomainError),
+
+    #[error("配置错误：{0}")]
+    Config(String),
+
+    #[error("适配器错误：{0}")]
+    Adapter(String),
+
+    #[error("插件错误：{0}")]
+    Plugin(String),
+
+    #[error("发送明确失败：{0}")]
+    SendRejected(String),
+
+    #[error("发送暂不可用：{0}")]
+    SendUnavailable(String),
+
+    #[error("发送结果待核查：{0}")]
+    SendUnknown(String),
+
+    #[error("LLM 错误：{0}")]
+    Llm(String),
+
+    #[error("LLM 响应内容无效：{0}")]
+    LlmResponseInvalid(String),
+
+    #[error("LLM 请求被限流：{message}")]
+    RateLimited {
+        message: String,
+        retry_after_secs: Option<u64>,
+    },
+
+    #[error("HTTP 错误：{0}")]
+    HttpError(String),
+
+    #[error("解析错误：{0}")]
+    ParseError(String),
+
+    #[error("角色卡导入错误：{0}")]
+    CardImport(String),
+
+    /// 用户输入错误（如 ID 不存在、ID 冲突等）。
+    /// code 用于控制协议错误码，message 用于人类可读描述。
+    #[error("用户输入错误 [{0}]: {1}")]
+    UserInput(String, String),
+
+    #[error("内部错误：{0}")]
+    Internal(String),
+
+    /// 测试专用故障注入（仅用于集成测试）。
+    /// 生产代码不应构造此变体。
+    #[cfg(test)]
+    #[error("测试故障注入：{0}")]
+    TestFault(String),
+}
+
+/// 领域层错误。此处不包含任何基础设施类型。
+#[derive(Debug, thiserror::Error)]
+pub enum DomainError {
+    #[error("角色未找到：{0}")]
+    CharacterNotFound(i64),
+
+    #[error("角色已存在：{0}")]
+    CharacterAlreadyExists(String),
+
+    #[error("会话未找到：{0}")]
+    ConversationNotFound(i64),
+
+    #[error("消息未找到：{0}")]
+    MessageNotFound(i64),
+
+    #[error("记忆未找到：{0}")]
+    MemoryNotFound(i64),
+
+    #[error("关系未找到：{character_id}/{participant_id}")]
+    RelationshipNotFound {
+        character_id: i64,
+        participant_id: i64,
+    },
+
+    #[error("状态无效：{0}")]
+    InvalidState(String),
+
+    #[error("角色定义无效：{0}")]
+    InvalidDefinition(String),
+
+    #[error("内部错误：{0}")]
+    Internal(String),
+}
+
+/// 存储层错误（包装数据库错误）。
+#[derive(Debug, thiserror::Error)]
+pub enum StorageError {
+    #[error("数据库错误：{0}")]
+    Database(String),
+
+    #[error("连接错误：{0}")]
+    Connection(String),
+
+    #[error("迁移错误：{0}")]
+    Migration(String),
+
+    #[error("序列化错误：{0}")]
+    Serialization(String),
+}
+
+impl From<sqlx::Error> for StorageError {
+    fn from(err: sqlx::Error) -> Self {
+        StorageError::Database(err.to_string())
+    }
+}
+
+impl From<serde_json::Error> for StorageError {
+    fn from(err: serde_json::Error) -> Self {
+        StorageError::Serialization(err.to_string())
+    }
+}
+
+/// 仓储层错误。
+#[derive(Debug, thiserror::Error)]
+pub enum RepositoryError {
+    #[error("未找到：{0}")]
+    NotFound(String),
+
+    #[error("已存在：{0}")]
+    AlreadyExists(String),
+
+    #[error("数据库错误：{0}")]
+    Database(String),
+
+    #[error("内部错误：{0}")]
+    Internal(String),
+
+    #[error("未实现：{0}")]
+    NotImplemented(String),
+
+    #[error("仓储所有权已失效")]
+    OwnershipLost,
+
+    #[error("入站事件队列已达到容量上限")]
+    InboundQueueFull,
+}
+
+impl From<sqlx::Error> for RepositoryError {
+    fn from(err: sqlx::Error) -> Self {
+        match err {
+            sqlx::Error::RowNotFound => RepositoryError::NotFound("数据库记录不存在".to_string()),
+            other => RepositoryError::Database(other.to_string()),
+        }
+    }
+}
+
+/// 测试专用：构造 TestFault 错误。
+#[cfg(test)]
+pub fn test_fault(msg: impl Into<String>) -> RuntimeError {
+    RuntimeError::TestFault(msg.into())
+}
