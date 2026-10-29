@@ -18,6 +18,7 @@ use yomua_bot::adapters::onebot::{OneBotAdapter, OneBotAdapterImpl};
 use yomua_bot::application::action::ActionDispatcher;
 use yomua_bot::application::behavior_engine::RuleBehaviorEngine;
 use yomua_bot::application::binding::BindingManager;
+use yomua_bot::application::character_card_scan::scan_character_cards;
 use yomua_bot::application::character_import::{
     BindOptions, CharacterImportService, ImportOptions,
 };
@@ -238,9 +239,10 @@ pub(crate) fn parse_runtime_args(args: &[String]) -> Result<PathBuf, RuntimeErro
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // 子命令分发：import-card / list-characters / list-bindings / switch-character。
+    // 子命令分发。
     match args.first().map(String::as_str) {
         Some("import-card") => return run_import(&args[1..]).await,
+        Some("scan-cards") => return run_scan_cards(&args[1..]).await,
         Some("list-characters") => return run_list_characters(&args[1..]).await,
         Some("list-bindings") => return run_list_bindings(&args[1..]).await,
         Some("switch-character") => return run_switch_character(&args[1..]).await,
@@ -332,6 +334,21 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
 
     // 4. 建立仓库。
     let repos = build_repos(pool);
+
+    let importer = build_character_importer(&repos);
+    let card_dir = std::env::current_dir()
+        .map_err(|e| RuntimeError::Config(format!("无法获取工作目录：{e}")))?
+        .join("assets/characters");
+    match scan_character_cards(&card_dir, &repos._pool, &importer).await {
+        Ok(result) => tracing::info!(
+            directory = %card_dir.display(),
+            imported = result.imported.len(),
+            unchanged = result.unchanged,
+            errors = result.errors.len(),
+            "角色卡目录扫描完成"
+        ),
+        Err(error) => tracing::warn!(error = %error, "角色卡目录扫描失败，继续启动"),
+    }
 
     // G1 启动检测：迁移阶段已经拒绝多角色绑定；这里保留运行时防线，
     // 发现外部手工修改造成的脏数据时直接阻止启动。
@@ -770,6 +787,64 @@ async fn run_import(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     storage.close().await;
     Ok(())
+}
+
+async fn run_scan_cards(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
+    let mut directory = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config-dir" => config_dir = PathBuf::from(arg_value(args, &mut i, "--config-dir")?),
+            "--directory" => {
+                directory = Some(PathBuf::from(arg_value(args, &mut i, "--directory")?))
+            }
+            arg if arg.starts_with('-') => {
+                return Err(RuntimeError::Config(format!("未知参数：{arg}")).into())
+            }
+            path => directory = Some(PathBuf::from(path)),
+        }
+        i += 1;
+    }
+    let (storage, repos) = open_cli_storage(&config_dir).await?;
+    let importer = build_character_importer(&repos);
+    let directory = directory.unwrap_or(std::env::current_dir()?.join("assets/characters"));
+    let result = scan_character_cards(&directory, &repos._pool, &importer).await?;
+    for (id, name) in &result.imported {
+        println!("已导入角色：{name} (id={id})");
+    }
+    println!(
+        "扫描完成：新增 {}，未变更 {}，失败 {}",
+        result.imported.len(),
+        result.unchanged,
+        result.errors.len()
+    );
+    for error in result.errors {
+        eprintln!("导入失败：{error}");
+    }
+    storage.close().await;
+    Ok(())
+}
+
+fn build_character_importer(repos: &Repos) -> CharacterImportService {
+    let character_repo: Arc<dyn CharacterRepository> = repos.character_repo.clone();
+    let conversation_repo = repos.conversation_repo.clone();
+    let participant_repo = repos.participant_repo.clone();
+    let conversation_manager = Arc::new(ConversationManager::new(
+        conversation_repo.clone(),
+        participant_repo,
+    ));
+    let binding_manager = Arc::new(BindingManager::new(
+        repos.binding_repo.clone(),
+        character_repo.clone(),
+        conversation_repo,
+    ));
+    CharacterImportService::new(
+        character_repo,
+        repos.state_repo.clone(),
+        conversation_manager,
+        binding_manager,
+    )
 }
 
 /// 打开配置目录下的 SQLite 存储并迁移，装配 CLI 只读命令所需的仓储。

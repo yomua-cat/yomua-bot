@@ -6,6 +6,7 @@
 pub mod action;
 pub mod behavior_engine;
 pub mod binding;
+pub mod character_card_scan;
 pub mod character_history;
 pub mod character_import;
 pub mod character_service;

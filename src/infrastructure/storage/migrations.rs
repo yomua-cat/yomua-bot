@@ -924,6 +924,18 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StorageError> {
     .execute(pool)
     .await
     .map_err(|e| StorageError::Migration(format!("migration 022 inbound_events cleanup index failed: {e}")))?;
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS character_card_sources (
+            path TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL,
+            character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            imported_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StorageError::Migration(format!("character card source table failed: {e}")))?;
     Ok(())
 }
 

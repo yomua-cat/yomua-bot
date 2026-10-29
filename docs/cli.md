@@ -14,11 +14,14 @@ yomua-bot --help
 | 命令 | 参数与行为 |
 | --- | --- |
 | `import-card <路径>` | 支持 JSON/PNG；`--config-dir`、`--conversation <外部ID>`、`--group`、`--participant <外部ID>`、`--participant-name`、`--reply-mode natural\|mention\|occasional`、`--proactive` |
+| `scan-cards [目录]` | 扫描 JSON/PNG 角色卡并导入；默认目录为当前工作目录的 `assets/characters`，支持 `--config-dir`、`--directory` |
 | `list-characters` | `--config-dir`；列出角色 ID 和名称 |
 | `list-bindings` | `--config-dir`；列出已有会话绑定及普通回复限额 |
 | `switch-character <角色名>` | 必须指定 `--conversation <外部ID>`，可加 `--config-dir`、`--group`；会话和角色须已存在 |
 
 `import-card` 默认不绑定、默认私聊、默认 `natural`；指定 `--conversation` 才创建或复用会话并绑定。`--participant` 创建的是人类参与者，不能替代回复链路所需的 Bot 角色参与者。`--proactive` 只启用当前的状态评估能力。
+
+常驻程序启动时也会扫描当前工作目录的 `assets/characters`。来源按规范化文件路径和 SHA-256 内容指纹登记；未变化的文件不会重复导入，文件内容改变后会作为新版本角色重新导入并获得新的数据库 ID。扫描支持子目录中的 `.json` 和 `.png` 文件。
 
 ```bash
 cargo run --locked --bin yomua-bot -- import-card /path/to/character.png \
@@ -26,6 +29,7 @@ cargo run --locked --bin yomua-bot -- import-card /path/to/character.png \
   --participant 10001 --participant-name 测试用户 --reply-mode natural
 
 cargo run --locked --bin yomua-bot -- list-bindings --config-dir /path/to/config
+cargo run --locked --bin yomua-bot -- scan-cards --config-dir /path/to/config
 cargo run --locked --bin yomua-bot -- switch-character 测试角色 \
   --config-dir /path/to/config --conversation 123456 --group
 ```
