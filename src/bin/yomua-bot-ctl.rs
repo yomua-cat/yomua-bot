@@ -1385,14 +1385,6 @@ impl LineEditor {
         self.editor.readline(prompt)
     }
 
-    fn readline_with_initial(
-        &mut self,
-        prompt: &str,
-        initial: &str,
-    ) -> Result<String, ReadlineError> {
-        self.editor.readline_with_initial(prompt, (initial, ""))
-    }
-
     fn save_history(&mut self) {
         if let Some(parent) = self.history_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1560,8 +1552,7 @@ async fn run_repl(socket: PathBuf) -> Result<(), String> {
 // 第九节：全屏命令面板
 // ============================================================================
 
-/// 全屏面板只负责挑选命令；需要 ID、文本或确认的命令仍回到行编辑器输入。
-/// 这样方向键适合浏览常用操作，复杂参数仍可在命令行中编辑。
+/// 全屏面板负责挑选命令；命令的参数在同一个输入流程中逐项补齐。
 async fn run_tui(socket: PathBuf) -> Result<(), String> {
     let mut stdout = io::stdout();
     terminal::enable_raw_mode().map_err(|e| format!("无法启用终端原始模式: {e}"))?;
@@ -1579,7 +1570,7 @@ async fn run_tui(socket: PathBuf) -> Result<(), String> {
 async fn run_tui_loop(stdout: &mut io::Stdout, socket: &PathBuf) -> Result<(), String> {
     let specs = yomua_bot::application::control_schema::specs();
     let mut selected = 0usize;
-    let mut message = "使用 ↑/↓ 选择，Enter 执行，Esc 退出；带参数命令会打开输入行".to_string();
+    let mut message = "使用 ↑/↓ 选择，Enter 执行，Esc 退出；参数会在执行前逐项询问".to_string();
 
     loop {
         draw_tui(stdout, specs, selected, &message).map_err(|e| format!("绘制面板失败: {e}"))?;
@@ -1611,7 +1602,10 @@ async fn run_tui_loop(stdout: &mut io::Stdout, socket: &PathBuf) -> Result<(), S
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
             (KeyCode::Enter, _) => {
                 let spec = specs[selected];
-                if spec.usage.contains('<') || spec.requires_confirmation {
+                if spec.usage.contains('<')
+                    || spec.requires_confirmation
+                    || !spec.allowed_options.is_empty()
+                {
                     leave_tui(stdout)?;
                     let result = prompt_tui_command(socket, &spec).await;
                     reenter_tui(stdout)?;
@@ -1734,26 +1728,51 @@ async fn prompt_tui_command(
         .join(".yomua-bot-ctl.history");
     let mut editor = LineEditor::new(history_path).map_err(|e| format!("无法初始化输入行: {e}"))?;
     println!("\n{}\n{}", spec.description, spec.usage);
-    println!("输入完整命令；直接回车取消。危险命令必须显式追加 --confirm。\n");
-    let line = match editor.readline_with_initial("命令> ", "") {
-        Ok(line) => line,
-        Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
+    println!("已选择此命令；下面只补充它需要的参数。直接回车取消。\n");
+    let builtin = command_from_path(
+        &spec
+            .name
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+    )
+    .ok_or_else(|| format!("命令定义无法解析: {}", spec.name))?;
+    let mut args = Vec::new();
+    let mut options = CommandOptions::default();
+    for index in 0..spec.positional_min as usize {
+        let label = positional_label(spec, index);
+        let value = prompt_tui_value(&mut editor, &format!("{label}> "))?;
+        let Some(value) = value else {
             editor.save_history();
             return Ok(None);
-        }
-        Err(error) => return Err(format!("读取命令失败: {error}")),
-    };
-    editor.save_history();
-    let line = line.trim();
-    if line.is_empty() {
-        return Ok(None);
+        };
+        args.push(value);
     }
-    let token_strings = tokenize_repl_line(line)?;
-    let tokens = token_strings.iter().map(String::as_str).collect::<Vec<_>>();
-    let parsed = ParsedCommand::parse(&tokens)?;
-    let builtin = command_from_path(&parsed.path).ok_or_else(|| "未知命令".to_string())?;
-    let response = execute_command(socket, builtin, &parsed.opts, &parsed.args).await?;
-    let formatter = OutputFormatter::new(parsed.opts.raw, None);
+    for option in spec.allowed_options {
+        if let Some(value) = prompt_tui_option(&mut editor, option)? {
+            apply_tui_option(&mut options, option, value)?;
+        }
+    }
+    if spec.supports_raw {
+        if let Some(value) = prompt_tui_option(&mut editor, "raw")? {
+            options.raw = parse_tui_bool(&value, "--raw")?;
+        }
+    }
+    if spec.requires_confirmation {
+        let Some(value) = prompt_tui_value(&mut editor, "确认执行？输入 yes 确认> ")?
+        else {
+            editor.save_history();
+            return Ok(None);
+        };
+        if !matches!(value.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            editor.save_history();
+            return Ok(Some("已取消危险命令".to_string()));
+        }
+        options.confirm = true;
+    }
+    editor.save_history();
+    let response = execute_command(socket, builtin, &options, &args).await?;
+    let formatter = OutputFormatter::new(options.raw, None);
     formatter.format_and_print(&response);
     if response.ok {
         Ok(Some("命令已完成，已返回面板".to_string()))
@@ -1763,6 +1782,97 @@ async fn prompt_tui_command(
             response_code(&response)
         )))
     }
+}
+
+fn positional_label(
+    spec: &yomua_bot::application::control_schema::ControlCommandSpec,
+    index: usize,
+) -> String {
+    spec.usage
+        .split_whitespace()
+        .filter_map(|token| token.strip_prefix('<').and_then(|v| v.strip_suffix('>')))
+        .nth(index)
+        .map(|name| format!("请输入 {name}"))
+        .unwrap_or_else(|| format!("请输入第 {} 个参数", index + 1))
+}
+
+fn prompt_tui_value(editor: &mut LineEditor, prompt: &str) -> Result<Option<String>, String> {
+    match editor.readline(prompt) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value.trim().to_string())),
+        Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => Ok(None),
+        Err(error) => Err(format!("读取参数失败: {error}")),
+    }
+}
+
+fn prompt_tui_option(editor: &mut LineEditor, option: &str) -> Result<Option<String>, String> {
+    let prompt = format!("--{option}（可选，直接回车跳过）> ");
+    prompt_tui_value(editor, &prompt)
+}
+
+fn parse_tui_bool(value: &str, option: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" | "true" | "1" => Ok(true),
+        "n" | "no" | "false" | "0" => Ok(false),
+        _ => Err(format!("{option} 请输入 yes/no")),
+    }
+}
+
+fn apply_tui_option(
+    options: &mut CommandOptions,
+    option: &str,
+    value: String,
+) -> Result<(), String> {
+    match option {
+        "limit" => options.limit = Some(parse_positive_id(&value, "limit")?),
+        "offset" => {
+            let parsed = value
+                .parse::<i64>()
+                .map_err(|_| "offset 需要一个非负整数".to_string())?;
+            if parsed < 0 {
+                return Err("offset 需要一个非负整数".to_string());
+            }
+            options.offset = Some(parsed);
+        }
+        "character" => options.character_id = Some(parse_positive_id(&value, "角色 ID")?),
+        "conversation" => options.conversation_id = Some(parse_positive_id(&value, "会话 ID")?),
+        "user" => options.user_id = Some(parse_positive_id(&value, "用户 ID")?),
+        "energy" => {
+            options.energy = Some(value.parse().map_err(|_| "energy 需要数值".to_string())?)
+        }
+        "stress" => {
+            options.stress = Some(value.parse().map_err(|_| "stress 需要数值".to_string())?)
+        }
+        "mood" => options.mood = Some(value.parse().map_err(|_| "mood 需要数值".to_string())?),
+        "activity" => options.activity = Some(value),
+        "reason" => options.reason = Some(value),
+        "duration" => {
+            parse_duration_to_secs(&value)?;
+            options.duration = Some(value);
+        }
+        "type" => options.memory_type = Some(value),
+        "instruction" => options.memory_instruction = Some(value),
+        _ => return Err(format!("TUI 暂不支持选项 --{option}")),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn tui_command_tokens(
+    spec: &yomua_bot::application::control_schema::ControlCommandSpec,
+    args: &[String],
+    options: &CommandOptions,
+) -> Vec<String> {
+    let mut tokens = spec
+        .name
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    tokens.extend_from_slice(args);
+    if options.confirm {
+        tokens.push("--confirm".to_string());
+    }
+    tokens
 }
 
 fn response_code(response: &ControlResponse) -> &str {
@@ -2580,6 +2690,39 @@ mod tests {
             5,
         )
         .expect("user delete request should build");
+    }
+
+    #[test]
+    fn tui_selection_builds_selected_command_instead_of_help_input() {
+        let spec = yomua_bot::application::control_schema::specs()
+            .iter()
+            .find(|spec| spec.name == "character show")
+            .expect("character show should be registered");
+        let tokens = tui_command_tokens(spec, &["1".to_string()], &CommandOptions::default());
+        assert_eq!(tokens, vec!["character", "show", "1"]);
+        let parsed = ParsedCommand::parse(&tokens.iter().map(String::as_str).collect::<Vec<_>>())
+            .expect("selected command should parse");
+        assert_eq!(parsed.path, vec!["character", "show"]);
+        assert_eq!(parsed.args, vec!["1"]);
+    }
+
+    #[test]
+    fn tui_dangerous_selection_requires_explicit_confirmation() {
+        let spec = yomua_bot::application::control_schema::specs()
+            .iter()
+            .find(|spec| spec.name == "user delete")
+            .expect("user delete should be registered");
+        assert!(spec.requires_confirmation);
+        let without_confirmation = CommandOptions::default();
+        assert!(!without_confirmation.confirm);
+        let confirmed = CommandOptions {
+            confirm: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            tui_command_tokens(spec, &["7".to_string()], &confirmed),
+            vec!["user", "delete", "7", "--confirm"]
+        );
     }
 
     #[test]
