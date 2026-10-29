@@ -586,40 +586,51 @@ impl LlmConfig {
 /// runtime.toml 模板（首次启动自动生成）。
 pub const RUNTIME_TEMPLATE: &str = r#"# yomua-bot 运行时配置
 # 标准位置：项目/服务根目录下的 config/runtime.toml
-# 首次启动自动生成。请先填写管理员 QQ，再启动常驻服务。
-# 文件可能包含本地路径和权限边界，不要提交到版本库。
+# 首次启动自动生成。常驻服务启动前必须填写非空的 admin_users。
+# 本文件可能包含本地路径、代理凭据和权限边界，不要提交到版本库。
+# TOML 不会替换环境变量；需要临时调整日志时使用 RUST_LOG 环境变量。
 
 # SQLite、控制 socket 和运行时状态目录。
-# 相对路径按启动目录解析；生产部署建议填写绝对路径。
+# 类型：字符串；文件缺失时默认值为 "data"。
+# 相对路径按进程启动目录解析，不按本配置文件目录解析；生产部署建议填写绝对路径。
 data_dir = "data"
 
-# 日志级别：trace / debug / info / warn / error
+# 日志级别：trace / debug / info / warn / error；默认值为 info。
+# 启动时若 RUST_LOG 是有效规则，则整条 RUST_LOG 规则优先；修改 log_level 可热重载。
 log_level = "info"
 
-# 优雅关停的整体超时（秒）。
+# 优雅关停的整体超时（秒）；类型：正整数，默认 10。
+# 覆盖适配器、后台任务、插件和存储的整体等待时间；修改后需要重启。
 shutdown_timeout_secs = 10
 
-# 可选：所有模型 HTTP 请求共用的出站代理。代理凭据可写在 URL 中；该配置不影响 OneBot WebSocket。
+# 可选：所有模型 HTTP(S) 请求共用的出站代理；删除注释表示直连，默认不使用代理。
+# 格式：http://[用户名:密码@]主机:端口 或 https://...；不能带 query/fragment。
+# 代理凭据只保存在本地，不要提交；只影响模型请求，不影响 OneBot WebSocket 或插件 socket。
+# 修改后需要重启。
 # proxy = "http://user:password@127.0.0.1:7890"
 
-# 插件目录；删除注释并填写路径后启用插件。
+# 可选插件目录；类型：字符串路径。省略时不启动插件系统。
+# 相对路径同样按进程启动目录解析；修改后需要重启。
 # plugins_dir = "plugins"
 
-# 能执行管理操作的 QQ 号。至少填写一个真实管理员 ID。
-# 终端 ctl 默认允许本机操作，QQ 指令仍会校验此列表。
+# 能执行 QQ 管理操作的外部用户 ID 列表；类型：字符串或整数数组，至少一个。
+# 空数组会导致常驻启动校验失败；终端 ctl 的本机访问不替代此列表校验。
 admin_users = []
 
-# 事件广播缓存容量；通常保持默认即可。
+# 可选事件广播缓存容量；类型：正整数，默认 256。消费滞后时超出容量的事件会丢弃。
+# 修改后需要重启。
 # broadcast_capacity = 256
 
-# 默认角色 ID。当前推荐通过 import-card 或 ctl 显式绑定，避免误绑定。
+# 可选默认角色 ID；类型：整数。当前配置可被读取并参与重载比较，主程序尚未用它自动创建绑定。
+# 新会话请继续使用 import-card 或 ctl 显式绑定；修改后需要重启。
 # default_character_id = 1
 
-# 主动行为和静默时段使用的 UTC 偏移，例如 "+8"（北京时间）或 "-5"。
+# 主动行为、静默时段和每日主动额度使用的 UTC 小时偏移；格式：+0 到 +23 或 -0 到 -23，默认 "+8"。
+# 该字段可通过 reload-config 热更新，后续决策立即使用新偏移。
 timezone = "+8"
 
-# 是否先将 OneBot 入站事件写入 SQLite inbox；默认开启。
-# 如需保留纯内存入站路径，可显式设置为 false。
+# 是否先将 OneBot 入站事件写入 SQLite inbox；类型：布尔值，默认 true。
+# true 可在崩溃后恢复已提交事件；显式 false 才关闭。修改后需要重启。
 inbound_durability = true
 "#;
 
@@ -627,43 +638,49 @@ inbound_durability = true
 pub const ONEBOT_TEMPLATE: &str = r#"# yomua-bot OneBot 连接配置
 # 标准位置：项目/服务根目录下的 config/onebot.toml
 # 本文件只连接本机或受信任的 OneBot 11 服务，不包含 QQ 登录凭据。
+# TOML 不会替换环境变量；令牌只能写入本地文件，不要提交到版本库。
 
-# NapCat 正向 WebSocket 地址。
+# OneBot 11 正向 WebSocket 地址；格式必须是 ws:// 或 wss://，默认 ws://127.0.0.1:3001。
+# 默认地址适用于本机 NapCat；服务在其他地址时必须修改。配置可解析不代表服务端已启动或认证成功。
 websocket_url = "ws://127.0.0.1:3001"
 
-# 与 NapCat websocketServers 配置一致；未启用鉴权时保留空字符串。
-# 令牌只保存在本地配置，不要提交到版本库。
+# 可选访问令牌；与 NapCat websocketServers 鉴权配置一致。未启用鉴权时省略此字段。
 # access_token = ""
 
-# Bot 自身 QQ 号，用于识别平台回声和自身消息。
+# 可选 Bot 自身 QQ 号；类型：正整数，用于识别平台回声和自身消息。
 # bot_self_id = 3524189564
 
-# 断线重连和心跳。
+# 断线重连基准间隔（秒）；类型：正整数，默认 1。
 reconnect_interval_secs = 1
+# 指数退避的最大间隔（秒）；类型：正整数，默认 60，不能小于基准间隔。
 max_reconnect_interval_secs = 60
+# WebSocket 心跳间隔（秒）；类型：正整数，默认 30。
 heartbeat_interval_secs = 30
 
-# 单次 Action（如发消息）等待回执的超时时间（秒）。
+# 单次 Action（如发消息）等待回执的超时时间（秒）；类型：正整数，默认 10。
 action_timeout_secs = 10
 "#;
 
 /// llm.toml 模板。
 pub const LLM_TEMPLATE: &str = r#"# yomua-bot LLM 配置
 # 标准位置：项目/服务根目录下的 config/llm.toml
-# 默认关闭模型。只有确认 Provider、模型名和上下文窗口后才启用。
-# API Key 只写在本地文件，不要提交或粘贴到问题反馈中。
+# 默认关闭模型。启用后必须同时配置 providers、model_instances 和 roles.conversation。
+# API Key 只写在本地文件，不要提交或粘贴到问题反馈中；TOML 不会替换环境变量。
+# Provider、模型和路由属于启动装配项，修改后需要重启。
 
+# 是否启用普通对话和认知模型；类型：布尔值，默认 false。
 enabled = false
 
-# 启用后取消以下 Provider、Model Instance 和 Role 配置并替换全部占位值。
+# 启用后取消以下 Provider、Model Instance 和 Role 配置，并替换所有占位值。
+# 当前启动装配支持 provider_type = "openai-compatible" 或 "typesafe"；不要使用其他类型。
 # 同一 Provider 可以注册多个模型；对话和认知可分别路由。
-# 备用模型只在网络错误、超时、429 或 5xx 时尝试；400/401/响应格式错误不会盲目切换。
+# 备用模型只在网络错误、超时、429 或 5xx 时尝试；400/401/响应格式错误不会切换。
 # [providers.primary]
 # provider_type = "openai-compatible"
-# base_url = "https://api.example.invalid/v1"
-# api_key = "REPLACE_WITH_PRIMARY_KEY"
-# embedding_model = "REPLACE_WITH_EMBEDDING_MODEL" # 可选
-# timeout_secs = 60
+# base_url = "https://api.example.invalid/v1" # 必须是无内嵌凭据的 HTTP(S) URL
+# api_key = "REPLACE_WITH_PRIMARY_KEY" # 可选；真实密钥仅保存在本地
+# embedding_model = "REPLACE_WITH_EMBEDDING_MODEL" # 可选；省略则跳过向量增强
+# timeout_secs = 60 # 可选正整数；省略时默认 60 秒
 #
 # [providers.backup]
 # provider_type = "openai-compatible"
@@ -673,10 +690,10 @@ enabled = false
 # timeout_secs = 60
 #
 # [model_instances.conversation]
-# provider = "primary"
-# model = "REPLACE_WITH_CONVERSATION_MODEL"
-# context_window = 8192
-# max_output_tokens = 1024
+# provider = "primary" # 必须引用 providers 中已登记的名称
+# model = "REPLACE_WITH_CONVERSATION_MODEL" # Provider 上的实际模型名，不能为空
+# context_window = 8192 # 可选正整数；与 max_output_tokens 同时设置时输出必须小于上下文
+# max_output_tokens = 1024 # 可选正整数；不能超过 u32 上限
 #
 # [model_instances.conversation_backup]
 # provider = "backup"
@@ -685,13 +702,13 @@ enabled = false
 # max_output_tokens = 1024
 #
 # [roles.conversation]
-# model_instance = "conversation"
-# fallback_model_instances = ["conversation_backup"]
-# max_attempts = 2
-# budget_tokens = 4096
+# model_instance = "conversation" # 必填；必须引用 model_instances 中的名称
+# fallback_model_instances = ["conversation_backup"] # 可选，按顺序尝试且不能重复
+# max_attempts = 2 # 可选；默认主模型加全部备用模型，范围为 1..模型链长度
+# budget_tokens = 4096 # 可选正整数；主模型与备用模型共享该上限
 #
 # [roles.cognition]
-# model_instance = "conversation"
+# model_instance = "conversation" # 省略整个 cognition 时自动复用 conversation
 # max_attempts = 1
 # budget_tokens = 4096
 "#;
@@ -701,30 +718,35 @@ pub const DECISION_TEMPLATE: &str = r#"# yomua-bot 决策模型配置
 # 标准位置：项目/服务根目录下的 config/decision.toml
 # 决策 Provider、URL 和密钥全部在本文件维护，避免与普通对话 Provider 混淆。
 # 本文件只服务于 decision 路由；普通对话和认知 Provider 仍配置在 llm.toml。
+# TOML 不会替换环境变量；真实 API Key 只保存在本地文件，不要提交。
 
+# 是否启用独立决策模型；类型：布尔值，默认 false。
+# 启用时必须同时启用 llm.toml，并填写 primary 及其 Provider。
 enabled = false
 
-# 一次决策最多尝试几个模型。只有配置备用模型时才需要大于 1。
+# 一次决策最多尝试几个模型；类型：正整数，默认使用主模型加全部备用模型。
+# 只有存在备用模型时才需要大于 1；主模型和备用模型共享 budget_tokens。
 # max_attempts = 2
-# 主模型和备用模型共享本次请求的 token 上限。
+# 单次决策输出 token 上限；类型：正整数，省略时不额外限制。
 # budget_tokens = 1024
 
 # Jev 决策 Provider。
 # provider_type = "typesafe" 表示使用 TypeSafe System One，而不是聊天补全接口。
 # [providers.jev]
 # provider_type = "typesafe"
-# base_url = "https://api.typesafe.ai/v1/systemone"
-# api_key = "REPLACE_WITH_JEV_API_KEY"
-# timeout_secs = 60
+# base_url = "https://api.typesafe.ai/v1/systemone" # 可填写服务根地址或完整 /v1/systemone
+# api_key = "REPLACE_WITH_JEV_API_KEY" # 真实密钥只保存在本地
+# timeout_secs = 60 # 可选正整数；省略时默认 60 秒
 
-# 启用后填写主模型。
+# 启用后必须填写主模型；provider 必须引用本文件 [providers.*] 中的名称。
 # [primary]
 # provider = "jev"
-# model = "jev-latest"
-# context_window = 8192
-# max_output_tokens = 256
+# model = "jev-latest" # 写作 jev 时运行时也会规范化为 jev-latest
+# context_window = 8192 # 可选正整数
+# max_output_tokens = 256 # 可选正整数，且小于 context_window（若同时设置）
 
 # 只有网络错误、超时、429 或 5xx 才会按顺序切换备用模型。
+# 备用 Provider 必须另行注册在本文件的 [providers.*]，不能放到 llm.toml，也不能与 llm.toml Provider 重名。
 # [[fallbacks]]
 # provider = "jev_backup"
 # model = "REPLACE_WITH_DECISION_BACKUP_MODEL"

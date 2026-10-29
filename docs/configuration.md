@@ -12,6 +12,8 @@
 
 `data_dir` 和 `plugins_dir` 的相对路径基于进程工作目录，不基于配置目录。部署时建议使用绝对路径。控制客户端不读取 TOML，需要独立传入 `--data-dir` 或 `--socket`。
 
+TOML 配置不会做环境变量替换，也不会按字段从多个文件合并默认值；字段缺失时只使用对应 Rust 配置结构的默认值。日志过滤是例外：启动时有效的 `RUST_LOG` 会整体覆盖 `runtime.log_level`。
+
 ## 绑定级普通回复限额
 
 普通回复限额属于 `CharacterBinding` 策略，不写入 TOML。绑定可以设置以下字段：
@@ -82,14 +84,14 @@ websocket_url = "ws://127.0.0.1:3001"
 access_token = "REPLACE_WITH_ONEBOT_TOKEN"
 # bot_self_id = 123456789
 reconnect_interval_secs = 1
-max_reconnect_interval_secs = 30
+max_reconnect_interval_secs = 60
 heartbeat_interval_secs = 30
 action_timeout_secs = 10
 ```
 
 令牌与 OneBot 服务端保持一致；不认证时省略 `access_token`。`bot_self_id` 用于回复处理中的自身参与者匹配，不能替代角色参与者记录的创建。
 
-未提供整个文件时，最大重连间隔默认 60 秒；程序生成的模板使用 30 秒。重连、心跳和动作超时字段目前缺少完整启动校验，使用正数。仅配置文件可解析不代表连接或认证成功。
+未提供整个文件时，最大重连间隔默认 60 秒；程序生成的模板也使用 60 秒。重连、心跳和动作超时字段必须使用正数，且最大重连间隔不能小于初始间隔。仅配置文件可解析不代表连接或认证成功。
 
 ## llm.toml：关闭模型
 
