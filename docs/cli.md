@@ -1,6 +1,6 @@
 # CLI 参考
 
-## 主程序与独立工具
+## 主程序
 
 ```bash
 yomua-bot [--config-dir <目录>]
@@ -9,28 +9,18 @@ yomua-bot --help
 
 省略 `--config-dir` 时使用启动目录下的 `config/`。首次启动会在那里生成模板并退出，填写配置后再启动。
 
-下列命令直接打开数据库并执行迁移，不要求常驻进程运行。即使是列表命令也可能创建数据目录或初始化数据库；试运行时使用隔离目录。
-
-| 命令 | 参数与行为 |
-| --- | --- |
-| `import-card <路径>` | 支持 JSON/PNG；`--config-dir`、`--conversation <外部ID>`、`--group`、`--participant <外部ID>`、`--participant-name`、`--reply-mode natural\|mention\|occasional`、`--proactive` |
-| `scan-cards [目录]` | 扫描 JSON/PNG 角色卡并导入；默认目录为当前工作目录的 `assets/characters`，支持 `--config-dir`、`--directory` |
-| `list-characters` | `--config-dir`；列出角色 ID 和名称 |
-| `list-bindings` | `--config-dir`；列出已有会话绑定及普通回复限额 |
-| `switch-character <角色名>` | 必须指定 `--conversation <外部ID>`，可加 `--config-dir`、`--group`；会话和角色须已存在 |
-
-`import-card` 默认不绑定、默认私聊、默认 `natural`；指定 `--conversation` 才创建或复用会话并绑定。`--participant` 创建的是人类参与者，不能替代回复链路所需的 Bot 角色参与者。`--proactive` 只启用当前的状态评估能力。
+主程序只启动常驻服务；角色卡管理、查询和会话切换命令统一由 `yomua-bot-ctl` 提供。
 
 常驻程序启动时也会扫描当前工作目录的 `assets/characters`。来源按规范化文件路径和 SHA-256 内容指纹登记；未变化的文件不会重复导入，文件内容改变后会作为新版本角色重新导入并获得新的数据库 ID。扫描支持子目录中的 `.json` 和 `.png` 文件。
 
 ```bash
-cargo run --locked --bin yomua-bot -- import-card /path/to/character.png \
+./target/release/yomua-bot-ctl import-card /path/to/character.png \
   --config-dir /path/to/config --conversation 123456 --group \
   --participant 10001 --participant-name 测试用户 --reply-mode natural
 
-cargo run --locked --bin yomua-bot -- list-bindings --config-dir /path/to/config
-cargo run --locked --bin yomua-bot -- scan-cards --config-dir /path/to/config
-cargo run --locked --bin yomua-bot -- switch-character 测试角色 \
+./target/release/yomua-bot-ctl list-bindings --config-dir /path/to/config
+./target/release/yomua-bot-ctl scan-cards --config-dir /path/to/config
+./target/release/yomua-bot-ctl switch-character 测试角色 \
   --config-dir /path/to/config --conversation 123456 --group
 ```
 
@@ -46,7 +36,7 @@ yomua-bot-ctl --help
 yomua-bot-ctl --tui
 ```
 
-全局目录选项放在命令前。默认 socket 为当前工作目录的 `data/control.sock`，显式 `--socket` 优先。客户端不读取主程序配置。
+控制服务命令默认连接当前工作目录的 `data/control.sock`，显式 `--socket` 优先。迁移的本地维护命令不连接 socket；它们读取 `--config-dir` 下的 `runtime.toml` 中 `data_dir` 并直接打开 SQLite，默认配置目录为 `./config`。
 
 无命令时进入 REPL，使用 `exit`、`quit`、`q`、Ctrl+D 或 Ctrl+C 退出客户端；退出客户端不等于关闭服务。REPL 支持单引号、双引号和反斜杠转义，支持上下键历史、光标编辑、Tab 命令补全，并把历史保存到 socket 所在数据目录的 `.yomua-bot-ctl.history`。输入 `tui` 或执行 `yomua-bot-ctl --tui` 可进入全屏命令面板，方向键选择、Enter 执行、Esc/q 退出；选择命令后，TUI 会只提示该命令所需的位置参数和可选项，直接回车取消，危险命令最后还需要输入 `yes` 明确确认。
 

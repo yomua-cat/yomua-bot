@@ -18,7 +18,7 @@ cargo build --release --locked --bin yomua-bot --bin yomua-bot-ctl
 ./target/release/yomua-bot --help
 ./target/release/yomua-bot-ctl --help
 
-./target/release/yomua-bot import-card /path/to/character.json \
+./target/release/yomua-bot-ctl import-card /path/to/character.json \
   --config-dir /absolute/path/to/config \
   --conversation 123456 --group
 ```

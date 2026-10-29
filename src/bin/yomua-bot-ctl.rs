@@ -7,7 +7,8 @@
 //! - **交互模式**：`yomua-bot-ctl`（无命令）进入交互式命令行（REPL），可连续执行多条命令
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::cursor;
@@ -24,7 +25,26 @@ use rustyline::validate::Validator;
 use rustyline::{Context, Editor, Helper};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
+use yomua_bot::application::binding::BindingManager;
+use yomua_bot::application::character_card_scan::scan_character_cards;
+use yomua_bot::application::character_import::{
+    BindOptions, CharacterImportService, ImportOptions,
+};
+use yomua_bot::application::config::load_runtime;
 use yomua_bot::application::control_schema::ControlOperation;
+use yomua_bot::application::conversation::ConversationManager;
+use yomua_bot::domain::character::ReplyMode;
+use yomua_bot::domain::conversation::ConversationType;
+use yomua_bot::domain::repository::{
+    CharacterBindingRepository, CharacterRepository, CharacterStateRepository,
+    ConversationRepository, ParticipantRepository,
+};
+use yomua_bot::error::RuntimeError;
+use yomua_bot::infrastructure::storage::repository::{
+    SqliteCharacterBindingRepository, SqliteCharacterRepository, SqliteCharacterStateRepository,
+    SqliteConversationRepository, SqliteParticipantRepository,
+};
+use yomua_bot::infrastructure::storage::SqliteStorage;
 
 // ============================================================================
 // 第一节：命令定义与注册表
@@ -72,6 +92,51 @@ impl CommandOptions {
 
 type BuiltinCommand = yomua_bot::application::control_schema::ControlOperation;
 
+const DEFAULT_CONFIG_DIR: &str = "config";
+const RUNTIME_CONFIG: &str = "runtime.toml";
+const DEFAULT_DATA_DIR: &str = "data";
+
+fn resolve_default_data_dir(config_dir: &Path, cwd: &Path) -> Result<PathBuf, String> {
+    let runtime_path = config_dir.join(RUNTIME_CONFIG);
+    if !runtime_path.exists() {
+        return Ok(cwd.join(DEFAULT_DATA_DIR));
+    }
+    let runtime = load_runtime(&runtime_path.display().to_string())
+        .map_err(|error| format!("无法从 {} 读取数据目录: {error}", runtime_path.display()))?;
+    let data_dir = PathBuf::from(runtime.data_dir);
+    Ok(if data_dir.is_absolute() {
+        data_dir
+    } else {
+        cwd.join(data_dir)
+    })
+}
+
+fn resolve_ctl_socket(
+    socket: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+    config_dir: &Path,
+    cwd: &Path,
+) -> Result<PathBuf, String> {
+    if let Some(socket) = socket {
+        return Ok(if socket.is_absolute() {
+            socket
+        } else {
+            cwd.join(socket)
+        });
+    }
+    let data_dir = match data_dir {
+        Some(data_dir) => {
+            if data_dir.is_absolute() {
+                data_dir
+            } else {
+                cwd.join(data_dir)
+            }
+        }
+        None => resolve_default_data_dir(config_dir, cwd)?,
+    };
+    Ok(data_dir.join("control.sock"))
+}
+
 fn command_from_path(path: &[String]) -> Option<BuiltinCommand> {
     let canonical = yomua_bot::application::control_schema::canonicalize(&path.join(" "))?;
     ControlOperation::from_canonical_name(canonical)
@@ -107,6 +172,373 @@ fn parse_positive_id(value: &str, name: &str) -> Result<i64, String> {
         return Err(format!("{name} 必须是正整数"));
     }
     Ok(parsed)
+}
+
+struct LocalCommandRepos {
+    character_repo: Arc<SqliteCharacterRepository>,
+    state_repo: Arc<dyn CharacterStateRepository>,
+    binding_repo: Arc<dyn CharacterBindingRepository>,
+    conversation_repo: Arc<dyn ConversationRepository>,
+    participant_repo: Arc<dyn ParticipantRepository>,
+}
+
+fn build_character_importer(repos: &LocalCommandRepos) -> CharacterImportService {
+    let character_repo: Arc<dyn CharacterRepository> = repos.character_repo.clone();
+    let conversation_manager = Arc::new(ConversationManager::new(
+        repos.conversation_repo.clone(),
+        repos.participant_repo.clone(),
+    ));
+    let binding_manager = Arc::new(BindingManager::new(
+        repos.binding_repo.clone(),
+        character_repo.clone(),
+        repos.conversation_repo.clone(),
+    ));
+    CharacterImportService::new(
+        character_repo,
+        repos.state_repo.clone(),
+        conversation_manager,
+        binding_manager,
+    )
+}
+
+async fn open_local_command_storage(
+    config_dir: &Path,
+) -> Result<(SqliteStorage, LocalCommandRepos), Box<dyn std::error::Error>> {
+    let config_path = config_dir.join(RUNTIME_CONFIG);
+    let runtime_cfg = load_runtime(&config_path.display().to_string())?;
+    std::fs::create_dir_all(&runtime_cfg.data_dir).map_err(|error| {
+        RuntimeError::Config(format!(
+            "无法创建数据目录 {}: {error}",
+            runtime_cfg.data_dir
+        ))
+    })?;
+    let db_path = format!("{}/runtime.db", runtime_cfg.data_dir);
+    let storage = SqliteStorage::open(&db_path).await?;
+    storage.migrate().await?;
+    let pool = storage.pool().clone();
+    let repos = LocalCommandRepos {
+        character_repo: Arc::new(SqliteCharacterRepository::new(pool.clone())),
+        state_repo: Arc::new(SqliteCharacterStateRepository::new(pool.clone())),
+        binding_repo: Arc::new(SqliteCharacterBindingRepository::new(pool.clone())),
+        conversation_repo: Arc::new(SqliteConversationRepository::new(pool.clone())),
+        participant_repo: Arc::new(SqliteParticipantRepository::new(pool)),
+    };
+    Ok((storage, repos))
+}
+
+fn arg_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
+    *index += 1;
+    args.get(*index)
+        .cloned()
+        .ok_or_else(|| format!("参数 {flag} 需要一个值"))
+}
+
+fn parse_reply_mode(value: &str) -> Result<ReplyMode, String> {
+    match value {
+        "natural" => Ok(ReplyMode::Natural),
+        "mention" | "mention_only" => Ok(ReplyMode::MentionOnly),
+        "occasional" => Ok(ReplyMode::Occasionally),
+        other => Err(format!("未知的回复模式：{other}")),
+    }
+}
+
+fn is_local_command(name: &str) -> bool {
+    matches!(
+        name,
+        "import-card" | "scan-cards" | "list-characters" | "list-bindings" | "switch-character"
+    )
+}
+
+async fn run_local_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let name = args.first().map(String::as_str).unwrap_or_default();
+    let command_args = &args[1..];
+    match name {
+        "import-card" => run_import_card(command_args).await,
+        "scan-cards" => run_scan_cards(command_args).await,
+        "list-characters" => run_list_characters(command_args).await,
+        "list-bindings" => run_list_bindings(command_args).await,
+        "switch-character" => run_switch_character(command_args).await,
+        _ => Err(format!("未知本地维护命令：{name}").into()),
+    }
+}
+
+async fn run_local_command_with_config(
+    args: &[String],
+    config_dir: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if config_dir.is_none() {
+        return run_local_command(args).await;
+    }
+    let mut adjusted = args.to_vec();
+    adjusted.push("--config-dir".to_string());
+    adjusted.push(config_dir.unwrap().to_string_lossy().to_string());
+    run_local_command(&adjusted).await
+}
+
+async fn run_import_card(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
+    let mut path = None;
+    let mut conversation = None;
+    let mut conversation_type = ConversationType::Private;
+    let mut participant = None;
+    let mut participant_name = None;
+    let mut reply_mode = ReplyMode::Natural;
+    let mut proactive = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config-dir" => {
+                config_dir = PathBuf::from(arg_value(args, &mut index, "--config-dir")?)
+            }
+            "--conversation" => conversation = Some(arg_value(args, &mut index, "--conversation")?),
+            "--participant" => participant = Some(arg_value(args, &mut index, "--participant")?),
+            "--participant-name" => {
+                participant_name = Some(arg_value(args, &mut index, "--participant-name")?)
+            }
+            "--reply-mode" => {
+                reply_mode = parse_reply_mode(&arg_value(args, &mut index, "--reply-mode")?)?
+            }
+            "--group" => conversation_type = ConversationType::Group,
+            "--proactive" => proactive = true,
+            value if value.starts_with('-') => return Err(format!("未知参数：{value}").into()),
+            value => path = Some(PathBuf::from(value)),
+        }
+        index += 1;
+    }
+    let path = path.ok_or_else(|| RuntimeError::Config("请指定角色卡路径".to_string()))?;
+    let (storage, repos) = open_local_command_storage(&config_dir).await?;
+    let importer = build_character_importer(&repos);
+    let options = ImportOptions {
+        bind: conversation.map(|external_conversation_id| BindOptions {
+            conversation_type,
+            external_conversation_id,
+            participant_external_id: participant,
+            participant_display_name: participant_name,
+            reply_mode,
+            proactive_enabled: proactive,
+        }),
+    };
+    let result = importer.import_file(&path, &options).await?;
+    println!("已导入角色：{} (id={})", result.name, result.character_id);
+    if let Some(spec) = &result.spec_version {
+        println!("卡版本：{spec}");
+    }
+    if let Some(conversation_id) = result.conversation_id {
+        println!("已绑定到会话（id={conversation_id}）");
+        if let Some(binding_id) = result.binding_id {
+            println!("绑定 id={binding_id}");
+        }
+        if let Some(participant_id) = result.participant_id {
+            println!("参与者 id={participant_id}");
+        }
+    }
+    storage.close().await;
+    Ok(())
+}
+
+async fn run_scan_cards(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
+    let mut directory = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config-dir" => {
+                config_dir = PathBuf::from(arg_value(args, &mut index, "--config-dir")?)
+            }
+            "--directory" => {
+                directory = Some(PathBuf::from(arg_value(args, &mut index, "--directory")?))
+            }
+            value if value.starts_with('-') => return Err(format!("未知参数：{value}").into()),
+            value => directory = Some(PathBuf::from(value)),
+        }
+        index += 1;
+    }
+    let (storage, repos) = open_local_command_storage(&config_dir).await?;
+    let importer = build_character_importer(&repos);
+    let directory = match directory {
+        Some(directory) => directory,
+        None => std::env::current_dir()?.join("assets/characters"),
+    };
+    let result = scan_character_cards(&directory, storage.pool(), &importer).await?;
+    for (id, name) in &result.imported {
+        println!("已导入角色：{name} (id={id})");
+    }
+    println!(
+        "扫描完成：新增 {}，未变更 {}，失败 {}",
+        result.imported.len(),
+        result.unchanged,
+        result.errors.len()
+    );
+    for error in result.errors {
+        eprintln!("导入失败：{error}");
+    }
+    storage.close().await;
+    Ok(())
+}
+
+async fn run_list_characters(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let config_dir = parse_local_config_dir(args)?;
+    let (storage, repos) = open_local_command_storage(&config_dir).await?;
+    let characters = repos.character_repo.find_all().await?;
+    if characters.is_empty() {
+        println!("暂无角色。可使用 `yomua-bot-ctl import-card` 导入角色卡。");
+    } else {
+        for character in characters {
+            println!("{}\t{}", character.id, character.definition.name);
+        }
+    }
+    storage.close().await;
+    Ok(())
+}
+
+fn parse_local_config_dir(args: &[String]) -> Result<PathBuf, String> {
+    let mut config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config-dir" => {
+                config_dir = PathBuf::from(arg_value(args, &mut index, "--config-dir")?)
+            }
+            value => return Err(format!("未知参数：{value}")),
+        }
+        index += 1;
+    }
+    Ok(config_dir)
+}
+
+async fn run_list_bindings(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let config_dir = parse_local_config_dir(args)?;
+    let (storage, repos) = open_local_command_storage(&config_dir).await?;
+    let bindings = repos.binding_repo.find_all().await?;
+    if bindings.is_empty() {
+        println!("暂无绑定关系。可先导入角色并绑定会话。");
+        storage.close().await;
+        return Ok(());
+    }
+    let conversations = repos.conversation_repo.find_all().await?;
+    let characters = repos.character_repo.find_all().await?;
+    let conversation_by_id = conversations
+        .iter()
+        .map(|item| (item.id, item))
+        .collect::<std::collections::HashMap<_, _>>();
+    let character_by_id = characters
+        .iter()
+        .map(|item| (item.id, item))
+        .collect::<std::collections::HashMap<_, _>>();
+    println!(
+        "绑定ID\t会话外部ID\t会话类型\t角色\t每用户/分钟\t每会话/小时\t@豁免\t@倍率\t切换时间"
+    );
+    for binding in bindings {
+        let external_id = conversation_by_id
+            .get(&binding.conversation_id)
+            .map(|item| item.external_id.as_str())
+            .unwrap_or("-");
+        let conversation_type = conversation_by_id
+            .get(&binding.conversation_id)
+            .map(|item| match item.conversation_type {
+                ConversationType::Group => "群聊",
+                ConversationType::Private => "私聊",
+            })
+            .unwrap_or("-");
+        let name = character_by_id
+            .get(&binding.character_id)
+            .map(|item| item.definition.name.as_str())
+            .unwrap_or("-");
+        let switched_at = binding
+            .switched_at
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{}\t{external_id}\t{conversation_type}\t{name}\t{}\t{}\t{}\t{}\t{switched_at}",
+            binding.id,
+            binding
+                .response_rate_limit
+                .per_user_per_minute
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "关闭".to_string()),
+            binding
+                .response_rate_limit
+                .per_session_per_hour
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "关闭".to_string()),
+            if binding.response_rate_limit.mention_exempt {
+                "是"
+            } else {
+                "否"
+            },
+            binding.response_rate_limit.mention_multiplier
+        );
+    }
+    storage.close().await;
+    Ok(())
+}
+
+async fn run_switch_character(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
+    let mut conversation_external_id = None;
+    let mut character_name = None;
+    let mut conversation_type = ConversationType::Private;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config-dir" => {
+                config_dir = PathBuf::from(arg_value(args, &mut index, "--config-dir")?)
+            }
+            "--conversation" => {
+                conversation_external_id = Some(arg_value(args, &mut index, "--conversation")?)
+            }
+            "--group" => conversation_type = ConversationType::Group,
+            value if value.starts_with('-') => return Err(format!("未知参数：{value}").into()),
+            value => character_name = Some(value.to_string()),
+        }
+        index += 1;
+    }
+    let character_name = character_name.ok_or_else(|| {
+        RuntimeError::Config(
+            "请指定角色名（例：switch-character 木然 --conversation 123456）".to_string(),
+        )
+    })?;
+    let external_id = conversation_external_id.ok_or_else(|| {
+        RuntimeError::Config("请用 --conversation 指定目标会话外部 ID（群号或用户号）".to_string())
+    })?;
+    let (storage, repos) = open_local_command_storage(&config_dir).await?;
+    let target_conversation = repos
+        .conversation_repo
+        .find_by_external_id_and_type(&external_id, conversation_type)
+        .await?
+        .ok_or_else(|| {
+            RuntimeError::Config(format!(
+                "未找到{}会话 {external_id}",
+                if conversation_type == ConversationType::Group {
+                    "群"
+                } else {
+                    "私聊"
+                }
+            ))
+        })?;
+    let target_character = repos
+        .character_repo
+        .find_all()
+        .await?
+        .into_iter()
+        .find(|item| item.definition.name == character_name)
+        .ok_or_else(|| RuntimeError::Config(format!("未找到角色 {character_name}")))?;
+    let character_repo: Arc<dyn CharacterRepository> = repos.character_repo.clone();
+    let manager = BindingManager::new(
+        repos.binding_repo.clone(),
+        character_repo,
+        repos.conversation_repo.clone(),
+    );
+    manager
+        .switch_character(target_conversation.id, target_character.id)
+        .await
+        .map_err(|error| {
+            eprintln!("换角色失败：{error}");
+            error
+        })?;
+    println!("已把会话 {external_id} 的角色切换为「{character_name}」");
+    storage.close().await;
+    Ok(())
 }
 
 // ============================================================================
@@ -1302,6 +1734,22 @@ impl Completer for ReplHelper {
         let prefix = before[..start].split_whitespace().collect::<Vec<_>>();
 
         let mut candidates = Vec::new();
+        if prefix.is_empty() {
+            for name in [
+                "import-card",
+                "scan-cards",
+                "list-characters",
+                "list-bindings",
+                "switch-character",
+            ] {
+                if name.starts_with(current) {
+                    candidates.push(Pair {
+                        display: name.to_string(),
+                        replacement: name.to_string(),
+                    });
+                }
+            }
+        }
         if current.starts_with('-') {
             for option in [
                 "--raw",
@@ -1505,13 +1953,22 @@ async fn run_repl(socket: PathBuf) -> Result<(), String> {
             continue;
         }
 
-        let token_strings = match tokenize_repl_line(line) {
+        let tokens = match tokenize_repl_line(line) {
             Ok(tokens) => tokens,
-            Err(e) => {
-                eprintln!("错误: {e}");
+            Err(error) => {
+                eprintln!("错误: {error}");
                 continue;
             }
         };
+        if tokens.first().is_some_and(|name| is_local_command(name)) {
+            match run_local_command(&tokens).await {
+                Ok(()) => {}
+                Err(error) => eprintln!("错误: {error}"),
+            }
+            continue;
+        }
+
+        let token_strings = tokens;
         let tokens: Vec<&str> = token_strings.iter().map(String::as_str).collect();
         let parsed = match ParsedCommand::parse(&tokens) {
             Ok(p) => p,
@@ -1608,9 +2065,14 @@ async fn run_tui_loop(stdout: &mut io::Stdout, socket: &PathBuf) -> Result<(), S
                 {
                     leave_tui(stdout)?;
                     let result = prompt_tui_command(socket, &spec).await;
+                    let should_wait = matches!(result, Ok(Some(())));
+                    if should_wait {
+                        wait_for_tui_return(&mut io::stdin().lock())?;
+                    }
                     reenter_tui(stdout)?;
                     message = match result {
-                        Ok(Some(text)) => text,
+                        Ok(Some(())) => "命令结果已显示".to_string(),
+                        Ok(None) if should_wait => "命令结果已显示".to_string(),
                         Ok(None) => "已取消输入，仍在命令面板".to_string(),
                         Err(error) => format!("错误: {error}"),
                     };
@@ -1622,19 +2084,13 @@ async fn run_tui_loop(stdout: &mut io::Stdout, socket: &PathBuf) -> Result<(), S
                         .collect::<Vec<_>>();
                     let builtin = command_from_path(&path)
                         .ok_or_else(|| format!("命令定义无法解析: {}", spec.name))?;
-                    let response =
+                    leave_tui(stdout)?;
+                    let result =
                         execute_command(socket, builtin, &CommandOptions::default(), &[]).await;
-                    message = match response {
-                        Ok(resp) if resp.ok => summarize_tui_response(&resp),
-                        Ok(resp) => {
-                            format!(
-                                "失败 [{}]: {}",
-                                response_code(&resp),
-                                resp.safe_error_message()
-                            )
-                        }
-                        Err(error) => format!("错误: {error}"),
-                    };
+                    show_tui_command_result(result, false);
+                    wait_for_tui_return(&mut io::stdin().lock())?;
+                    reenter_tui(stdout)?;
+                    message = "命令结果已显示".to_string();
                 }
             }
             _ => {}
@@ -1721,14 +2177,14 @@ fn reenter_tui(stdout: &mut io::Stdout) -> Result<(), String> {
 async fn prompt_tui_command(
     socket: &PathBuf,
     spec: &yomua_bot::application::control_schema::ControlCommandSpec,
-) -> Result<Option<String>, String> {
+) -> Result<Option<()>, String> {
     let history_path = socket
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(".yomua-bot-ctl.history");
     let mut editor = LineEditor::new(history_path).map_err(|e| format!("无法初始化输入行: {e}"))?;
     println!("\n{}\n{}", spec.description, spec.usage);
-    println!("已选择此命令；下面只补充它需要的参数。直接回车取消。\n");
+    println!("已选择此命令；下面只补充它需要的参数。参数输入时直接回车取消本次命令。\n");
     let builtin = command_from_path(
         &spec
             .name
@@ -1740,7 +2196,7 @@ async fn prompt_tui_command(
     let mut args = Vec::new();
     let mut options = CommandOptions::default();
     for index in 0..spec.positional_min as usize {
-        let label = positional_label(spec, index);
+        let label = positional_prompt(spec, index);
         let value = prompt_tui_value(&mut editor, &format!("{label}> "))?;
         let Some(value) = value else {
             editor.save_history();
@@ -1749,12 +2205,12 @@ async fn prompt_tui_command(
         args.push(value);
     }
     for option in spec.allowed_options {
-        if let Some(value) = prompt_tui_option(&mut editor, option)? {
+        if let Some(value) = prompt_tui_option(&mut editor, spec, option)? {
             apply_tui_option(&mut options, option, value)?;
         }
     }
     if spec.supports_raw {
-        if let Some(value) = prompt_tui_option(&mut editor, "raw")? {
+        if let Some(value) = prompt_tui_option(&mut editor, spec, "raw")? {
             options.raw = parse_tui_bool(&value, "--raw")?;
         }
     }
@@ -1766,25 +2222,34 @@ async fn prompt_tui_command(
         };
         if !matches!(value.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
             editor.save_history();
-            return Ok(Some("已取消危险命令".to_string()));
+            return Ok(None);
         }
         options.confirm = true;
     }
     editor.save_history();
-    let response = execute_command(socket, builtin, &options, &args).await?;
-    let formatter = OutputFormatter::new(options.raw, None);
-    formatter.format_and_print(&response);
-    if response.ok {
-        Ok(Some("命令已完成，已返回面板".to_string()))
-    } else {
-        Ok(Some(format!(
-            "命令失败 [{}]，已返回面板",
-            response_code(&response)
-        )))
+    let result = execute_command(socket, builtin, &options, &args).await;
+    show_tui_command_result(result, options.raw);
+    Ok(Some(()))
+}
+
+fn show_tui_command_result(result: Result<ControlResponse, String>, raw: bool) {
+    match result {
+        Ok(response) => OutputFormatter::new(raw, None).format_and_print(&response),
+        Err(error) => eprintln!("错误: {error}"),
     }
 }
 
-fn positional_label(
+fn wait_for_tui_return(input: &mut impl io::BufRead) -> Result<(), String> {
+    terminal::disable_raw_mode().map_err(|error| format!("无法恢复终端输入: {error}"))?;
+    println!("\n按回车返回命令面板...");
+    let mut line = String::new();
+    input
+        .read_line(&mut line)
+        .map(|_| ())
+        .map_err(|error| format!("等待返回面板时读取输入失败: {error}"))
+}
+
+fn positional_prompt(
     spec: &yomua_bot::application::control_schema::ControlCommandSpec,
     index: usize,
 ) -> String {
@@ -1792,7 +2257,7 @@ fn positional_label(
         .split_whitespace()
         .filter_map(|token| token.strip_prefix('<').and_then(|v| v.strip_suffix('>')))
         .nth(index)
-        .map(|name| format!("请输入 {name}"))
+        .map(|name| format!("请输入 {name}（{}）", positional_description(spec, index)))
         .unwrap_or_else(|| format!("请输入第 {} 个参数", index + 1))
 }
 
@@ -1805,9 +2270,63 @@ fn prompt_tui_value(editor: &mut LineEditor, prompt: &str) -> Result<Option<Stri
     }
 }
 
-fn prompt_tui_option(editor: &mut LineEditor, option: &str) -> Result<Option<String>, String> {
-    let prompt = format!("--{option}（可选，直接回车跳过）> ");
+fn prompt_tui_option(
+    editor: &mut LineEditor,
+    spec: &yomua_bot::application::control_schema::ControlCommandSpec,
+    option: &str,
+) -> Result<Option<String>, String> {
+    let prompt = format!(
+        "--{option}（{}；直接回车跳过）> ",
+        option_description(spec, option)
+    );
     prompt_tui_value(editor, &prompt)
+}
+
+fn positional_description(
+    spec: &yomua_bot::application::control_schema::ControlCommandSpec,
+    index: usize,
+) -> &'static str {
+    let name = spec
+        .usage
+        .split_whitespace()
+        .filter_map(|token| token.strip_prefix('<').and_then(|v| v.strip_suffix('>')))
+        .nth(index)
+        .unwrap_or("");
+    match name {
+        "id" | "character-id" => "角色或角色卡的数字 ID",
+        "old-id" => "当前角色卡 ID",
+        "new-id" => "要设置的新角色卡 ID",
+        "source-user-id" => "要合并并删除的来源用户 ID",
+        "target-user-id" => "接收来源用户数据的目标用户 ID",
+        "user-id" => "全域用户 ID",
+        "qq-id" => "QQ 用户 ID",
+        "memory-id" => "记忆记录 ID",
+        "message-id" => "待查询或重试的消息 ID",
+        _ => "该命令指定对象的 ID",
+    }
+}
+
+fn option_description(
+    _spec: &yomua_bot::application::control_schema::ControlCommandSpec,
+    option: &str,
+) -> &'static str {
+    match option {
+        "limit" => "最多返回的记录数",
+        "offset" => "分页起始位置，从 0 开始",
+        "character" => "筛选或指定角色 ID",
+        "conversation" => "筛选或指定会话 ID",
+        "user" => "指定用户 ID",
+        "energy" => "角色能量值",
+        "stress" => "角色压力值",
+        "mood" => "角色心情值",
+        "activity" => "角色当前活动描述",
+        "reason" => "记录本次操作的原因",
+        "duration" => "封禁时长，如 30m、2h 或 7d",
+        "type" => "记忆类型筛选条件",
+        "instruction" => "对记忆内容的中文修改或确认说明",
+        "raw" => "是否输出原始 JSON（yes/no）",
+        _ => "参数值",
+    }
 }
 
 fn parse_tui_bool(value: &str, option: &str) -> Result<bool, String> {
@@ -1875,25 +2394,6 @@ fn tui_command_tokens(
     tokens
 }
 
-fn response_code(response: &ControlResponse) -> &str {
-    response
-        .error
-        .as_ref()
-        .map(|error| error.code.as_str())
-        .unwrap_or("UNKNOWN")
-}
-
-fn summarize_tui_response(response: &ControlResponse) -> String {
-    let Some(data) = response.data.as_ref() else {
-        return "命令已完成".to_string();
-    };
-    let mut text = serde_json::to_string(data).unwrap_or_else(|_| "命令已完成".to_string());
-    if text.chars().count() > 96 {
-        text = text.chars().take(93).collect::<String>() + "...";
-    }
-    format!("命令已完成: {text}")
-}
-
 // ============================================================================
 // 第十节：帮助信息
 // ============================================================================
@@ -1928,6 +2428,13 @@ fn print_help() {
         );
     }
     println!();
+    println!("本地维护命令（不要求运行中的 bot）：");
+    println!("  import-card <路径> [--config-dir <目录>] [--conversation <外部ID>] [--group] [--participant <ID>] [--participant-name <名称>] [--reply-mode natural|mention|occasional] [--proactive]");
+    println!("  scan-cards [目录] [--directory <目录>] [--config-dir <目录>]");
+    println!("  list-characters [--config-dir <目录>]");
+    println!("  list-bindings [--config-dir <目录>]");
+    println!("  switch-character <角色名> --conversation <外部ID> [--group] [--config-dir <目录>]");
+    println!();
     println!("REPL 控制:");
     println!("  tui / panel         打开全屏命令面板");
     println!("  help <前缀>          只显示匹配的命令");
@@ -1938,6 +2445,19 @@ fn print_help_for(prefix: &str) {
     let prefix = prefix.trim();
     if prefix.is_empty() {
         print_help();
+        return;
+    }
+    if [
+        "import-card",
+        "scan-cards",
+        "list-characters",
+        "list-bindings",
+        "switch-character",
+    ]
+    .iter()
+    .any(|name| name.starts_with(prefix))
+    {
+        println!("本地维护命令匹配：{prefix}");
         return;
     }
     let specs: Vec<_> = yomua_bot::application::control_schema::specs()
@@ -1987,8 +2507,8 @@ fn print_global_help() {
   yomua-bot-ctl --tui   打开全屏命令面板
 
 选项:
-  --socket <路径>   控制 socket 路径（默认：<data-dir>/control.sock）
-  --data-dir <路径> 数据目录（默认：data）
+  --socket <路径>   控制 socket 路径（优先级最高）
+  --data-dir <路径> 数据目录（覆盖 runtime.toml 的 data_dir）
   --raw             输出完整控制响应 JSON；可放在命令前或命令后
   --confirm         确认执行危险操作；可放在命令前或命令后
   --tui             打开方向键可操作的全屏命令面板
@@ -2001,6 +2521,11 @@ fn print_global_help() {
   yomua-bot-ctl conversation list
   yomua-bot-ctl blacklist list
   yomua-bot-ctl memory list --character 1
+  yomua-bot-ctl import-card /path/to/character.json --config-dir /path/to/config
+  yomua-bot-ctl scan-cards --config-dir /path/to/config
+  yomua-bot-ctl list-bindings --config-dir /path/to/config
+
+无参数启动时，ctl 默认读取 config/runtime.toml 的 data_dir 并连接其 control.sock；配置缺失时使用 data/control.sock。相对路径按启动工作目录解析。--socket 优先于 --data-dir。
 
 运行 'help' 命令查看所有可用命令；在 REPL 中按 Tab 可补全命令，输入 tui 可进入全屏面板。"#
     );
@@ -2015,32 +2540,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctl_started_at = std::time::Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    let mut command_args = args.as_slice();
+    let mut config_dir = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    eprintln!("错误: --config-dir 需要目录参数");
+                    std::process::exit(1);
+                };
+                config_dir = Some(PathBuf::from(value));
+                index += 1;
+            }
+            _ => break,
+        }
+    }
+    if index > 0 {
+        command_args = &args[index..];
+    }
+    let local_args = command_args.to_vec();
+
+    if command_args.iter().any(|a| a == "--help" || a == "-h") {
         print_global_help();
         std::process::exit(0);
     }
 
-    if args.is_empty() {
-        let socket = PathBuf::from("data/control.sock");
-        if let Err(e) = run_repl(socket).await {
-            eprintln!("REPL 错误: {e}");
+    if command_args
+        .first()
+        .is_some_and(|arg| is_local_command(arg))
+    {
+        if let Err(error) = run_local_command_with_config(&local_args, config_dir).await {
+            eprintln!("错误: {error}");
             std::process::exit(1);
         }
         return Ok(());
     }
 
-    // 解析全局选项
+    // 解析全局选项，REPL/TUI 与单次命令共用路径参数。
     let mut socket: Option<PathBuf> = None;
-    let mut data_dir: PathBuf = PathBuf::from("data");
+    let mut data_dir: Option<PathBuf> = None;
     let mut tui = false;
     let mut command_prefix_options: Vec<String> = Vec::new();
     let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
+    while i < command_args.len() {
+        match command_args[i].as_str() {
             "--socket" => {
                 i += 1;
-                if i < args.len() {
-                    socket = Some(PathBuf::from(&args[i]));
+                if i < command_args.len() {
+                    socket = Some(PathBuf::from(&command_args[i]));
                     i += 1;
                 } else {
                     eprintln!("错误: --socket 需要路径参数");
@@ -2049,8 +2598,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--data-dir" => {
                 i += 1;
-                if i < args.len() {
-                    data_dir = PathBuf::from(&args[i]);
+                if i < command_args.len() {
+                    data_dir = Some(PathBuf::from(&command_args[i]));
                     i += 1;
                 } else {
                     eprintln!("错误: --data-dir 需要路径参数");
@@ -2059,7 +2608,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--raw" | "--confirm" => {
                 // 允许全局选项放在命令前，也保留命令后的写法。
-                command_prefix_options.push(args[i].clone());
+                command_prefix_options.push(command_args[i].clone());
                 i += 1;
             }
             "--tui" => {
@@ -2070,16 +2619,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut remaining = args[i..].to_vec();
+    let mut remaining = command_args[i..].to_vec();
     if !command_prefix_options.is_empty() {
         remaining.extend(command_prefix_options);
     }
     if remaining.is_empty() {
-        let socket = socket.unwrap_or_else(|| data_dir.join("control.sock"));
+        let cwd = std::env::current_dir()?;
+        let resolved_socket = resolve_ctl_socket(
+            socket,
+            data_dir,
+            config_dir
+                .as_deref()
+                .unwrap_or_else(|| Path::new(DEFAULT_CONFIG_DIR)),
+            &cwd,
+        )
+        .map_err(|error| format!("REPL 路径解析失败: {error}"))?;
         let result = if tui {
-            run_tui(socket).await
+            run_tui(resolved_socket).await
         } else {
-            run_repl(socket).await
+            run_repl(resolved_socket).await
         };
         if let Err(e) = result {
             eprintln!("REPL 错误: {e}");
@@ -2122,7 +2680,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let socket = socket.unwrap_or_else(|| data_dir.join("control.sock"));
+    let socket = resolve_ctl_socket(
+        socket,
+        data_dir,
+        config_dir
+            .as_deref()
+            .unwrap_or_else(|| Path::new(DEFAULT_CONFIG_DIR)),
+        &std::env::current_dir()?,
+    )
+    .map_err(|error| format!("控制 socket 路径解析失败: {error}"))?;
     let formatter = OutputFormatter::new(parsed.opts.raw, Some(ctl_started_at));
 
     match execute_command(&socket, builtin, &parsed.opts, &parsed.args).await {
@@ -2166,6 +2732,251 @@ fn rand_u32() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_card(name: &str) -> String {
+        serde_json::json!({
+            "spec": "chara_card_v3",
+            "spec_version": "chara_card_v3",
+            "data": { "name": name, "description": "test" }
+        })
+        .to_string()
+    }
+
+    async fn write_test_runtime_config(root: &Path) -> PathBuf {
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            config_dir.join(RUNTIME_CONFIG),
+            format!("data_dir = {:?}\n", data_dir.display().to_string()),
+        )
+        .unwrap();
+        let storage = SqliteStorage::open(&format!("{}/runtime.db", data_dir.display()))
+            .await
+            .unwrap();
+        storage.migrate().await.unwrap();
+        storage.close().await;
+        config_dir
+    }
+
+    #[tokio::test]
+    async fn local_ctl_commands_import_scan_list_bind_and_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = write_test_runtime_config(root.path()).await;
+        let card_a = root.path().join("a.json");
+        let card_b = root.path().join("b.json");
+        std::fs::write(&card_a, test_card("角色甲")).unwrap();
+        std::fs::write(&card_b, test_card("角色乙")).unwrap();
+        let config_arg = config_dir.to_string_lossy().to_string();
+
+        run_local_command(&[
+            "import-card".into(),
+            card_a.to_string_lossy().into_owned(),
+            "--config-dir".into(),
+            config_arg.clone(),
+            "--conversation".into(),
+            "12345".into(),
+            "--group".into(),
+            "--participant".into(),
+            "67890".into(),
+            "--reply-mode".into(),
+            "natural".into(),
+            "--proactive".into(),
+        ])
+        .await
+        .unwrap();
+        run_local_command(&[
+            "import-card".into(),
+            card_b.to_string_lossy().into_owned(),
+            "--config-dir".into(),
+            config_arg.clone(),
+        ])
+        .await
+        .unwrap();
+
+        let scan_dir = root.path().join("cards");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(scan_dir.join("third.json"), test_card("角色丙")).unwrap();
+        run_local_command(&[
+            "scan-cards".into(),
+            "--directory".into(),
+            scan_dir.to_string_lossy().into_owned(),
+            "--config-dir".into(),
+            config_arg.clone(),
+        ])
+        .await
+        .unwrap();
+        run_local_command(&[
+            "scan-cards".into(),
+            "--directory".into(),
+            scan_dir.to_string_lossy().into_owned(),
+            "--config-dir".into(),
+            config_arg.clone(),
+        ])
+        .await
+        .unwrap();
+        run_local_command(&[
+            "list-characters".into(),
+            "--config-dir".into(),
+            config_arg.clone(),
+        ])
+        .await
+        .unwrap();
+        run_local_command(&[
+            "list-bindings".into(),
+            "--config-dir".into(),
+            config_arg.clone(),
+        ])
+        .await
+        .unwrap();
+        run_local_command(&[
+            "switch-character".into(),
+            "角色乙".into(),
+            "--conversation".into(),
+            "12345".into(),
+            "--group".into(),
+            "--config-dir".into(),
+            config_arg.clone(),
+        ])
+        .await
+        .unwrap();
+
+        let runtime_cfg =
+            load_runtime(&config_dir.join(RUNTIME_CONFIG).display().to_string()).unwrap();
+        let storage = SqliteStorage::open(&format!("{}/runtime.db", runtime_cfg.data_dir))
+            .await
+            .unwrap();
+        let name: String = sqlx::query_scalar(
+            "SELECT c.name FROM conversation_bindings b JOIN characters c ON c.id=b.character_id JOIN conversations v ON v.id=b.conversation_id WHERE v.external_id='12345' AND v.conversation_type='group'",
+        ).fetch_one(storage.pool()).await.unwrap();
+        assert_eq!(name, "角色乙");
+        storage.close().await;
+    }
+
+    #[test]
+    fn local_command_parser_rejects_invalid_arguments_and_registers_commands() {
+        for name in [
+            "import-card",
+            "scan-cards",
+            "list-characters",
+            "list-bindings",
+            "switch-character",
+        ] {
+            assert!(is_local_command(name));
+        }
+        assert!(!is_local_command("status"));
+        assert!(parse_reply_mode("unsupported").is_err());
+        assert!(parse_local_config_dir(&["--unknown".into()]).is_err());
+    }
+
+    #[test]
+    fn ctl_socket_defaults_to_runtime_data_dir_and_honors_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("working");
+        let config = root.path().join("config");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join(RUNTIME_CONFIG), "data_dir = \"debug\"\n").unwrap();
+
+        assert_eq!(
+            resolve_ctl_socket(None, None, &config, &cwd).unwrap(),
+            cwd.join("debug/control.sock")
+        );
+        assert_eq!(
+            resolve_ctl_socket(None, Some(PathBuf::from("custom-data")), &config, &cwd).unwrap(),
+            cwd.join("custom-data/control.sock")
+        );
+        assert_eq!(
+            resolve_ctl_socket(
+                Some(PathBuf::from("custom.sock")),
+                Some(PathBuf::from("ignored")),
+                &config,
+                &cwd
+            )
+            .unwrap(),
+            cwd.join("custom.sock")
+        );
+    }
+
+    #[test]
+    fn ctl_socket_config_errors_are_reported_and_missing_config_keeps_legacy_default() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let cwd = root.path().join("working");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        assert_eq!(
+            resolve_ctl_socket(None, None, &config, &cwd).unwrap(),
+            cwd.join("data/control.sock")
+        );
+
+        std::fs::write(config.join(RUNTIME_CONFIG), "data_dir = \n").unwrap();
+        let error = resolve_ctl_socket(None, None, &config, &cwd)
+            .expect_err("invalid runtime configuration should be reported");
+        assert!(error.contains("runtime.toml"));
+    }
+
+    #[tokio::test]
+    async fn ctl_resolved_socket_connects_from_another_working_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("service");
+        let config = cwd.join("config");
+        let data_dir = cwd.join("debug");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(config.join(RUNTIME_CONFIG), "data_dir = \"debug\"\n").unwrap();
+        let socket = resolve_ctl_socket(None, None, &config, &cwd).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let mut reader = BufReader::new(&mut stream);
+            reader.read_until(b'\n', &mut request).await.unwrap();
+            let envelope: yomua_bot::application::control_schema::ControlEnvelope =
+                serde_json::from_slice(
+                    request
+                        .strip_suffix(b"\n")
+                        .expect("request line is terminated"),
+                )
+                .unwrap();
+            let response = ControlResponse {
+                id: envelope.id,
+                ok: true,
+                data: Some(serde_json::json!({"status": "ok"})),
+                error: None,
+            };
+            reader
+                .get_mut()
+                .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let response = execute_command(
+            &socket,
+            ControlOperation::Status,
+            &CommandOptions::default(),
+            &[],
+        )
+        .await
+        .expect("ctl should connect to the configured socket");
+        assert!(response.ok);
+        server.await.unwrap();
+
+        let missing = data_dir.join("missing.sock");
+        let error = execute_command(
+            &missing,
+            ControlOperation::Status,
+            &CommandOptions::default(),
+            &[],
+        )
+        .await
+        .expect_err("missing bot socket should fail clearly");
+        assert!(error.contains(&missing.display().to_string()));
+        assert!(error.contains("No such file") || error.contains("找不到"));
+    }
 
     #[test]
     fn test_parse_status() {
@@ -2723,6 +3534,52 @@ mod tests {
             tui_command_tokens(spec, &["7".to_string()], &confirmed),
             vec!["user", "delete", "7", "--confirm"]
         );
+    }
+
+    #[test]
+    fn tui_parameter_prompts_describe_every_collectable_argument() {
+        use yomua_bot::application::control_schema::specs;
+
+        for spec in specs() {
+            let positional_names = spec
+                .usage
+                .split_whitespace()
+                .filter_map(|token| token.strip_prefix('<').and_then(|v| v.strip_suffix('>')))
+                .take(spec.positional_min as usize)
+                .collect::<Vec<_>>();
+            for (index, name) in positional_names.iter().enumerate() {
+                assert!(
+                    !positional_description(spec, index).is_empty(),
+                    "{} <{}> must have a description",
+                    spec.name,
+                    name
+                );
+            }
+            for option in spec.allowed_options {
+                assert!(
+                    !option_description(spec, option).is_empty(),
+                    "{} --{} must have a description",
+                    spec.name,
+                    option
+                );
+            }
+            if spec.supports_raw {
+                assert!(!option_description(spec, "raw").is_empty());
+            }
+        }
+
+        let character = specs()
+            .iter()
+            .find(|spec| spec.name == "character show")
+            .unwrap();
+        assert!(positional_prompt(character, 0).contains("角色或角色卡的数字 ID"));
+        assert!(option_description(character, "raw").contains("原始 JSON"));
+    }
+
+    #[test]
+    fn tui_result_pause_requires_enter_to_return_to_panel() {
+        let mut input = io::Cursor::new(b"\n".to_vec());
+        assert!(wait_for_tui_return(&mut input).is_ok());
     }
 
     #[test]

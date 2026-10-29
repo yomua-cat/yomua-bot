@@ -78,7 +78,7 @@ config/decision.toml
 支持 `.json` 和 `.png` 角色卡：
 
 ```bash
-./target/release/yomua-bot import-card /path/to/card.json \
+./target/release/yomua-bot-ctl import-card /path/to/card.json \
   --config-dir config \
   --conversation <群号> \
   --group \

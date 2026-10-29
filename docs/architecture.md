@@ -13,7 +13,7 @@
 
 [主程序](../src/main.rs)负责装配具体实现。Domain 通过仓储接口表达持久化需求；实际装配中 Application 也直接引用部分适配器和基础设施类型，不能把分层目标当成已验证的严格依赖隔离。
 
-`yomua-bot` 是常驻程序及角色卡管理工具；`yomua-bot-ctl` 是 Unix socket 控制客户端。它们共享[库入口](../src/lib.rs)。
+`yomua-bot` 只负责常驻服务装配与生命周期；`yomua-bot-ctl` 统一提供 Unix socket 控制命令和本地角色卡维护命令。后者复用[应用层导入与绑定服务](../src/application/character_import.rs)，本地维护命令依据 `runtime.toml` 的 `data_dir` 访问同一 SQLite 数据库。它们共享[库入口](../src/lib.rs)。
 
 控制 socket 与插件 socket 的父目录在创建或绑定前收紧为 `0700`，socket 文件本身保持 `0600`；已有目录也会收紧权限，避免目录枚举或替换 socket。含 API key、access token 的配置结构在 `Debug` 输出中显示为 `<redacted>`，不改变 TOML 读写与相等比较。
 

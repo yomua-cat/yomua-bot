@@ -68,10 +68,10 @@ rand = "0.8"
 # Line editor for CLI REPL
 rustyline = { version = "15", features = ["with-file-history"] }
 
-# Full-screen command panel for yomua-bot-ctl
+# Interactive command panel for yomua-bot-ctl
 crossterm = "0.28"
 
-# Process/system info (for status command)
+# Process/system info for runtime status responses
 sysinfo = "0.32"
 
 [dev-dependencies]

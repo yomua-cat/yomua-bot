@@ -622,7 +622,7 @@ admin_users = []
 # broadcast_capacity = 256
 
 # 可选默认角色 ID；类型：整数。当前配置可被读取并参与重载比较，主程序尚未用它自动创建绑定。
-# 新会话请继续使用 import-card 或 ctl 显式绑定；修改后需要重启。
+# 新会话请使用 yomua-bot-ctl import-card 显式绑定；修改后需要重启。
 # default_character_id = 1
 
 # 主动行为、静默时段和每日主动额度使用的 UTC 小时偏移；格式：+0 到 +23 或 -0 到 -23，默认 "+8"。

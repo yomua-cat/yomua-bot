@@ -19,15 +19,13 @@ use yomua_bot::application::action::ActionDispatcher;
 use yomua_bot::application::behavior_engine::RuleBehaviorEngine;
 use yomua_bot::application::binding::BindingManager;
 use yomua_bot::application::character_card_scan::scan_character_cards;
-use yomua_bot::application::character_import::{
-    BindOptions, CharacterImportService, ImportOptions,
-};
+use yomua_bot::application::character_import::CharacterImportService;
 use yomua_bot::application::cognition::CognitionLayer;
 use yomua_bot::application::cognition_driver::CognitionDriver;
 use yomua_bot::application::command::CommandHandler;
 use yomua_bot::application::config::{
-    load_runtime, write_template_if_missing, ConfigurationBundle, DecisionConfig, LlmConfig,
-    DECISION_TEMPLATE, LLM_TEMPLATE, ONEBOT_TEMPLATE, RUNTIME_TEMPLATE,
+    write_template_if_missing, ConfigurationBundle, DecisionConfig, LlmConfig, DECISION_TEMPLATE,
+    LLM_TEMPLATE, ONEBOT_TEMPLATE, RUNTIME_TEMPLATE,
 };
 use yomua_bot::application::context::ContextBuilder;
 use yomua_bot::application::context_assembler::{
@@ -59,8 +57,6 @@ use yomua_bot::application::relationship_service::RelationshipService;
 use yomua_bot::application::reply_processor::{DelayExecutor, ReplyProcessor, TokioDelayExecutor};
 use yomua_bot::application::runtime::CharacterRuntime;
 use yomua_bot::application::session_service::SessionService;
-use yomua_bot::domain::character::ReplyMode;
-use yomua_bot::domain::conversation::ConversationType;
 use yomua_bot::domain::decision::{
     DecisionLlmServiceImpl, DecisionResultValidator, DefaultOverridePolicy, HeuristicTrigger,
     NoOpTrigger,
@@ -177,7 +173,7 @@ fn build_provider_from_config(
     )?))
 }
 
-/// 运行时 CLI 帮助文本。
+/// 运行时启动帮助文本。
 const RUNTIME_HELP: &str = r#"yomua-bot —— Character Runtime
 
 用法：
@@ -186,6 +182,8 @@ const RUNTIME_HELP: &str = r#"yomua-bot —— Character Runtime
 选项：
   --help, -h          显示本帮助信息
   --config-dir <目录>  指定配置目录（默认：./config）
+
+维护命令请使用 yomua-bot-ctl。
 
 无参数时，使用启动目录下的 `config/` 作为配置目录；首次启动会在其中生成模板。
 配置文件：<config-dir>/runtime.toml、<config-dir>/llm.toml、<config-dir>/decision.toml、<config-dir>/onebot.toml。
@@ -238,16 +236,6 @@ pub(crate) fn parse_runtime_args(args: &[String]) -> Result<PathBuf, RuntimeErro
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-
-    // 子命令分发。
-    match args.first().map(String::as_str) {
-        Some("import-card") => return run_import(&args[1..]).await,
-        Some("scan-cards") => return run_scan_cards(&args[1..]).await,
-        Some("list-characters") => return run_list_characters(&args[1..]).await,
-        Some("list-bindings") => return run_list_bindings(&args[1..]).await,
-        Some("switch-character") => return run_switch_character(&args[1..]).await,
-        _ => {}
-    }
 
     let config_dir = parse_runtime_args(&args)?;
     let _handle = run_runtime(&config_dir).await?;
@@ -678,407 +666,6 @@ async fn run_runtime(config_dir: &Path) -> Result<RuntimeHandle, RuntimeError> {
     Ok(handle)
 }
 
-/// 运行 `import-card` 子命令：把一张角色卡 JSON/PNG 导入 SQLite，
-/// 并按需绑定到指定会话。
-///
-/// 用法：`cargo run -- import-card <卡片路径> [选项]`
-///
-/// 选项：
-/// - `--config-dir <目录>`：配置目录（默认 `./config`，读其中的 `runtime.toml`）
-/// - `--conversation <外部ID>`：绑定到的会话外部 ID（例如 QQ 群号）
-/// - `--group`：目标会话为群聊（默认私聊）
-/// - `--participant <外部ID>`：创建/复用会话中的一个人类参与者
-/// - `--participant-name <名称>`：参与者的显示名称（首次创建时使用）
-/// - `--reply-mode <natural|mention|occasional>`：回复方式（默认 `natural`）
-/// - `--proactive`：启用主动消息
-async fn run_import(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    // --- 解析命令行参数 ---
-    let mut config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
-    let mut path: Option<PathBuf> = None;
-    let mut conversation: Option<String> = None;
-    let mut conversation_type = ConversationType::Private;
-    let mut participant: Option<String> = None;
-    let mut participant_name: Option<String> = None;
-    let mut reply_mode = ReplyMode::Natural;
-    let mut proactive = false;
-
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        match arg {
-            "--config-dir" => config_dir = PathBuf::from(arg_value(args, &mut i, arg)?),
-            "--conversation" => conversation = Some(arg_value(args, &mut i, arg)?),
-            "--participant" => participant = Some(arg_value(args, &mut i, arg)?),
-            "--participant-name" => participant_name = Some(arg_value(args, &mut i, arg)?),
-            "--reply-mode" => reply_mode = parse_reply_mode(&arg_value(args, &mut i, arg)?)?,
-            "--group" => conversation_type = ConversationType::Group,
-            "--proactive" => proactive = true,
-            _ if arg.starts_with('-') => {
-                return Err(RuntimeError::Config(format!("未知参数：{arg}")).into());
-            }
-            _ => path = Some(PathBuf::from(arg)),
-        }
-        i += 1;
-    }
-
-    let path = path.ok_or_else(|| RuntimeError::Config("请指定角色卡路径".to_string()))?;
-
-    // --- 打开存储并迁移 ---
-    let runtime_cfg = load_runtime(&config_dir.join(RUNTIME_CONFIG).display().to_string())?;
-    std::fs::create_dir_all(&runtime_cfg.data_dir).map_err(|e| {
-        RuntimeError::Config(format!("无法创建数据目录 {}: {e}", runtime_cfg.data_dir))
-    })?;
-    let db_path = format!("{}/runtime.db", runtime_cfg.data_dir);
-    let storage = SqliteStorage::open(&db_path).await?;
-    storage.migrate().await?;
-    let pool = storage.pool().clone();
-
-    // --- 装配仓储与导入服务 ---
-    let repos = build_repos(pool);
-    let character_repo: Arc<dyn CharacterRepository> = repos.character_repo.clone();
-    let state_repo = repos.state_repo.clone();
-    let conversation_repo = repos.conversation_repo.clone();
-    let participant_repo = repos.participant_repo.clone();
-    let binding_repo = repos.binding_repo.clone();
-
-    let conversation_manager = Arc::new(ConversationManager::new(
-        conversation_repo.clone(),
-        participant_repo.clone(),
-    ));
-    let binding_manager = Arc::new(BindingManager::new(
-        binding_repo,
-        character_repo.clone(),
-        conversation_repo.clone(),
-    ));
-    let importer = CharacterImportService::new(
-        character_repo,
-        state_repo,
-        conversation_manager,
-        binding_manager,
-    );
-
-    // --- 执行导入 ---
-    let options = ImportOptions {
-        bind: conversation.map(|external_id| BindOptions {
-            conversation_type,
-            external_conversation_id: external_id,
-            participant_external_id: participant,
-            participant_display_name: participant_name,
-            reply_mode,
-            proactive_enabled: proactive,
-        }),
-    };
-
-    let result = importer.import_file(&path, &options).await?;
-
-    println!("已导入角色：{} (id={})", result.name, result.character_id);
-    if let Some(spec) = &result.spec_version {
-        println!("卡版本：{spec}");
-    }
-    if let Some(cid) = result.conversation_id {
-        println!("已绑定到会话（id={cid}）");
-        if let Some(bid) = result.binding_id {
-            println!("绑定 id={bid}");
-        }
-        if let Some(pid) = result.participant_id {
-            println!("参与者 id={pid}");
-        }
-    }
-
-    storage.close().await;
-    Ok(())
-}
-
-async fn run_scan_cards(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
-    let mut directory = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config-dir" => config_dir = PathBuf::from(arg_value(args, &mut i, "--config-dir")?),
-            "--directory" => {
-                directory = Some(PathBuf::from(arg_value(args, &mut i, "--directory")?))
-            }
-            arg if arg.starts_with('-') => {
-                return Err(RuntimeError::Config(format!("未知参数：{arg}")).into())
-            }
-            path => directory = Some(PathBuf::from(path)),
-        }
-        i += 1;
-    }
-    let (storage, repos) = open_cli_storage(&config_dir).await?;
-    let importer = build_character_importer(&repos);
-    let directory = directory.unwrap_or(std::env::current_dir()?.join("assets/characters"));
-    let result = scan_character_cards(&directory, &repos._pool, &importer).await?;
-    for (id, name) in &result.imported {
-        println!("已导入角色：{name} (id={id})");
-    }
-    println!(
-        "扫描完成：新增 {}，未变更 {}，失败 {}",
-        result.imported.len(),
-        result.unchanged,
-        result.errors.len()
-    );
-    for error in result.errors {
-        eprintln!("导入失败：{error}");
-    }
-    storage.close().await;
-    Ok(())
-}
-
-fn build_character_importer(repos: &Repos) -> CharacterImportService {
-    let character_repo: Arc<dyn CharacterRepository> = repos.character_repo.clone();
-    let conversation_repo = repos.conversation_repo.clone();
-    let participant_repo = repos.participant_repo.clone();
-    let conversation_manager = Arc::new(ConversationManager::new(
-        conversation_repo.clone(),
-        participant_repo,
-    ));
-    let binding_manager = Arc::new(BindingManager::new(
-        repos.binding_repo.clone(),
-        character_repo.clone(),
-        conversation_repo,
-    ));
-    CharacterImportService::new(
-        character_repo,
-        repos.state_repo.clone(),
-        conversation_manager,
-        binding_manager,
-    )
-}
-
-/// 打开配置目录下的 SQLite 存储并迁移，装配 CLI 只读命令所需的仓储。
-///
-/// 返回 `(storage, character_repo, conversation_repo, binding_repo)`；
-/// 调用方在使用完毕后负责 `storage.close().await`。
-#[allow(clippy::type_complexity)]
-async fn open_cli_storage(
-    config_dir: &Path,
-) -> Result<(SqliteStorage, Repos), Box<dyn std::error::Error>> {
-    let runtime_cfg = load_runtime(&config_dir.join(RUNTIME_CONFIG).display().to_string())?;
-    std::fs::create_dir_all(&runtime_cfg.data_dir).map_err(|e| {
-        RuntimeError::Config(format!("无法创建数据目录 {}: {e}", runtime_cfg.data_dir))
-    })?;
-    let db_path = format!("{}/runtime.db", runtime_cfg.data_dir);
-    let storage = SqliteStorage::open(&db_path).await?;
-    storage.migrate().await?;
-    let pool = storage.pool().clone();
-
-    Ok((storage, build_repos(pool)))
-}
-
-/// 解析 CLI 公共参数：`--config-dir <目录>`（默认 `./config`）。
-fn parse_config_dir_arg(args: &[String]) -> Result<PathBuf, RuntimeError> {
-    let mut config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        match arg {
-            "--config-dir" => config_dir = PathBuf::from(arg_value(args, &mut i, arg)?),
-            _ => return Err(RuntimeError::Config(format!("未知参数：{arg}"))),
-        }
-        i += 1;
-    }
-    Ok(config_dir)
-}
-
-/// 运行 `list-characters` 子命令：列出全部角色（id + 名称）。
-///
-/// 用法：`cargo run -- list-characters [--config-dir <目录>]`
-async fn run_list_characters(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let config_dir = parse_config_dir_arg(args)?;
-    let (storage, repos) = open_cli_storage(&config_dir).await?;
-    let character_repo: Arc<dyn CharacterRepository> = repos.character_repo.clone();
-
-    let characters = character_repo.find_all().await?;
-    if characters.is_empty() {
-        println!("暂无角色。可使用 `import-card` 导入角色卡。");
-    } else {
-        for c in characters {
-            println!("{}\t{}", c.id, c.definition.name);
-        }
-    }
-
-    storage.close().await;
-    Ok(())
-}
-
-/// 运行 `list-bindings` 子命令：列出全部会话的角色绑定关系。
-///
-/// 用法：`cargo run -- list-bindings [--config-dir <目录>]`
-async fn run_list_bindings(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let config_dir = parse_config_dir_arg(args)?;
-    let (storage, repos) = open_cli_storage(&config_dir).await?;
-    let character_repo: Arc<dyn CharacterRepository> = repos.character_repo.clone();
-    let conversation_repo = repos.conversation_repo.clone();
-    let binding_repo = repos.binding_repo.clone();
-
-    let bindings = binding_repo.find_all().await?;
-    if bindings.is_empty() {
-        println!("暂无绑定关系。可先导入角色并绑定会话。");
-        storage.close().await;
-        return Ok(());
-    }
-
-    // 建会话与角色的 id → 实体映射，用于展示外部 ID 与角色名。
-    let conversations = conversation_repo.find_all().await?;
-    let characters = character_repo.find_all().await?;
-    let conv_by_id: std::collections::HashMap<i64, &yomua_bot::domain::conversation::Conversation> =
-        conversations.iter().map(|c| (c.id, c)).collect();
-    let char_by_id: std::collections::HashMap<i64, &yomua_bot::domain::character::Character> =
-        characters.iter().map(|c| (c.id, c)).collect();
-
-    println!(
-        "绑定ID\t会话外部ID\t会话类型\t角色\t每用户/分钟\t每会话/小时\t@豁免\t@倍率\t切换时间"
-    );
-    for b in bindings {
-        let external_id = conv_by_id
-            .get(&b.conversation_id)
-            .map(|c| c.external_id.as_str())
-            .unwrap_or("-");
-        let conv_type = conv_by_id
-            .get(&b.conversation_id)
-            .map(|c| match c.conversation_type {
-                ConversationType::Group => "群聊",
-                ConversationType::Private => "私聊",
-            })
-            .unwrap_or("-");
-        let name = char_by_id
-            .get(&b.character_id)
-            .map(|c| c.definition.name.as_str())
-            .unwrap_or("-");
-        let switched_at = b
-            .switched_at
-            .map(|t| t.to_rfc3339())
-            .unwrap_or_else(|| "-".to_string());
-        println!(
-            "{}\t{external_id}\t{conv_type}\t{name}\t{}\t{}\t{}\t{}\t{switched_at}",
-            b.id,
-            b.response_rate_limit
-                .per_user_per_minute
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "关闭".to_string()),
-            b.response_rate_limit
-                .per_session_per_hour
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "关闭".to_string()),
-            if b.response_rate_limit.mention_exempt {
-                "是"
-            } else {
-                "否"
-            },
-            b.response_rate_limit.mention_multiplier,
-        );
-    }
-
-    storage.close().await;
-    Ok(())
-}
-
-/// 运行 `switch-character` 子命令：把一个已存在会话的角色切换到指定角色。
-///
-/// 用法：`cargo run -- switch-character <角色名> --conversation <外部ID> [--group] [--config-dir <目录>]`
-///
-/// `--group` 表示目标会话为群聊（默认私聊）；本命令只查询已存在会话，
-/// 不会像 `import-card` 那样创建会话。
-async fn run_switch_character(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
-    let mut conversation_external_id: Option<String> = None;
-    let mut character_name: Option<String> = None;
-    let mut conversation_type = ConversationType::Private;
-
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        match arg {
-            "--config-dir" => config_dir = PathBuf::from(arg_value(args, &mut i, arg)?),
-            "--conversation" => conversation_external_id = Some(arg_value(args, &mut i, arg)?),
-            "--group" => conversation_type = ConversationType::Group,
-            _ if arg.starts_with('-') => {
-                return Err(RuntimeError::Config(format!("未知参数：{arg}")).into());
-            }
-            _ => character_name = Some(arg.to_string()),
-        }
-        i += 1;
-    }
-
-    let character_name = character_name.ok_or_else(|| {
-        RuntimeError::Config(
-            "请指定角色名（例：switch-character 木然 --conversation 123456）".to_string(),
-        )
-    })?;
-    let external_id = conversation_external_id.ok_or_else(|| {
-        RuntimeError::Config("请用 --conversation 指定目标会话外部 ID（群号或用户号）".to_string())
-    })?;
-
-    tracing::debug!(target: "cli", ?conversation_type, "准备切换会话角色");
-
-    // 打开存储并装配局部仓储（只读查询，不创建会话）。
-    let (storage, repos) = open_cli_storage(&config_dir).await?;
-    let character_repo: Arc<dyn CharacterRepository> = repos.character_repo.clone();
-    let conversation_repo = repos.conversation_repo.clone();
-    let binding_repo = repos.binding_repo.clone();
-
-    let target_conversation = conversation_repo
-        .find_by_external_id_and_type(&external_id, conversation_type)
-        .await?
-        .ok_or_else(|| {
-            RuntimeError::Config(format!(
-                "未找到{}会话 {external_id}",
-                match conversation_type {
-                    ConversationType::Group => "群",
-                    ConversationType::Private => "私聊",
-                }
-            ))
-        })?;
-
-    let target_character = character_repo
-        .find_all()
-        .await?
-        .into_iter()
-        .find(|c| c.definition.name == character_name)
-        .ok_or_else(|| RuntimeError::Config(format!("未找到角色 {character_name}")))?;
-
-    let binding_manager = BindingManager::new(
-        binding_repo,
-        character_repo.clone(),
-        conversation_repo.clone(),
-    );
-    match binding_manager
-        .switch_character(target_conversation.id, target_character.id)
-        .await
-    {
-        Ok(_) => {
-            println!("已把会话 {external_id} 的角色切换为「{character_name}」");
-        }
-        Err(e) => {
-            eprintln!("换角色失败：{e}");
-            return Err(e.into());
-        }
-    }
-
-    storage.close().await;
-    Ok(())
-}
-
-/// 读取一个需要取值的命令行选项。
-fn arg_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, RuntimeError> {
-    *i += 1;
-    args.get(*i)
-        .cloned()
-        .ok_or_else(|| RuntimeError::Config(format!("参数 {flag} 需要一个值")))
-}
-
-/// 把命令行中的回复模式字符串解析为 [`ReplyMode`]。
-fn parse_reply_mode(s: &str) -> Result<ReplyMode, RuntimeError> {
-    match s {
-        "natural" => Ok(ReplyMode::Natural),
-        "mention" | "mention_only" => Ok(ReplyMode::MentionOnly),
-        "occasional" => Ok(ReplyMode::Occasionally),
-        other => Err(RuntimeError::Config(format!("未知的回复模式：{other}"))),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // 运行时装配辅助函数。
 // ---------------------------------------------------------------------------
@@ -1203,6 +790,25 @@ struct AppLayer {
     mood_service: Arc<MoodService>,
     memory_service: Arc<MemoryService>,
     llm_scheduler: Option<Arc<DefaultLlmScheduler>>,
+}
+
+fn build_character_importer(repos: &Repos) -> CharacterImportService {
+    let character_repo: Arc<dyn CharacterRepository> = repos.character_repo.clone();
+    let conversation_manager = Arc::new(ConversationManager::new(
+        repos.conversation_repo.clone(),
+        repos.participant_repo.clone(),
+    ));
+    let binding_manager = Arc::new(BindingManager::new(
+        repos.binding_repo.clone(),
+        character_repo.clone(),
+        repos.conversation_repo.clone(),
+    ));
+    CharacterImportService::new(
+        character_repo,
+        repos.state_repo.clone(),
+        conversation_manager,
+        binding_manager,
+    )
 }
 
 /// 装配应用层编排依赖。
@@ -1658,6 +1264,22 @@ mod tests {
     fn test_parse_runtime_args_positional_config_dir_is_rejected() {
         let result = parse_runtime_args(&["/tmp/my-config".to_string()]);
         assert!(result.is_err(), "配置目录必须显式使用 --config-dir");
+    }
+
+    #[test]
+    fn maintenance_commands_are_not_runtime_arguments() {
+        for command in [
+            "import-card",
+            "scan-cards",
+            "list-characters",
+            "list-bindings",
+            "switch-character",
+        ] {
+            assert!(
+                parse_runtime_args(&[command.to_string()]).is_err(),
+                "{command} must be handled by yomua-bot-ctl"
+            );
+        }
     }
 
     #[tokio::test]
